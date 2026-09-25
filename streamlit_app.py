@@ -45,14 +45,17 @@ SOURCE_LABEL = {
     "fallback_generic": "🟠 检索无命中 · 通用兜底生成",
 }
 
-# 侧边栏推荐问题：均为「真跑过、确认有返回数据」的问题，保证演示不冷场
+# 侧边栏推荐问题：均为「真跑过、确认有返回数据」的问题，保证演示不冷场。
+# 前 6 条走结构化问数（SQL），后 2 条走知识库问答（RAG）——两条分支都能演示。
 EXAMPLES = [
     "华东区上个月可靠性试验的准时完成率是多少",
     "那华南区呢？",
-    "华东区上个月可靠性试验的检测服务收入是多少",
     "各业务线的检测准时率是多少",
-    "可靠性业务的报告出具周期是多少天",
+    "华东区上个月可靠性试验的检测服务收入是多少",
     "各实验室设备利用率",
+    "可靠性业务的报告出具周期是多少天",
+    "为什么问华南区查不到数据",
+    "EMC 是什么意思",
 ]
 
 
@@ -112,8 +115,29 @@ def get_engine():
         min_score=settings.retrieval.min_score,
         max_retry=settings.pipeline.max_retry,
     )
-    st.session_state.engine = GRGQueryEngine(pipeline, build_semantic_layer())
+    st.session_state.engine = GRGQueryEngine(
+        pipeline,
+        build_semantic_layer(),
+        doc_retriever=_build_doc_retriever(settings),
+        doc_max_chars=settings.kb.doc_max_chars,
+    )
     return st.session_state.engine
+
+
+def _build_doc_retriever(settings):
+    """企业知识库混合检索器（pgvector + pg_trgm + 关键词 → RRF）。
+
+    构建失败不影响主流程：自动降级为纯 SQL 问数。
+    """
+    if not settings.kb.enabled:
+        return None
+    try:
+        from nl2sql.embedding import build_embedder
+        from nl2sql.kb import build_doc_retriever
+
+        return build_doc_retriever(settings, build_embedder(settings.embedding, settings.llm))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def config_status() -> tuple[bool, str]:
@@ -174,10 +198,40 @@ def _fmt(v) -> str:
     return str(v)
 
 
+def render_rag(out: dict) -> None:
+    """文档问答（混合 RAG）：只依据知识库资料作答，并列出引用来源。"""
+    st.caption("📚 知识库问答 · 结构化问数不适用时走文档检索（三路召回 + RRF 融合）")
+    st.markdown(out.get("answer") or "（未生成回答）")
+    docs = out.get("docs") or []
+    if docs:
+        with st.expander(f"📚 参考来源（知识库命中 {len(docs)} 篇）"):
+            for i, d in enumerate(docs, start=1):
+                src = f" — {d.source}" if getattr(d, "source", "") else ""
+                st.write(f"**[{i}] {d.title}**{src}")
+                if getattr(d, "reasons", None):
+                    st.caption("　检索依据：" + d.reasons[0])
+
+
+def render_doc_sources(docs: list) -> None:
+    """结构化问数时展示"知识库参考了哪些资料"（混合 RAG 的另一半）。"""
+    if not docs:
+        return
+    with st.expander(f"📚 参考知识库（{len(docs)} 篇，已作为口径补充注入生成）"):
+        for i, d in enumerate(docs, start=1):
+            st.write(f"**[{i}] {d.title}**")
+            if getattr(d, "reasons", None):
+                st.caption("　检索依据：" + d.reasons[0])
+
+
 def render_answer(out: dict) -> None:
     # 歧义澄清：不进入生成
     if out.get("type") == "clarification":
         st.warning(f"❓ 需要澄清：{out['message']}")
+        return
+
+    # 文档问答（RAG 分支）
+    if out.get("type") == "rag":
+        render_rag(out)
         return
 
     res = out["result"]
@@ -237,14 +291,16 @@ def render_answer(out: dict) -> None:
         st.write(f"- 归一化问题：`{mapped.normalized}`")
         st.write(f"- 解析实体：`{mapped.entities}`")
 
+    render_doc_sources(out.get("docs") or [])
+
 
 # ---------------------------------------------------------------------------
 # 4) 页面
 # ---------------------------------------------------------------------------
 st.title(f"📊 {DISPLAY_NAME} · 自然问数系统")
 st.caption(
-    "语义层驱动的 NL2SQL：可解释检索 · Schema Linking · sqlglot 校验 · "
-    "EXPLAIN 预检 · 多轮上下文 · 失败回退"
+    "语义层驱动的 NL2SQL ⊕ 企业知识库混合 RAG：可解释检索 · Schema Linking · "
+    "sqlglot 校验 · EXPLAIN 预检 · 多轮上下文 · 失败回退"
 )
 
 ok, msg = config_status()

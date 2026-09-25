@@ -3,8 +3,9 @@ sqlglot>=25.0          # SQL AST 解析与方言校验
 pydantic>=2.0          # 配置模型
 pydantic-settings>=2.0 # 配置加载（.env / 环境变量 / Streamlit secrets）
 openai>=1.30           # OpenAI 兼容 LLM 客户端（通义/DeepSeek/Ollama 均可）
+httpx>=0.27            # 显式依赖：直接用它构造"绕开环境代理"的 http_client
 
-# 真实 PostgreSQL 预检与执行（生产必装）
+# 真实 PostgreSQL 预检与执行（生产必装；Neon 已支持 pgvector / pg_trgm 扩展）
 psycopg[binary]>=3.1
 
 # Web UI（Streamlit Cloud 部署入口：streamlit_app.py）

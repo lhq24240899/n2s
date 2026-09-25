@@ -38,6 +38,30 @@ class RetrievalSettings(BaseModel):
     top_k: int = 5
 
 
+class EmbeddingSettings(BaseModel):
+    """向量化设置（用于企业知识库的混合检索）。
+
+    base_url / api_key 留空则复用 LLM 的配置（同一个 OpenAI 兼容网关）。
+    """
+
+    model: str = "text-embedding-3-small"
+    dim: int = 1536              # 必须与所选模型一致，换模型要同步改
+    base_url: str = ""
+    api_key: str = ""
+    timeout: float = 30.0
+    disable_proxy: bool = False  # 同 LLM：本机代理异常时置 true 直连
+
+
+class KBSettings(BaseModel):
+    """企业知识库（pgvector）设置。"""
+
+    enabled: bool = True
+    table: str = "kb_docs"
+    top_k: int = 4               # 混合召回后注入 prompt 的文档条数
+    rrf_k: int = 60              # RRF 融合常数（论文默认值）
+    doc_max_chars: int = 1200    # 单条文档注入 prompt 的截断长度
+
+
 class PipelineSettings(BaseModel):
     max_retry: int = 1           # 生成失败后的重试次数（每次携带错误反馈）
 
@@ -57,6 +81,8 @@ class Settings(BaseSettings):
     llm: LLMSettings = LLMSettings()
     db: DBSettings = DBSettings()
     retrieval: RetrievalSettings = RetrievalSettings()
+    embedding: EmbeddingSettings = EmbeddingSettings()
+    kb: KBSettings = KBSettings()
     pipeline: PipelineSettings = PipelineSettings()
     log: LogSettings = LogSettings()
 

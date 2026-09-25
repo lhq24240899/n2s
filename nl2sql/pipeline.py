@@ -63,6 +63,8 @@ class Text2SQLPipeline:
         # 空结果自愈：SQL 能执行但匹配 0 行 / 全 NULL 时，带反馈重生成一次
         # （这类失败静态校验与 EXPLAIN 都发现不了，只有执行后才知道）
         self.retry_on_empty = retry_on_empty
+        # 企业知识库摘录（混合检索结果），由上层每轮注入；用于补充业务口径与已知坑
+        self.doc_context: Optional[str] = None
         self._log = logging.getLogger("nl2sql.pipeline")
 
     # ---------------- 对外 API ----------------
@@ -92,7 +94,7 @@ class Text2SQLPipeline:
         last_raw = ""
         for attempt in range(self.max_retry + 1):
             prompt = self.prompt.build(
-                question, schemas, hits, self.glossary, error_feedback
+                question, schemas, hits, self.glossary, error_feedback, self.doc_context
             )
             raw = self.llm.generate(prompt, SYSTEM_PROMPT)
             last_raw = raw
@@ -122,7 +124,7 @@ class Text2SQLPipeline:
             self._log.info("无检索命中，走通用提示词回退")
             full_schemas = self.registry.link(self.registry.names())
             prompt = self.prompt.build(
-                question, full_schemas, [], self.glossary, error_feedback
+                question, full_schemas, [], self.glossary, error_feedback, self.doc_context
             )
             raw = self.llm.generate(prompt, SYSTEM_PROMPT)
             last_raw = raw

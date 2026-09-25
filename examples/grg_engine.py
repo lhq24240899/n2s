@@ -11,8 +11,15 @@
   因此这里把「原问题 + 歧义同义词 + 消歧后的取值」暂存为**待澄清态**；
   用户确认后用规范词重写原问题再跑一遍，保证指标/维度不丢、上下文不被污染。
 
+混合 RAG（结构化 ⊕ 文档）：
+  每轮先对企业知识库做**三路混合召回**（关键词 / pg_trgm / pgvector → RRF 融合）：
+  - 解析出结构化意图（有指标或要求分组）-> 走 SQL 问数，并把知识库摘录作为
+    「业务口径参考」注入生成 prompt（补上表结构看不出来的口径与已知坑）；
+  - 解析不出结构化意图（如"EMC 是什么""为什么华南区查不到数据"）->
+    走**文档问答**，只依据检索到的资料作答并标注引用来源，避免 RAG 变成新的幻觉源。
+
 LLM 与 DB 均为真实实现（由 build_llm / build_db 注入）：
-- 真实 LLM 靠 prompt 里的 schema + 口径 Glossary + 参考示例来生成 SQL。
+- 真实 LLM 靠 prompt 里的 schema + 口径 Glossary + 知识库摘录 + 参考示例来生成 SQL。
 - 真实 DB 由 PsycopgRunner 执行 EXPLAIN 预检与查询，返回真实数据。
 
 语义层（semantic.py / grg_schema.py）承载计量检测行业知识，是这套系统
@@ -21,6 +28,7 @@ LLM 与 DB 均为真实实现（由 build_llm / build_db 注入）：
 from __future__ import annotations
 
 from nl2sql.context import QueryContext
+from nl2sql.kb import answer_with_docs, build_sql_doc_block
 from nl2sql.pipeline import Text2SQLPipeline
 from nl2sql.semantic import MappedQuery, SemanticLayer, SemanticMapper
 
@@ -33,14 +41,23 @@ _PUNCT = "。，、！？!?,.;；:：~～ \t　\"'“”‘’"
 
 
 class GRGQueryEngine:
-    """计量检测问数引擎：语义映射 + 多轮上下文 + 通用 pipeline 的组合层。"""
+    """计量检测问数引擎：语义层 + 多轮上下文 + 混合 RAG + 通用 pipeline 的组合层。"""
 
-    def __init__(self, pipeline: Text2SQLPipeline, layer: SemanticLayer):
+    def __init__(
+        self,
+        pipeline: Text2SQLPipeline,
+        layer: SemanticLayer,
+        doc_retriever=None,
+        doc_max_chars: int = 1200,
+    ):
         self.pipeline = pipeline
         self.layer = layer
         self.mapper = SemanticMapper(layer)
         self.context = QueryContext()
         self.pending: dict | None = None  # 待澄清态（见模块 docstring）
+        # 可选：企业知识库混合检索器（三路召回 + RRF）。不传则退化为纯 SQL 问数。
+        self.doc_retriever = doc_retriever
+        self.doc_max_chars = doc_max_chars
 
     # ---------------- 对外 API ----------------
 
@@ -128,11 +145,29 @@ class GRGQueryEngine:
         # 多轮上下文继承（追问"那华南区呢" -> 仅替换区域，业务线/指标/时间沿用）
         merged = self.context.inherit(mapped)
 
-        # 组装口径 Glossary（本指标口径 + 已识别实体作为硬过滤约束）
+        # 企业知识库混合检索（三路召回 + RRF）。
+        # 用「本轮问题」而不是继承后的文本，避免继承来的维度词把文档检索带偏。
+        docs = self.doc_retriever.retrieve(mapped.normalized) if self.doc_retriever else []
+
+        # 路由：解析不出结构化意图（无指标、也没要求分组）-> 走文档问答（RAG）
+        structured = merged.metric is not None or "group_by" in merged.entities
+        if not structured and docs:
+            answer = answer_with_docs(
+                self.pipeline.llm, mapped.normalized, docs, self.doc_max_chars
+            )
+            return {
+                "type": "rag",
+                "mapped": merged,
+                "answer": answer,
+                "docs": docs,
+            }
+
+        # 结构化问数：把知识库摘录作为**业务口径补充**注入生成 prompt
         glossary = self.layer.glossary_for(
             merged.metric.id if merged.metric else None, merged.entities
         )
         self.pipeline.glossary = glossary
+        self.pipeline.doc_context = build_sql_doc_block(docs, self.doc_max_chars) or None
 
         res, cols, rows = self.pipeline.query(merged.normalized)
 
@@ -146,4 +181,5 @@ class GRGQueryEngine:
             "cols": cols,
             "rows": rows,
             "glossary": glossary,
+            "docs": docs,
         }

@@ -33,6 +33,7 @@ class PromptBuilder:
         hits: list[RetrievalHit],
         glossary: Optional[Glossary] = None,
         error_feedback: Optional[str] = None,
+        doc_context: Optional[str] = None,
     ) -> str:
         parts: list[str] = [f"# 任务\n{question}\n"]
 
@@ -46,6 +47,10 @@ class PromptBuilder:
             for col, values in (t.sample_values or {}).items():
                 opts = ", ".join(f"'{v}'" for v in values)
                 parts.append(f"  取值约束: {t.name}.{col} 仅能取 {opts}")
+
+        # 企业知识库摘录（混合检索结果）：补充表结构看不出来的业务口径与已知坑
+        if doc_context:
+            parts.append(doc_context)
 
         if glossary:
             rendered = glossary.render()

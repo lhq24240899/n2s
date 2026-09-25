@@ -68,13 +68,18 @@ nl2sql/
 │   ├── llm.py                  # LLMClient ABC + OpenAI 兼容真实客户端（缺 key 报错）
 │   ├── validation.py           # SQLValidator（sqlglot AST 校验）
 │   ├── db.py                   # DBRunner ABC + Psycopg(EXPLAIN)（缺 DSN 报错）
+│   ├── embedding.py            # ★向量化：OpenAI 兼容 + 本地 HashingEmbedder（离线可测）
+│   ├── vectorstore.py          # ★pgvector + pg_trgm 知识库存储（三路召回）
+│   ├── kb.py                   # ★混合检索：RRF 融合 + 文档问答（带引用，降幻觉）
 │   └── pipeline.py             # Text2SQLPipeline 主流程编排
 ├── examples/                   # 演示知识库 + 端到端 demo
 │   ├── schema.py               # 通用演示知识库
 │   ├── demo.py                 # 通用端到端 demo
 │   ├── grg_schema.py           # ★计量检测领域知识（表/指标/同义词/知识图谱/示例）
-│   ├── grg_engine.py           # ★计量检测引擎编排（真实 LLM + 真实 DB）
+│   ├── grg_engine.py           # ★计量检测引擎编排（真实 LLM + 真实 DB + 混合 RAG 路由）
 │   ├── grg_demo.py             # ★计量检测端到端 demo（单轮/多轮/澄清）
+│   ├── kb_docs.py              # ★企业知识库语料（19 篇：指标口径/术语/标准/排错 FAQ）
+│   ├── setup_kb.py             # ★建知识库：建表 + 向量化 + 写入 + 检索自检
 │   └── setup_dev_db.py         # 在真实库建示例表 + 灌种子数据
 └── tests/                      # pytest 单测
 ```
@@ -147,6 +152,7 @@ PIPELINE__MAX_RETRY=1
 | SQL 正确但匹配 0 行 / 全 NULL | **空结果自愈**：`query()` 检测到空结果，带「过滤条件可能不匹配」反馈重生成一次（`retry_on_empty`，可关）；UI 自动展开 SQL |
 | 问「各业务线/各实验室」却只返回一个总数 | 语义层识别**分组维度**（`各/按/每个 + 维度词`）→ Glossary 下发 `GROUP BY` 指令（每行一个取值），且**不再把同维度继承成过滤条件** |
 | 会话中途答错一次后，后面全查不到数据 | 连接用 **autocommit**（每语句独立事务）避免坏语句毒化整条连接，并**异常即弃连接重连**——否则 PostgreSQL 的 `current transaction is aborted` 会让整条连接持续失败 |
+| 文档类问题（"EMC 是什么""为什么华南区查不到数据"） | 走**企业知识库混合 RAG**：关键词 + pg_trgm + pgvector 三路召回 → RRF 融合 → **只依据资料作答并标注引用**，避免 RAG 变成新的幻觉源 |
 | 重试后仍失败 | 回退到最相关示例 SQL，`source=fallback_template` |
 | 定位故障层 | `source` 字段 + `PipelineTrace`（每步 attempt 都有记录） |
 
@@ -316,5 +322,67 @@ streamlit run streamlit_app.py
   互不串台；侧边栏「清空对话」即 `reset_context()`。
 - 结果区展示：数值卡片/表格 + **口径说明**（指标=口径，数据来源=表）+ 可展开的**生成 SQL** 与
   **语义映射 reasons**——把「可解释、可审计」直接暴露给使用者。
+
+---
+
+## 10. 企业知识库与混合 RAG
+
+结构化问数解决不了「EMC 是什么」「为什么问华南区查不到数据」这类**文档性问题**，
+而企业里这类知识（指标口径、业务术语、检测标准、排错经验）恰恰最容易让模型瞎编。
+本项目的做法是：**同一个入口，两条分支，各用各的长处，还能互相补强**。
+
+```
+用户问题
+   │
+   ▼
+┌──────────────────────────┐  三路召回（同一个 pgvector 表）
+│ 混合检索 HybridDocRetriever│ ──┬─ 关键词命中（精确子串，最可解释）
+└──────────────────────────┘   ├─ pg_trgm word_similarity（容错：错别字/语序）
+   │                           └─ pgvector 余弦相似度（语义改写）
+   │                                  └──▶ RRF 倒数排名融合 → top-k
+   ▼
+┌───────────────┐  解析出指标 / 要求分组 ?
+│  路由 Route    │── 是 ──▶ 结构化问数：SQL 生成时**注入知识库摘录**作口径补充
+└───────────────┘                    （补上表结构看不出来的口径与已知坑）
+   │ 否
+   └──────────────▶ 文档问答：**只依据检索到的资料作答**，并标注引用 [1][2]
+```
+
+### 10.1 为什么用 pgvector（而不是另引一套向量库）
+
+- **一个库搞定**：结构化数据（表/指标）与文档（口径/标准/术语）都在同一个 Neon 库，
+  天然支持「向量检索 ⊕ 结构化查询」的混合检索，不用维护两套数据的一致性；
+- **Neon 免运维**，Streamlit Cloud 上零额外服务；
+- **可解释性不丢失**：向量分数与标签/关键词分数一起暴露在 `reasons` 里，
+  不是黑盒召回。
+
+### 10.2 三个工程细节（都踩过坑）
+
+1. **中文短查询必须用 `word_similarity`，不能用 `similarity`**：
+   后者是「整串 vs 整串」，短查询对长文档几乎必然低于默认阈值 0.3，会一路召回为空。
+   `word_similarity(query, doc)` 取「查询三元组 vs 文档任意片段」的最大相似度才对。
+2. **RRF 融合只依赖名次**，三路信号量纲不同也无需归一化/调权重，鲁棒且好讲。
+3. **`jsonb` 字段要传 JSON 文本**：psycopg 会把 Python `list` 适配成 PG 数组字面量
+   （`{指标,口径}`），写 jsonb 会报 `invalid input syntax for type json`。
+
+### 10.3 建库与自检
+
+```bash
+python examples/setup_kb.py                 # 建表 + 向量化 + 写入（幂等）
+python examples/setup_kb.py --demo          # 跑一组混合检索自检（打印三路命中明细）
+python examples/setup_kb.py --query "为什么问华南区查不到数据"
+```
+
+知识库语料在 `examples/kb_docs.py`（19 篇：5 个指标口径 + 业务线/术语 + 检测标准 + 排错 FAQ），
+**每条都与 `grg_schema.py` 的指标口径严格对齐**——否则文档与数据打架，RAG 会变成新的幻觉来源。
+
+### 10.4 降幻觉的三层做法
+
+| 层次 | 做法 |
+|---|---|
+| 生成前 | Schema Linking 限定表列 + 口径 Glossary + 知识库摘录（把"业务真相"喂进去） |
+| 生成中 | 温度 0；静态校验（sqlglot AST 白名单）+ 执行预检（EXPLAIN） |
+| 生成后 | 空结果自愈重生成；**RAG 答案强制带引用**，资料不足时明确说"资料中未涉及" |
+
 
 
