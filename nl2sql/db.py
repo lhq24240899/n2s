@@ -25,6 +25,22 @@ class DBRunner(ABC):
 
 
 class PsycopgRunner(DBRunner):
+    """只读查询执行器（EXPLAIN 预检 + 真实执行）。
+
+    关键设计：连接使用 **autocommit**，每条语句各自独立成事务。
+
+    为什么必须这样？PostgreSQL 里只要某条语句在事务中报错，整个事务会被标记为
+    aborted，此后**同一连接上的所有语句都会报**
+    `current transaction is aborted, commands ignored until end of transaction block`，
+    直到显式 ROLLBACK 为止。
+
+    实测踩过的坑：不设 autocommit 时，某次 LLM 生成了非法 SQL -> 这条连接被毒化 ->
+    之后**整个会话所有问题都查不出数据**（表现为"本地跑得好好的、线上全查不到"，
+    因为本地每次运行脚本都是新连接，而 Web 端一个会话会长期复用同一条连接）。
+
+    第二道保险：任何异常都会丢弃当前连接，下次调用自动重连。
+    """
+
     def __init__(self, dsn: str, dialect: str = "postgres", timeout: float = 10.0):
         self.dsn = dsn
         self.dialect = dialect
@@ -32,29 +48,45 @@ class PsycopgRunner(DBRunner):
         self._conn = None
 
     def _connect(self):
-        if self._conn is None:
+        if self._conn is None or getattr(self._conn, "closed", False):
             import psycopg  # 懒加载，未安装时报清晰错误
 
-            self._conn = psycopg.connect(self.dsn, connect_timeout=int(self.timeout))
+            self._conn = psycopg.connect(
+                self.dsn,
+                connect_timeout=int(self.timeout),
+                autocommit=True,  # 只读场景：避免一条坏语句毒化整个会话
+            )
         return self._conn
+
+    def _discard(self) -> None:
+        """丢弃当前连接，下一次调用自动重连（不把坏状态的连接留给后续查询）。"""
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _query(self, sql: str) -> tuple[list[str], list[tuple]]:
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                cols = [d[0] for d in cur.description] if cur.description else []
+                return cols, cur.fetchall()
+        except Exception:  # noqa: BLE001
+            self._discard()
+            raise
 
     def explain(self, sql: str) -> tuple[bool, Optional[str]]:
         try:
-            conn = self._connect()
-            with conn.cursor() as cur:
-                cur.execute(f"EXPLAIN {sql}")  # 只读预检，不产生任何写/读副作用
-                cur.fetchall()
+            self._query(f"EXPLAIN {sql}")  # 只读预检，不产生任何写/读副作用
             return True, None
         except Exception as e:  # noqa: BLE001
             return False, f"EXPLAIN 失败: {e}"
 
     def execute(self, sql: str) -> tuple[list[str], list[tuple]]:
-        conn = self._connect()
-        with conn.cursor() as cur:
-            cur.execute(sql)
-            cols = [d[0] for d in cur.description]
-            rows = cur.fetchall()
-        return cols, rows
+        return self._query(sql)
 
 
 def build_db(settings, registry=None) -> DBRunner:

@@ -146,6 +146,7 @@ PIPELINE__MAX_RETRY=1
 | 生成错了没法发现 | `DBRunner.explain`（生产为 EXPLAIN）做执行预检 |
 | SQL 正确但匹配 0 行 / 全 NULL | **空结果自愈**：`query()` 检测到空结果，带「过滤条件可能不匹配」反馈重生成一次（`retry_on_empty`，可关）；UI 自动展开 SQL |
 | 问「各业务线/各实验室」却只返回一个总数 | 语义层识别**分组维度**（`各/按/每个 + 维度词`）→ Glossary 下发 `GROUP BY` 指令（每行一个取值），且**不再把同维度继承成过滤条件** |
+| 会话中途答错一次后，后面全查不到数据 | 连接用 **autocommit**（每语句独立事务）避免坏语句毒化整条连接，并**异常即弃连接重连**——否则 PostgreSQL 的 `current transaction is aborted` 会让整条连接持续失败 |
 | 重试后仍失败 | 回退到最相关示例 SQL，`source=fallback_template` |
 | 定位故障层 | `source` 字段 + `PipelineTrace`（每步 attempt 都有记录） |
 
@@ -154,7 +155,9 @@ PIPELINE__MAX_RETRY=1
 ## 6. 生产替换清单
 
 1. **`llm.py`**：配 `LLM__API_KEY` 即自动切换真实 OpenAI 兼容模型；温度恒为 0。
-2. **`db.py`**：配 `DB__DSN` 即走 `PsycopgRunner.explain`（`EXPLAIN`，只读不执行）。
+2. **`db.py`**：配 `DB__DSN` 即走 `PsycopgRunner.explain`（`EXPLAIN`，只读不执行）；
+   连接为 **autocommit**（只读场景，避免一条坏语句让整条连接持续报
+   `current transaction is aborted`），且任何异常都会丢弃连接、下次自动重连。
 3. **`validation.py`**：已用 `sqlglot` 做 AST 解析与方言（`dialect` 可配 postgres/mysql/...），
    比正则可靠得多；可按需扩展为「语义校验 + 权限校验」。
 4. **`retrieval.py`**：若标签覆盖不足，可叠加 BM25（`rank_bm25`）或向量检索，
