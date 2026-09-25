@@ -33,7 +33,7 @@ import streamlit as st
 # ============================================================
 # 页面显示的机构名称（想换名只改这一行；不涉及任何业务逻辑）
 # ============================================================
-DISPLAY_NAME = "计量检测集团"
+DISPLAY_NAME = "test"
 
 st.set_page_config(
     page_title=f"{DISPLAY_NAME} · 智能问数", page_icon="📊", layout="wide"
