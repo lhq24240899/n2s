@@ -94,6 +94,7 @@ class Text2SQLGraph:
         prompt_builder: Optional[PromptBuilder] = None,
         linker: Optional[SchemaLinker] = None,
         retriever: Optional[RetrievalService] = None,
+        graph=None,
         top_k: int = 5,
         min_score: float = 1.0,
         max_retry: int = 1,
@@ -107,7 +108,8 @@ class Text2SQLGraph:
         self.glossary = glossary
         self.validator = validator or SQLValidator(registry, dialect=registry.dialect)
         self.prompt = prompt_builder or PromptBuilder(registry)
-        self.linker = linker or SchemaLinker(registry)
+        # 业务知识图谱：让 Schema Linking 能把中文业务词映射到英文物理表
+        self.linker = linker or SchemaLinker(registry, graph=graph)
         self.retriever = retriever or RetrievalService(store, min_score=min_score)
         self.top_k = top_k
         self.max_retry = max_retry
@@ -177,9 +179,11 @@ class Text2SQLGraph:
         if self.guard is not None:
             # 与 pipeline 一致：无权表不出现在 prompt 里
             schemas = self.guard.constrain_schemas(schemas)
+        kg = [r for r in getattr(self.linker, "last_reasons", []) if r.startswith("知识图谱")]
+        note = f"，知识图谱贡献 {len(kg)} 张" if kg else ""
         return self._merge(
             state,
-            f"link：候选表 {len(schemas)} 张 {[t.name for t in schemas]}",
+            f"link：候选表 {len(schemas)} 张 {[t.name for t in schemas]}{note}",
             candidate_tables=candidate,
             allowed_tables=[t.name for t in schemas],
             schemas=schemas,

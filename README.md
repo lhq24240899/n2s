@@ -121,9 +121,17 @@ python examples/demo.py         # 通用 3 场景
 # 5) 跑单元测试（使用 tests/doubles 里的离线替身，不花真钱、不碰真库）
 pytest -q
 
+# 5.5) 跑问数评估集（57 条，真 LLM + 真库，输出 execution accuracy）
+python examples/eval_run.py                 # 全量，报告写入 evals/last_report.json
+python examples/eval_run.py --category 分组 # 只跑某类
+
 # 6) 起智能体 API / MCP server（第 12 节）
 python examples/api_server.py --port 8000      # → http://127.0.0.1:8000/docs
 python -m nl2sql.mcp_server                    # stdio，给 IDE / 其它智能体用
+
+# 7) schema 变更检测（对接元数据中心后的 CI 卡口）
+python examples/metadata_check.py --save       # 首次保存快照
+python examples/metadata_check.py              # 有变更输出明细，退出码 1
 ```
 
 输出会清晰展示三种最终来源：
@@ -288,16 +296,22 @@ python examples/grg_demo.py
 3. **歧义澄清**：`那个做环境的实验室利用率怎么样` → 触发歧义同义词，返回澄清问题，不进入生成。
 4. **跨业务线**：`集成电路测试的检测一次通过率` → 同义词"集成电路"→ic，跨表关联 test_records。
 
-### 8.5 测试
+### 8.5 测试与评估
 
 ```bash
-pytest -q            # 共 120 个用例：检索/校验/linker/pipeline/semantic/context/grg
-                     #   + kb(混合RAG)/rerank/graph(图编排)/auth/policy/api/mcp
+pytest -q                        # 144 个离线用例：检索/校验/linker/semantic/context/grg
+                                 #   + kb(混合RAG)/rerank/graph(图编排)/auth/policy/api/mcp/metadata
+python examples/eval_run.py      # 57 条在线评估（真 LLM + 真库）→ execution accuracy
 ```
 
 测试分层：`tests/doubles.py` 提供确定性替身（不联网、不花钱、不碰真库），
 `tests/service_factory.py` 用替身搭出**真实服务栈**（真实 QueryService + 引擎 + 语义层 + 权限层），
 因此 `test_api.py` / `test_mcp.py` 覆盖的是真实调用链，而不是 mock 出来的假接口。
+
+**评估与测试的分工**：pytest 验证"代码逻辑对不对"（离线、秒级）；
+评估集验证"**答得准不准**"（在线、按 execution accuracy 计分）。
+评估集的标准答案是一段段**标准 SQL**——与系统生成的 SQL 在同一库上各跑一遍、按值比对，
+所以种子数据变了评估集依然有效。详见第 13 节。
 
 ### 8.6 落地路线（对应你 §六）
 
@@ -586,3 +600,77 @@ HTTP API 面向前端；MCP 面向**宿主模型**——把能力以「工具 + 
 
 
 
+
+---
+
+## 13. 评估体系与元数据接入
+
+这一节对应 JD 第 2 条里最容易被忽略的两句：「搭建智能问数**全流程**能力」（全流程必须**可衡量**）
+和「**对接**企业数据系统」（表结构不能永远手写在代码里）。
+
+### 13.1 评估集：57 条 + 自动跑分（execution accuracy）
+
+```bash
+python examples/eval_run.py                  # 全量，报告写 evals/last_report.json
+python examples/eval_run.py --category 分组  # 只跑某类
+python examples/eval_run.py --min-accuracy 0.9   # 低于阈值退出码 1，可接 CI
+```
+
+设计（`evals/harness.py` + `evals/cases.py`）：
+
+- **标准答案不是硬编码数字，而是标准 SQL**——与系统生成的 SQL 在同一个库上各跑一遍、按值比对。
+  这是 NL2SQL 领域标准的 evaluation 做法：种子数据变了评估集依然有效，还顺带验证标准 SQL 本身。
+- 浮点按 4 位小数归一；多行结果按**排序后的集合**比对（GROUP BY 行序不影响对错）；
+  「最高的实验室是哪个」允许系统额外返回利用率列，只要标准值出现在任一列即算命中。
+- 57 条覆盖 8 类：指标值（准时率/收入/利用率/一次通过率/周期）、分组、排名 TopN、总量计数、
+  **多轮继承**、澄清、文档 RAG（必须带引用）、**安全**（写请求/注入必须被拒）、边界健壮。
+- 比对逻辑是纯函数，`tests/test_eval.py` 离线单测（不起服务也能测 harness）。
+
+**首轮基线 75.4% → 修复后 93.0%**，每一处提升都是评估集抓出来的真实缺陷：
+
+| 轮次 | 通过率 | 评估集抓到的缺陷 → 修复 |
+|---|---|---|
+| R1 | 75.4% | 「总量」问句 0/8——"多少台设备"没有注册指标，**被错误路由进文档问答** → 语义层新增 `count` 意图 + Glossary 下发 `COUNT(*)` 指令；"上个月"时而滚动窗口时而自然月 → 时间口径钉死进 Glossary |
+| R2 | 91.2% | TopN 问句（"报告数量最多的业务线"）仍走 RAG → 补 `topn` 意图进路由；LLM 只返回聚合数值不返回"是哪个" → 排名约束要求第一列是名称列 |
+| R3 | **93.0%** | 剩余 4 条失败各有明确根因（见下），不再盲修 |
+
+**R3 剩余 4 个已知失败（诚实记录）**：
+- `按实验室统计报告数量`：LLM 自行添加了问题未提及的过滤条件（NL2SQL 的经典病）；
+- `每个客户的合同总金额`：LLM 用 id 列而不是名称列分组——Glossary 已要求名称列，模型服从性问题的边界 case；
+- `已开票合同金额最高的客户`：LLM 用了保留字 `to` 做别名导致 EXPLAIN 失败，重试后回退模板；
+- `已开票的合同总金额`：**口径冲突**——"合同总金额"命中了收入指标的口径（经报告关联，23,000,000），
+  而字面口径是合同表直接求和（800,000）。这不是 bug，是**指标治理问题**：两个口径都"对"，
+  正确解法是在语义层显式区分「合同金额」与「检测服务收入」两个指标——这正是 JD 里"协同优化指标体系"要解决的事。
+
+> 面试价值：**"你的准确率多少？怎么测的？"** —— 93.0%，57 条 8 类，标准答案是一段段标准 SQL、按执行结果比对，
+> 且能说出"从 75% 到 93% 的每一分是修了什么"。这比任何"我做了 NL2SQL"都有说服力。
+
+### 13.2 知识图谱接进 Schema Linking（把注释兑现）
+
+`KnowledgeGraph` 和 `related_tables()` 早就写好了，注释说"供 Schema Linking 增强"——但 `SchemaLinker`
+**从没接过它**。本次补上，并给图谱补了「业务术语 → 物理表」的对应表关系（实验室→labs、设备→equipment…）：
+
+- 实测收益：`各实验室的设备利用率` 这类问题，物理表名是英文（labs/equipment），纯字面匹配**一张表都抽不到**，
+  现在靠图谱的「实验室→labs、设备→equipment」正确落表（`linker.last_reasons` 可解释，图编排的 trace 会显示
+  "知识图谱贡献 N 张"）。
+- 设计约束：只走一跳的「对应表」关系，不做多跳推理——多跳会把无关表拉进 prompt，反而稀释注意力。
+- 单测：`tests/test_linker.py`（图谱命中/关闭时行为不变/概念关系不污染候选表）。
+
+### 13.3 元数据接入：`MetadataProvider`（表结构的单一事实来源）
+
+Demo 形态表结构手写在 `examples/grg_schema.py`；生产必须从元数据中心/数仓 API 自动获取。
+`nl2sql/metadata.py` 提供三件事：
+
+| 能力 | 说明 |
+|---|---|
+| `MetadataProvider.load()` | `Static`（代码内领域库，默认）/ `Api`（`GET {base}/tables`，Bearer 鉴权，进程内 TTL 缓存）两种实现，`METADATA__PROVIDER=api` 一键切换，业务代码零改动 |
+| `fingerprint()` | 结构指纹：加表/删表/加列/改类型任一变化都会改变指纹，进程内检测到即告警 |
+| `diff_tables()` | 把"变了什么"渲染成人话（新增/删除表、新增/删除列、类型变更） |
+
+```bash
+python examples/metadata_check.py --save    # 首次保存结构快照
+python examples/metadata_check.py           # 有变更打印明细并退出码 1（CI 卡口）
+```
+
+配合上游的**库级只读 + 行级权限**（第 12 节）与这里的**schema 变更检测**，
+"对接企业数据系统"的三件套就齐了：元数据自动获取、权限可执行、变更可发现。

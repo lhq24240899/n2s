@@ -112,6 +112,19 @@ class PipelineSettings(BaseModel):
     critique_llm: bool = False   # 图编排下是否开启 LLM 结果复核（默认关，省成本）
 
 
+class MetadataSettings(BaseModel):
+    """元数据接入：表结构的来源（对应「对接企业数据系统」）。
+
+    static = 代码内领域知识库（Demo 形态）；api = 从元数据中心/数仓 API 自动同步（生产形态）。
+    """
+
+    provider: str = "static"       # static | api
+    base_url: str = ""             # api 模式：GET {base_url}/tables
+    token: str = ""                # api 模式：Bearer token
+    timeout: float = 10.0
+    cache_ttl: float = 300.0       # api 模式的进程内缓存秒数
+
+
 class LogSettings(BaseModel):
     level: str = "INFO"
     fmt: str = "text"            # text | json
@@ -128,6 +141,7 @@ class Settings(BaseSettings):
     db: DBSettings = DBSettings()
     auth: AuthSettings = AuthSettings()
     api: ApiSettings = ApiSettings()
+    metadata: MetadataSettings = MetadataSettings()
     retrieval: RetrievalSettings = RetrievalSettings()
     embedding: EmbeddingSettings = EmbeddingSettings()
     kb: KBSettings = KBSettings()

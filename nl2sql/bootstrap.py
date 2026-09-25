@@ -24,6 +24,7 @@ from .pipeline import Text2SQLPipeline
 from .policy import DataPolicy, PolicyGuard
 
 _log = logging.getLogger("nl2sql.bootstrap")
+_LAST_SCHEMA_FINGERPRINT: str = ""   # 进程内记录上次结构指纹，用于变更告警
 
 
 @dataclass
@@ -47,13 +48,32 @@ def build_app_context(
     need_db: bool = True,
     need_kb: bool = True,
 ) -> AppContext:
-    """构建上下文。领域知识（表/指标/同义词/示例/知识库语料）来自 examples/。"""
+    """构建上下文。领域知识（指标/同义词/示例/知识库语料）来自 examples/；
+    表结构来自**元数据接入层**（static=代码内领域库，api=元数据中心同步）。"""
     settings = settings or get_settings()
     setup_logging(settings.log.level, settings.log.fmt)
 
-    from examples.grg_schema import build_registry, build_semantic_layer, build_store
+    from examples.grg_schema import build_semantic_layer, build_store
 
-    registry = build_registry(settings.db.dialect)
+    from .knowledge import SchemaRegistry
+    from .metadata import build_metadata_provider, fingerprint
+
+    # 表结构的单一事实来源：生产切 METADATA__PROVIDER=api 即可，业务代码零改动
+    provider = build_metadata_provider(settings)
+    tables = provider.load()
+    registry = SchemaRegistry(tables, dialect=settings.db.dialect)
+    fp = fingerprint(tables)
+    global _LAST_SCHEMA_FINGERPRINT
+    if _LAST_SCHEMA_FINGERPRINT and _LAST_SCHEMA_FINGERPRINT != fp:
+        _log.warning(
+            "检测到 schema 变更: %s -> %s（请运行 examples/metadata_check.py 查看明细）",
+            _LAST_SCHEMA_FINGERPRINT, fp,
+        )
+    _LAST_SCHEMA_FINGERPRINT = fp
+    _log.info(
+        "元数据加载: provider=%s tables=%d fingerprint=%s",
+        type(provider).__name__, len(tables), fp,
+    )
     store = build_store()
     layer = build_semantic_layer()
 
@@ -120,6 +140,7 @@ def _make_graph_runner(ctx: AppContext, guard: PolicyGuard):
         llm=ctx.llm,
         db=ctx.db,
         retriever=_build_store_retriever(ctx),
+        graph=getattr(ctx.layer, "graph", None),   # 业务知识图谱 -> Schema Linking
         top_k=settings.retrieval.top_k,
         min_score=settings.retrieval.min_score,
         max_retry=settings.pipeline.max_retry,
@@ -150,6 +171,7 @@ def _make_pipeline(ctx: AppContext, guard: PolicyGuard) -> Text2SQLPipeline:
         llm=ctx.llm,
         db=ctx.db,
         retriever=_build_store_retriever(ctx),
+        graph=getattr(ctx.layer, "graph", None),   # 业务知识图谱 -> Schema Linking
         top_k=settings.retrieval.top_k,
         min_score=settings.retrieval.min_score,
         max_retry=settings.pipeline.max_retry,

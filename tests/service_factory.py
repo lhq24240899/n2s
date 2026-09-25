@@ -44,6 +44,7 @@ def make_service(settings: Settings | None = None, *, policy_factory=None,
         pipeline = Text2SQLPipeline(
             registry=registry, store=store, llm=GRGMockLLM(),
             db=GRGSampleDB(registry, dialect=settings.db.dialect),
+            graph=layer.graph,  # 与生产装配一致：知识图谱参与 Schema Linking
             top_k=settings.retrieval.top_k, min_score=settings.retrieval.min_score,
             max_retry=settings.pipeline.max_retry,
         )

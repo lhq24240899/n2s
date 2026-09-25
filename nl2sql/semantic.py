@@ -149,6 +149,17 @@ class SemanticLayer:
         "business_line": "business_lines.name",
         "lab": "labs.name",
         "region": "labs.region",
+        "customer": "customers.name",
+    }
+
+    # 时间口径：口语 -> 规范 SQL 窗口。不固定死它，LLM 会时而写滚动窗口时而写自然月，
+    # 同一个"上个月"返回不同数字（评估集实测抓到过）。
+    TIME_WINDOWS = {
+        "上个月": "r.issued_at >= CURRENT_DATE - INTERVAL '30 days'（滚动30天，**不要**用自然月 date_trunc）",
+        "上月": "r.issued_at >= CURRENT_DATE - INTERVAL '30 days'（滚动30天，**不要**用自然月 date_trunc）",
+        "上周": "r.issued_at >= CURRENT_DATE - INTERVAL '7 days'（滚动7天）",
+        "本月": "r.issued_at >= date_trunc('month', CURRENT_DATE)（本月1号至今）",
+        "这个月": "r.issued_at >= date_trunc('month', CURRENT_DATE)（本月1号至今）",
     }
 
     def __init__(
@@ -181,12 +192,11 @@ class SemanticLayer:
         ms: list[GlossaryMetric] = []
         if metric_id and metric_id in self.metrics:
             m = self.metrics[metric_id]
-            ms.append(
-                GlossaryMetric(
-                    m.name,
-                    f"{m.definition}  [SQL参考: {m.sql_hint}]",
-                )
-            )
+            # 分组/排名问句下不下发标量 SQL 模板——它会与「GROUP BY / 返回名称列」的
+            # 约束打架（评估集实测：hint 是标量 SUM 模板时，LLM 会无视分组要求）
+            shaped = bool(entities and (entities.get("group_by") or entities.get("topn")))
+            hint = "" if shaped else f"  [SQL参考: {m.sql_hint}]"
+            ms.append(GlossaryMetric(m.name, f"{m.definition}{hint}"))
 
         entries = list(self.base_entries)
         if entities:
@@ -210,9 +220,41 @@ class SemanticLayer:
                     "分组维度（重要）",
                     f"本次问的是「各{group_by}」的分布，必须按 {group_col} 做 GROUP BY，"
                     f"**每个取值输出一行**（不要把全部数据聚合成一个数），"
+                    f"**SELECT 里必须带 {group_col} 这个名称列**（不要用 id 列当分组标识），"
                     f"并且不要再对该维度添加 WHERE 过滤条件",
                 )
             )
+
+        # 总量问句：明确要求 COUNT，防止 LLM 自作主张换聚合
+        if entities.get("count"):
+            out.append(
+                GlossaryEntry(
+                    "本次聚合（重要）",
+                    "这是一个**计数**问题：用 COUNT(*) 统计行数，不要对其它列做 SUM/AVG",
+                )
+            )
+
+        # 最值/排名问句：要求返回"是哪个"的名称列，而不是只给一个数
+        if entities.get("topn"):
+            out.append(
+                GlossaryEntry(
+                    "排名问句（重要）",
+                    "这是一个**最值/排名**问题：用 ORDER BY <聚合值> ASC/DESC 加 LIMIT 返回最值那一行；"
+                    "**第一列必须是名称标识列**（如实验室名/业务线名/客户名），不要只返回聚合数值，也不要用 id 列",
+                )
+            )
+
+        # 时间口径：把口语时间钉死成规范 SQL 窗口（评估集实测：不钉死会漂移）
+        time_word = entities.get("time")
+        if time_word:
+            window = self.TIME_WINDOWS.get(time_word)
+            if window:
+                out.append(
+                    GlossaryEntry(
+                        "本次时间口径（重要）",
+                        f"问题里的「{time_word}」必须翻译成：{window}",
+                    )
+                )
 
         for key, column in self.entity_columns.items():
             if group_col and key == group_by:
@@ -243,8 +285,21 @@ class SemanticMapper:
         "business_line": ("业务线", "业务板块"),
         "lab": ("实验室",),
         "region": ("区域", "大区", "地区"),
+        "customer": ("客户",),
     }
     GROUP_TRIGGERS = ("各", "各个", "每个", "每", "按", "分别", "不同", "所有")
+
+    # 总量问句：「多少台 / 多少个 / 总数」这类**计数意图**。
+    # 这些问题没有注册指标，若不显式识别会被当成文档问答（评估集实测：总量类 0/8 全走错路）。
+    COUNT_PATTERNS = (
+        "多少台", "多少个", "多少份", "多少条", "多少家", "多少张",
+        "总数", "数量是多少", "有几个", "几台", "几个",
+    )
+
+    # 最值/排名问句：「最高的 / 最多的 / 最低的」。
+    # 不识别的话部分问句会被当成文档问答；且 LLM 常只返回聚合数值，
+    # 忘了返回"是哪个"的名称列（评估集实测）。
+    TOPN_PATTERNS = ("最高", "最多", "最低", "最少", "排名", "前三个", "前三名", "top")
 
     def __init__(self, layer: SemanticLayer):
         self.layer = layer
@@ -287,6 +342,18 @@ class SemanticMapper:
                 entities.setdefault("metric", m.id)
                 reasons.append(f"指标命中:{m.name}")
                 break
+
+        # 2.5) 总量问句：没有注册指标的计数意图 -> 显式标记，保证走结构化 SQL
+        #      （不标记会被当成文档问答：评估集实测「总量」类 0/8 全部走错路）
+        if not metric and any(p in question for p in self.COUNT_PATTERNS):
+            entities["count"] = True
+            reasons.append("总量问句: COUNT 计数（走结构化查询）")
+
+        # 2.6) 最值/排名问句：同样需要显式路由 + 约束返回形态
+        ql = question.lower()
+        if any(p in question for p in self.TOPN_PATTERNS) or "top" in ql:
+            entities["topn"] = True
+            reasons.append("排名问句: 返回最值所在行（ORDER BY + LIMIT），需含名称列")
 
         # 3) 区域实体抽取
         for r in self.REGIONS:

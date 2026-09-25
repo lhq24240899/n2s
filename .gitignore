@@ -18,3 +18,5 @@ venv/
 .idea/
 .vscode/
 .DS_Store
+.metadata_snapshot.json
+evals/last_report.json

@@ -170,8 +170,15 @@ class GRGQueryEngine:
         # 用「本轮问题」而不是继承后的文本，避免继承来的维度词把文档检索带偏。
         docs = self.doc_retriever.retrieve(mapped.normalized) if self.doc_retriever else []
 
-        # 路由：解析不出结构化意图（无指标、也没要求分组）-> 走文档问答（RAG）
-        structured = merged.metric is not None or "group_by" in merged.entities
+        # 路由：解析不出结构化意图（无指标、无计数/排名意图、也没要求分组）-> 走文档问答（RAG）
+        # （"多少台设备"这类总量问句没有注册指标，必须靠 count 意图保住结构化路由——
+        #   评估集实测：缺这条规则时「总量」类 8 条全部被错误路由进 RAG）
+        structured = (
+            merged.metric is not None
+            or "group_by" in merged.entities
+            or "count" in merged.entities
+            or "topn" in merged.entities
+        )
         if not structured and docs:
             answer = answer_with_docs(
                 self.pipeline.llm, mapped.normalized, docs, self.doc_max_chars

@@ -106,6 +106,7 @@ def get_engine():
     setup_logging(settings.log.level, settings.log.fmt)
 
     registry = build_registry(settings.db.dialect)
+    layer = build_semantic_layer()
     llm = build_llm(settings.llm)  # 缺 LLM__API_KEY 会直接抛错
     store = build_store()
 
@@ -116,11 +117,12 @@ def get_engine():
             llm=llm,
             db=build_db(settings.db, registry),  # 缺 DB__DSN 会直接抛错
             retriever=_build_retriever(settings, store, llm),
+            graph=layer.graph,  # 业务知识图谱 -> Schema Linking（中文业务词 -> 物理表）
             top_k=settings.retrieval.top_k,
             min_score=settings.retrieval.min_score,
             max_retry=settings.pipeline.max_retry,
         ),
-        build_semantic_layer(),
+        layer,
         doc_retriever=_build_doc_retriever(settings, llm),
         doc_max_chars=settings.kb.doc_max_chars,
     )

@@ -165,7 +165,7 @@ def build_metrics() -> list[Metric]:
             ),
             source_tables=["contracts", "trust_orders", "reports"],
             dimensions=["区域", "实验室", "业务线", "时间"],
-            aliases=["收入", "营收", "检测收入"],
+            aliases=["收入", "营收", "检测收入", "合同金额", "合同总金额"],
         ),
         Metric(
             id="on_time_completion_rate",
@@ -237,6 +237,13 @@ def build_synonyms() -> list[Synonym]:
         Synonym("计量", "计量服务", "business_line", "calibration"),
         Synonym("生命科学", "生命科学", "business_line", "life_science"),
         Synonym("EHS", "EHS评价服务", "business_line", "ehs"),
+        # ---- 业务线**全名**也要登记：用户可能直接说全称（评估集实测，
+        #      漏登记时 LLM 拿不到硬约束，会把"按业务线过滤"写成"按业务线分组"）----
+        Synonym("可靠性与环境试验", "可靠性与环境试验", "business_line", "reliability"),
+        Synonym("电磁兼容检测", "电磁兼容检测", "business_line", "emc"),
+        Synonym("集成电路测试与分析", "集成电路测试与分析", "business_line", "ic"),
+        Synonym("计量服务", "计量服务", "business_line", "calibration"),
+        Synonym("数据科学分析与评价", "数据科学分析与评价", "business_line", "data_science"),
         # 歧义示例：需向用户澄清。
         # canonical 用「可靠性」——用户确认后用它重写原问题，从而复用已有的
         # 「可靠性 -> business_line=reliability」映射，保证消歧后能正确落到指标/业务线。
@@ -278,9 +285,29 @@ def build_knowledge_graph() -> KnowledgeGraph:
         KGEdge("检测记录", "生成", "报告"),
         KGEdge("客户", "签订", "合同"),
         KGEdge("合同", "关联", "委托单"),
+
+        # ---- 「业务术语 -> 物理表」映射 ----
+        # 这一段是 Schema Linking 真正要用的：用户说中文，物理表名是英文，
+        # 靠它把「实验室」「设备」这类业务词落到 labs / equipment 上。
+        KGEdge("实验室", "对应表", "labs"),
+        KGEdge("设备", "对应表", "equipment"),
+        KGEdge("委托单", "对应表", "trust_orders"),
+        KGEdge("报告", "对应表", "reports"),
+        KGEdge("检测记录", "对应表", "test_records"),
+        KGEdge("客户", "对应表", "customers"),
+        KGEdge("合同", "对应表", "contracts"),
+        # 区域落在 labs.region 这一列上，不是独立的表
+        KGEdge("区域", "对应表", "labs"),
+        KGEdge("华东", "对应表", "labs"),
+        KGEdge("华南", "对应表", "labs"),
+        KGEdge("华北", "对应表", "labs"),
+
+        # 业务线 -> 数据表（报告表与检测记录表都按业务线关联）
         KGEdge("可靠性与环境试验", "对应表", "reports"),
         KGEdge("电磁兼容检测", "对应表", "reports"),
         KGEdge("集成电路测试与分析", "对应表", "test_records"),
+        KGEdge("计量服务", "对应表", "reports"),
+        KGEdge("数据科学分析与评价", "对应表", "reports"),
     ]
     return KnowledgeGraph(nodes=nodes, edges=edges)
 

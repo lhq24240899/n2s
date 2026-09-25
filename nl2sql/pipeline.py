@@ -44,6 +44,7 @@ class Text2SQLPipeline:
         prompt_builder: Optional[PromptBuilder] = None,
         linker: Optional[SchemaLinker] = None,
         retriever: Optional[RetrievalService] = None,
+        graph=None,
         top_k: int = 5,
         min_score: float = 1.0,
         max_retry: int = 1,
@@ -56,7 +57,10 @@ class Text2SQLPipeline:
         self.glossary = glossary
         self.validator = validator or SQLValidator(registry, dialect=registry.dialect)
         self.prompt = prompt_builder or PromptBuilder(registry)
-        self.linker = linker or SchemaLinker(registry)
+        # 业务知识图谱（SemanticLayer.graph）：让 Schema Linking 能把中文业务词
+        # 映射到英文物理表——否则「各实验室的设备利用率」一张表都抽不到，
+        # 只能靠检索命中兜着走（实测过，见 linker.py 的注释）
+        self.linker = linker or SchemaLinker(registry, graph=graph)
         self.retriever = retriever or RetrievalService(store, min_score=min_score)
         self.top_k = top_k
         self.max_retry = max_retry
@@ -96,6 +100,9 @@ class Text2SQLPipeline:
         trace.candidate_tables = candidate
         trace.allowed_tables = allowed
         self._log.info("候选表: %s", allowed)
+        # Schema Linking 的可解释依据（字面命中/检索继承/知识图谱/兜底各贡献了什么）
+        for r in getattr(self.linker, "last_reasons", []):
+            self._log.info("  └ linking 依据: %s", r)
 
         # 3) 生成 + 校验 + 预检 + 重试
         error_feedback: Optional[str] = pre_feedback

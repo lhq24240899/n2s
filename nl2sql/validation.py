@@ -64,7 +64,11 @@ class SQLValidator:
         if unknown:
             return f"引用了未授权表: {sorted(unknown)}"
 
-        # 列白名单（幻觉字段拦截）
+        # 列白名单（幻觉字段拦截）。
+        # 注意：SELECT 别名（AS xxx）不是物理列，必须先收集放行——否则
+        # `SELECT COUNT(*) AS cnt ... ORDER BY cnt` 这种合法写法会被误杀，
+        # 重试耗尽后回退到模板 SQL，答案整个跑偏（评估集实测抓到过）。
+        aliases = {a.alias_or_name for a in parsed.find_all(exp.Alias)}
         table_cols = {name: set(t.columns.keys()) for name, t in self.registry.tables.items()}
         for col in parsed.find_all(exp.Column):
             cname = col.name
@@ -73,6 +77,8 @@ class SQLValidator:
                 if tbl in table_cols and cname not in table_cols[tbl]:
                     return f"列不存在: {tbl}.{cname}"
             else:
+                if cname in aliases:
+                    continue  # SELECT/CTE 列别名，合法
                 if not any(cname in table_cols[t] for t in allowed_tables):
                     return f"列不存在: {cname}"
 
