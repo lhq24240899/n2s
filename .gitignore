@@ -1,6 +1,7 @@
 # ===== 密钥 / 环境（绝不提交）=====
 .env
 .env.local
+.streamlit/secrets.toml
 
 # ===== Python 缓存 / 构建产物 =====
 __pycache__/

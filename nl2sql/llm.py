@@ -31,10 +31,21 @@ class OpenAIClient(LLMClient):
         temperature: float = 0.0,
         max_tokens: int = 1024,
         timeout: float = 30.0,
+        disable_proxy: bool = False,
     ):
         from openai import OpenAI  # 懒加载，未安装时报清晰错误
 
-        self._client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+        http_client = None
+        if disable_proxy:
+            # 忽略 HTTP_PROXY/HTTPS_PROXY：本机代理未运行却残留代理环境变量时，
+            # httpx 会尝试连代理并失败（Connection error），置 true 直连即可。
+            import httpx
+
+            http_client = httpx.Client(trust_env=False)
+
+        self._client = OpenAI(
+            base_url=base_url, api_key=api_key, timeout=timeout, http_client=http_client
+        )
         self._model = model
         self._temperature = temperature
         self._max_tokens = max_tokens
@@ -67,4 +78,5 @@ def build_llm(settings: LLMSettings) -> LLMClient:
         temperature=settings.temperature,
         max_tokens=settings.max_tokens,
         timeout=settings.timeout,
+        disable_proxy=settings.disable_proxy,
     )

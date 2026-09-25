@@ -21,6 +21,9 @@ class LLMSettings(BaseModel):
     temperature: float = 0.0     # 生成 SQL 必须确定性，温度恒为 0
     max_tokens: int = 1024
     timeout: float = 30.0
+    # 忽略 HTTP_PROXY/HTTPS_PROXY 等环境代理（httpx trust_env=False）。
+    # 本机代理软件未开、却残留代理环境变量时会导致 Connection error，置 true 可直连。
+    disable_proxy: bool = False
 
 
 class DBSettings(BaseModel):

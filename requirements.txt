@@ -1,11 +1,14 @@
 # 核心依赖（必装）
 sqlglot>=25.0          # SQL AST 解析与方言校验
 pydantic>=2.0          # 配置模型
-pydantic-settings>=2.0 # .env 配置加载
+pydantic-settings>=2.0 # 配置加载（.env / 环境变量 / Streamlit secrets）
 openai>=1.30           # OpenAI 兼容 LLM 客户端（通义/DeepSeek/Ollama 均可）
 
-# 真实 PostgreSQL 预检（生产启用；不装则自动回退到 Mock）
+# 真实 PostgreSQL 预检与执行（生产必装）
 psycopg[binary]>=3.1
+
+# Web UI（Streamlit Cloud 部署入口：streamlit_app.py）
+streamlit>=1.36
 
 # 开发依赖（测试）
 pytest>=8.0

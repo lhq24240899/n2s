@@ -1,0 +1,240 @@
+"""广电计量 · 智能问数系统 —— Streamlit 入口（部署时的 Main file）。
+
+部署到 Streamlit Community Cloud：
+  1. 仓库：https://github.com/lhq24240899/n2s
+  2. Main file path：streamlit_app.py
+  3. App → Settings → Secrets 填入（键名与 .env 一致，用 TOML）：
+        LLM__BASE_URL = "https://api.ephone.ai/v1"
+        LLM__API_KEY  = "sk-..."
+        LLM__MODEL    = "gpt-4o-mini"
+        DB__DSN       = "postgresql://user:pass@host/db?sslmode=require"
+     （详见 .streamlit/secrets.toml.example）
+  4. 数据库需先建表灌数：本地跑一次 `python examples/setup_dev_db.py`
+     （数据写入 Neon，云端直接复用，无需在 Cloud 上再建）
+
+本地运行：
+    streamlit run streamlit_app.py
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+# 保证 `nl2sql` / `examples` 可被导入（Streamlit 从仓库根启动，通常已满足）
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import streamlit as st
+
+st.set_page_config(page_title="广电计量 · 智能问数", page_icon="📊", layout="wide")
+
+SOURCE_LABEL = {
+    "llm": "✅ LLM 生成 · 通过静态校验 + 执行预检",
+    "fallback_template": "🟡 重试耗尽 · 回退到最相关示例 SQL",
+    "fallback_generic": "🟠 检索无命中 · 通用兜底生成",
+}
+
+EXAMPLES = [
+    "华东区上个月可靠性试验的准时完成率是多少",
+    "那华南区呢？",
+    "集成电路测试的检测一次通过率",
+    "各实验室设备利用率",
+    "华东区上个月可靠性试验的检测服务收入是多少",
+    "那个做环境的实验室利用率怎么样",
+]
+
+
+# ---------------------------------------------------------------------------
+# 1) 把 Streamlit secrets 注入环境变量，供 pydantic-settings 读取
+#    （Cloud 上没有 .env；本地仍可用 .env / .streamlit/secrets.toml）
+# ---------------------------------------------------------------------------
+def _flatten(d, prefix=""):
+    out: dict = {}
+    for k, v in d.items():
+        key = f"{prefix}{k}"
+        if isinstance(v, dict):
+            out.update(_flatten(v, f"{key}__"))
+        else:
+            out[key] = v
+    return out
+
+
+def _inject_secrets() -> None:
+    try:
+        sec = dict(st.secrets)
+    except Exception:
+        return
+    if not sec:
+        return
+    for k, v in _flatten(sec).items():
+        os.environ.setdefault(k.upper(), str(v))
+
+
+_inject_secrets()
+
+
+# ---------------------------------------------------------------------------
+# 2) 引擎：每个浏览器会话一个（自带多轮上下文），重组件在该会话内只建一次
+# ---------------------------------------------------------------------------
+def get_engine():
+    if "engine" in st.session_state:
+        return st.session_state.engine
+
+    from examples.grg_engine import GRGQueryEngine
+    from examples.grg_schema import build_registry, build_semantic_layer, build_store
+    from nl2sql.config import get_settings, setup_logging
+    from nl2sql.db import build_db
+    from nl2sql.llm import build_llm
+    from nl2sql.pipeline import Text2SQLPipeline
+
+    settings = get_settings()
+    setup_logging(settings.log.level, settings.log.fmt)
+
+    registry = build_registry(settings.db.dialect)
+    pipeline = Text2SQLPipeline(
+        registry=registry,
+        store=build_store(),
+        llm=build_llm(settings.llm),        # 缺 LLM__API_KEY 会直接抛错
+        db=build_db(settings.db, registry),  # 缺 DB__DSN 会直接抛错
+        top_k=settings.retrieval.top_k,
+        min_score=settings.retrieval.min_score,
+        max_retry=settings.pipeline.max_retry,
+    )
+    st.session_state.engine = GRGQueryEngine(pipeline, build_semantic_layer())
+    return st.session_state.engine
+
+
+def config_status() -> tuple[bool, str]:
+    """启动自检：明确告知缺了哪个配置，而不是等第一次提问才报错。"""
+    try:
+        from nl2sql.config import get_settings
+
+        s = get_settings()
+    except Exception as e:  # noqa: BLE001
+        return False, f"配置加载失败：{e}"
+    missing = []
+    if not s.llm.api_key:
+        missing.append("LLM__API_KEY")
+    if not s.db.dsn:
+        missing.append("DB__DSN")
+    if missing:
+        return False, "缺少配置：" + "、".join(missing)
+    return True, "配置就绪"
+
+
+# ---------------------------------------------------------------------------
+# 3) 结果渲染
+# ---------------------------------------------------------------------------
+def _fmt(v) -> str:
+    if isinstance(v, float):
+        return f"{v:,.4f}".rstrip("0").rstrip(".")
+    if isinstance(v, int):
+        return f"{v:,}"
+    return str(v)
+
+
+def render_answer(out: dict) -> None:
+    # 歧义澄清：不进入生成
+    if out.get("type") == "clarification":
+        st.warning(f"❓ 需要澄清：{out['message']}")
+        return
+
+    res = out["result"]
+    mapped = out["mapped"]
+    cols, rows = out["cols"], out["rows"]
+
+    st.caption(SOURCE_LABEL.get(res.source.value, res.source.value))
+
+    # 单值 -> 大数字卡片；多行 -> 表格
+    if rows and len(rows) == 1 and len(rows[0]) == 1:
+        label = mapped.metric.name if mapped.metric else (cols[0] if cols else "结果")
+        st.metric(label=label, value=_fmt(rows[0][0]))
+    elif rows:
+        st.dataframe([dict(zip(cols, r)) for r in rows])
+    else:
+        st.info("查询执行完成，但无数据返回。")
+
+    if res.error:
+        st.error(f"告警：{res.error}")
+
+    # 口径说明（可审计）
+    if mapped.metric:
+        m = mapped.metric
+        st.markdown(
+            f"> **口径说明**：{m.name} = {m.definition}  \n"
+            f"> 数据来源：`{'`、`'.join(m.source_tables)}`"
+        )
+
+    with st.expander("🔍 生成的 SQL"):
+        st.code(res.sql or "（无）", language="sql")
+
+    with st.expander("🧭 语义映射（可解释）"):
+        for r in mapped.reasons:
+            st.write(f"- {r}")
+        st.write(f"- 归一化问题：`{mapped.normalized}`")
+        st.write(f"- 解析实体：`{mapped.entities}`")
+
+
+# ---------------------------------------------------------------------------
+# 4) 页面
+# ---------------------------------------------------------------------------
+st.title("📊 广电计量 · 自然问数系统")
+st.caption(
+    "语义层驱动的 NL2SQL：可解释检索 · Schema Linking · sqlglot 校验 · "
+    "EXPLAIN 预检 · 多轮上下文 · 失败回退"
+)
+
+ok, msg = config_status()
+
+with st.sidebar:
+    st.subheader("⚙️ 状态")
+    (st.success if ok else st.error)(msg)
+
+    st.divider()
+    st.subheader("💡 示例问题")
+    for i, q in enumerate(EXAMPLES):
+        if st.button(q, key=f"ex_{i}"):
+            st.session_state.pending = q
+
+    st.divider()
+    if st.button("🧹 清空对话 / 重置多轮上下文"):
+        st.session_state.turns = []
+        if "engine" in st.session_state:
+            st.session_state.engine.reset_context()
+        st.rerun()
+
+    st.caption("数据源：Neon PostgreSQL（需先用 setup_dev_db.py 建表灌数）")
+
+if "turns" not in st.session_state:
+    st.session_state.turns = []
+
+# 渲染历史
+for t in st.session_state.turns:
+    with st.chat_message(t["role"], avatar=("🧑" if t["role"] == "user" else "📊")):
+        if t["role"] == "user":
+            st.write(t["content"])
+        else:
+            render_answer(t["payload"])
+
+# 取输入（支持侧边栏示例按钮注入）
+question = st.chat_input("用一句话提问，例如：华东区上个月可靠性试验的准时完成率是多少")
+if st.session_state.get("pending"):
+    question = st.session_state.pop("pending")
+
+if question:
+    st.session_state.turns.append({"role": "user", "content": question})
+    with st.chat_message("user", avatar="🧑"):
+        st.write(question)
+
+    with st.chat_message("assistant", avatar="📊"):
+        out = None
+        with st.spinner("语义映射 → 检索 → 生成 → 校验 → 预检 → 执行 ..."):
+            try:
+                out = get_engine().ask(question)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"初始化或查询失败：{e}")
+        if out is not None:
+            render_answer(out)
+            st.session_state.turns.append({"role": "assistant", "payload": out})

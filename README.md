@@ -52,6 +52,8 @@
 ```
 nl2sql/
 ├── pyproject.toml / requirements.txt / .env.example
+├── streamlit_app.py            # ★Web UI 入口（Streamlit Cloud 的 Main file）
+├── .streamlit/secrets.toml.example  # Streamlit secrets 模板（本地复制为 secrets.toml）
 ├── nl2sql/                     # 核心包
 │   ├── config.py               # pydantic-settings 配置 + 结构化日志
 │   ├── models.py               # 全部数据结构 + PipelineTrace
@@ -224,7 +226,7 @@ python examples/grg_demo.py
 
 演示覆盖：
 1. **单轮语义映射**：`华东区上个月可靠性试验的准时完成率` → 同义词展开、指标解析、注入口径、生成 SQL、口径说明。
-2. **多轮继承**：`那华南区呢？` → 继承业务线/指标/时间，仅换区域，返回不同值（华东 0.923 vs 华南 0.887）。
+2. **多轮继承**：`那华南区呢？` → 继承业务线/指标/时间，仅换区域，返回不同值（华东 0.9167 vs 华南 0.8889）。
 3. **歧义澄清**：`那个做环境的实验室利用率怎么样` → 触发歧义同义词，返回澄清问题，不进入生成。
 4. **跨业务线**：`集成电路测试的检测一次通过率` → 同义词"集成电路"→ic，跨表关联 test_records。
 
@@ -250,4 +252,48 @@ pytest -q            # 共 24 个用例：检索/校验/linker/pipeline + 新增
 EXPLAIN 预检 + 审计日志），重点投入在语义层而非重复建设数据接入——与你文档结论一致。
 演示用的确定性替身（`MockLLM`/`MockDBRunner`/`GRGMockLLM`/`GRGSampleDB`）只保留在 `tests/doubles.py`
 供离线单测使用，生产代码已强制走真实 LLM 与真实数据库。
+
+---
+
+## 9. 部署到 Streamlit
+
+Web 入口是仓库根目录的 **`streamlit_app.py`**（部署时的 **Main file**）。
+
+### 9.1 本地运行
+
+```bash
+pip install -r requirements.txt
+cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # 填入真实 LLM/DB 凭据
+streamlit run streamlit_app.py
+```
+
+本地也可继续用 `.env`（`streamlit_app.py` 会优先读 `st.secrets`，两者键名一致）。
+
+### 9.2 Streamlit Community Cloud
+
+1. 打开 https://share.streamlit.io → **New app** → 选仓库 `lhq24240899/n2s`、分支 `main`。
+2. **Main file path** 填：`streamlit_app.py`
+3. **Advanced settings → Secrets**，粘贴（键名同 `.env`，用 TOML）：
+
+   ```toml
+   LLM__BASE_URL = "https://api.ephone.ai/v1"
+   LLM__API_KEY  = "sk-..."
+   LLM__MODEL    = "gpt-4o-mini"
+   DB__DSN       = "postgresql://user:pass@host/db?sslmode=require"
+   ```
+
+4. Deploy。依赖由仓库根的 `requirements.txt` 自动安装。
+
+> **数据准备**：表与种子数据在**数据库侧**（Neon），不在 Cloud 上。本地跑一次
+> `python examples/setup_dev_db.py` 建好表即可，云端 App 直接复用同一库。
+
+### 9.3 架构说明（为什么这样接）
+
+- Cloud 上**没有 `.env`**，密钥走 `st.secrets`；`streamlit_app.py` 启动时把 secrets 展平后写入
+  环境变量（`LLM__BASE_URL` 等），`pydantic-settings` 便能像读 `.env` 一样读到——**核心引擎零改动**。
+- 每个浏览器会话**独立持有一个 `GRGQueryEngine`**（含独立 `QueryContext`），所以多轮上下文
+  互不串台；侧边栏「清空对话」即 `reset_context()`。
+- 结果区展示：数值卡片/表格 + **口径说明**（指标=口径，数据来源=表）+ 可展开的**生成 SQL** 与
+  **语义映射 reasons**——把「可解释、可审计」直接暴露给使用者。
+
 
