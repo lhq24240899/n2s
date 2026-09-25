@@ -131,6 +131,8 @@ class MappedQuery:
     resolved_synonyms: list[str]
     clarification: Optional[str]  # 若需澄清则非空
     reasons: list[str]
+    # 触发澄清的歧义同义词；上层据此在用户确认后「回到原问题」重跑
+    ambiguous_synonyms: list[Synonym] = field(default_factory=list)
 
 
 class SemanticLayer:
@@ -275,6 +277,7 @@ class SemanticMapper:
                 resolved_synonyms=resolved,
                 clarification=clar,
                 reasons=reasons,
+                ambiguous_synonyms=ambiguous,
             )
 
         return MappedQuery(

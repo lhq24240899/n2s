@@ -237,14 +237,16 @@ def build_synonyms() -> list[Synonym]:
         Synonym("计量", "计量服务", "business_line", "calibration"),
         Synonym("生命科学", "生命科学", "business_line", "life_science"),
         Synonym("EHS", "EHS评价服务", "business_line", "ehs"),
-        # 歧义示例：需向用户澄清
+        # 歧义示例：需向用户澄清。
+        # canonical 用「可靠性」——用户确认后用它重写原问题，从而复用已有的
+        # 「可靠性 -> business_line=reliability」映射，保证消歧后能正确落到指标/业务线。
         Synonym(
             "那个做环境的",
-            "环境可靠性实验室",
+            "可靠性",
             "business_line",
-            "",
+            "reliability",
             ambiguous=True,
-            clarification="您说的'那个做环境的'是指『环境可靠性实验室』吗？请确认是可靠性与环境试验业务线下的环境试验方向。",
+            clarification="您说的'那个做环境的'是指『可靠性与环境试验』（环境可靠性实验室）业务线吗？请确认。",
         ),
     ]
 

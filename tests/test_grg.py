@@ -61,3 +61,52 @@ def test_business_line_switch():
     out = e.ask("集成电路测试的检测一次通过率")
     assert out["type"] == "result"
     assert out["cols"] == ["first_pass_rate"]
+
+
+def test_clarification_resume_keeps_metric():
+    """确认澄清后应「回到原问题」：指标仍是用例里的设备利用率。
+
+    回归用例：线上曾出现先问收入、再问"那个做环境的实验室利用率怎么样"、
+    确认后却答成"检测服务收入"——因为澄清后把答复当成新问题，
+    继承了上一轮的旧指标。
+    """
+    e = _engine()
+    # 先制造一个"旧指标"（收入）留在上下文里，复现上述前置条件
+    e.ask("华东区上个月可靠性试验的检测服务收入是多少")
+
+    clar = e.ask("那个做环境的实验室利用率怎么样")
+    assert clar["type"] == "clarification"
+
+    out = e.ask("是的")
+    assert out["type"] == "result"
+    assert out["cols"] == ["utilization"], "指标应为设备利用率，而不是收入"
+    assert out["mapped"].metric is not None
+    assert out["mapped"].metric.id == "equipment_utilization"
+    assert out["mapped"].entities.get("business_line") == "reliability"
+
+
+def test_clarification_reply_with_extra_info():
+    """带补充信息的确认（"是的，就是可靠性实验室"）也应回到原问题。"""
+    e = _engine()
+    e.ask("那个做环境的实验室利用率怎么样")
+    out = e.ask("是的，就是可靠性实验室")
+    assert out["type"] == "result"
+    assert out["cols"] == ["utilization"]
+
+
+def test_new_question_during_pending_is_not_folded():
+    """待澄清期间用户直接抛出带指标的新问题 -> 应按新问题处理，不折叠。"""
+    e = _engine()
+    e.ask("那个做环境的实验室利用率怎么样")
+    out = e.ask("集成电路测试的检测一次通过率")
+    assert out["type"] == "result"
+    assert out["cols"] == ["first_pass_rate"]
+    assert e.pending is None
+
+
+def test_reset_clears_pending():
+    e = _engine()
+    e.ask("那个做环境的实验室利用率怎么样")
+    assert e.pending is not None
+    e.reset_context()
+    assert e.pending is None
