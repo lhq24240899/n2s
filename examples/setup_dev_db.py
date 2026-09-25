@@ -121,6 +121,20 @@ def _seed(cur: psycopg.Cursor) -> None:
     orders.append((oid, 4, 4, 1, 1))
     oid += 1
 
+    # 其他业务线的委托单：让「各业务线的检测准时率」这类分组问题能返回多行，
+    # 而不是只剩"可靠性"一条线。各线数量与逾期数不同，便于演示"每条线不一样"。
+    extra_start = len(orders)
+    other_lines = [
+        (1, 1, 8, 1),    # 计量服务     -> 广州计量实验室,      8 单 / 1 条逾期
+        (3, 3, 10, 2),   # 电磁兼容检测 -> 北京电磁兼容实验室, 10 单 / 2 条逾期
+        (4, 4, 6, 1),    # 集成电路     -> 上海集成电路实验室,  6 单 / 1 条逾期
+        (6, 1, 5, 1),    # 数据科学     -> 广州计量实验室,      5 单 / 1 条逾期
+    ]
+    for bl_id, lab_id, cnt, _late in other_lines:
+        for _ in range(cnt):
+            orders.append((oid, lab_id, bl_id, 1, 1))
+            oid += 1
+
     cur.executemany(
         "INSERT INTO trust_orders "
         "(id, lab_id, business_line_id, customer_id, contract_id, created_at, promised_date, status) "
@@ -148,6 +162,13 @@ def _seed(cur: psycopg.Cursor) -> None:
         add_report(o, 0 if i == 0 else 1, 10 + i)
     for i, o in enumerate(north[:10]):
         add_report(o, 0 if i == 0 else 1, 10 + i)
+
+    # 其他业务线的报告：每条线逾期数不同 -> 「各业务线准时率」结果彼此有差异
+    pos = extra_start
+    for _bl_id, _lab_id, cnt, late in other_lines:
+        for j in range(cnt):
+            add_report(orders[pos], 0 if j < late else 1, 10 + j)
+            pos += 1
 
     cur.executemany(
         "INSERT INTO reports "

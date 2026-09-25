@@ -144,6 +144,13 @@ class SemanticLayer:
         "business_line": "business_lines.code",
     }
 
+    # 分组维度 -> 用于 GROUP BY 的展示列（问「各业务线」要每行一个业务线）
+    GROUP_COLUMNS = {
+        "business_line": "business_lines.name",
+        "lab": "labs.name",
+        "region": "labs.region",
+    }
+
     def __init__(
         self,
         metrics: list[Metric],
@@ -187,13 +194,29 @@ class SemanticLayer:
         return Glossary(metrics=ms, entries=entries)
 
     def _entity_entries(self, entities: dict) -> list[GlossaryEntry]:
-        """把已识别实体渲染成「必须使用的规范过滤条件」。"""
+        """把已识别实体渲染成「必须使用的规范过滤条件」，并下发分组维度。"""
         notes = {
             "region": "用户口语可能带'区'字（如'华南区'），但库内规范值不带，务必用此值",
             "business_line": "这是业务线 code，不要用中文名",
         }
         out: list[GlossaryEntry] = []
+
+        # 分组维度优先：要求 GROUP BY 该维度，每行一个取值；同维度不能再加过滤
+        group_by = entities.get("group_by")
+        group_col = self.GROUP_COLUMNS.get(group_by) if group_by else None
+        if group_col:
+            out.append(
+                GlossaryEntry(
+                    "分组维度（重要）",
+                    f"本次问的是「各{group_by}」的分布，必须按 {group_col} 做 GROUP BY，"
+                    f"**每个取值输出一行**（不要把全部数据聚合成一个数），"
+                    f"并且不要再对该维度添加 WHERE 过滤条件",
+                )
+            )
+
         for key, column in self.entity_columns.items():
+            if group_col and key == group_by:
+                continue  # 正在分组的维度不能再当过滤条件
             value = entities.get(key)
             if not value:
                 continue
@@ -213,8 +236,27 @@ class SemanticMapper:
 
     REGIONS = ["华东", "华南", "华北", "华中", "西南", "西北", "东北"]
 
+    # 「各X / 按X / 每个X」= 按 X 分组（GROUP BY），不是过滤条件。
+    # 若不区分，LLM 会把"各业务线"当成普通问句，再叠加继承来的业务线过滤，
+    # 结果只剩一个数值（实测踩过）。键与 SemanticLayer.GROUP_COLUMNS 对齐。
+    GROUP_KEYWORDS = {
+        "business_line": ("业务线", "业务板块"),
+        "lab": ("实验室",),
+        "region": ("区域", "大区", "地区"),
+    }
+    GROUP_TRIGGERS = ("各", "各个", "每个", "每", "按", "分别", "不同", "所有")
+
     def __init__(self, layer: SemanticLayer):
         self.layer = layer
+
+    def _detect_group_by(self, question: str) -> Optional[str]:
+        """识别「各业务线 / 各实验室 / 各区域」这类分组维度。"""
+        if not any(t in question for t in self.GROUP_TRIGGERS):
+            return None
+        for dim, keywords in self.GROUP_KEYWORDS.items():
+            if any(k in question for k in keywords):
+                return dim
+        return None
 
     def map(self, question: str) -> MappedQuery:
         reasons: list[str] = []
@@ -255,6 +297,12 @@ class SemanticMapper:
                 if f"{r}区" in normalized:
                     normalized = normalized.replace(f"{r}区", r)
                     reasons.append(f"区域归一化:{r}区->{r}")
+
+        # 3.5) 分组维度：「各业务线 / 各实验室 / 各区域」-> 要求按该维度 GROUP BY
+        group_by = self._detect_group_by(question)
+        if group_by:
+            entities["group_by"] = group_by
+            reasons.append(f"分组维度:{group_by}（要求按该维度分组，每行一个取值）")
 
         # 4) 时间实体（粗粒度）
         if "上个月" in question:

@@ -34,21 +34,25 @@ class QueryContext:
         ents = dict(mapped.entities)
         metric = mapped.metric or self.metric
 
+        # 本轮要「分组」的维度，不能再从上下文继承成过滤条件。
+        # 例：上一轮问「华东区可靠性…」，本轮问「各业务线的准时率」，
+        # 若沿用 business_line=reliability 就只剩一个数值（实测 bug）。
+        group_by = ents.get("group_by")
+        skip = {group_by} if group_by else set()
+
+        inherited_keys: list[str] = []
         if self.metric is not None and "metric" not in ents:
             ents["metric"] = self.metric.id
-        if self.business_line is not None and "business_line" not in ents:
+            inherited_keys.append("metric")
+        if self.business_line is not None and "business_line" not in ents and "business_line" not in skip:
             ents["business_line"] = self.business_line
-        if self.region is not None and "region" not in ents:
+            inherited_keys.append("business_line")
+        if self.region is not None and "region" not in ents and "region" not in skip:
             ents["region"] = self.region
-        if self.time is not None and "time" not in ents:
+            inherited_keys.append("region")
+        if self.time is not None and "time" not in ents and "time" not in skip:
             ents["time"] = self.time
-
-        inherited = (
-            (self.metric is not None and "metric" not in mapped.entities)
-            or (self.business_line is not None and "business_line" not in mapped.entities)
-            or (self.region is not None and "region" not in mapped.entities)
-            or (self.time is not None and "time" not in mapped.entities)
-        )
+            inherited_keys.append("time")
 
         # 重新拼出归一化问题，让继承的维度进入检索/生成
         extra: list[str] = []
@@ -60,9 +64,11 @@ class QueryContext:
         if extra:
             normalized = f"{normalized} {' '.join(extra)}"
 
-        reasons = mapped.reasons
-        if inherited:
-            reasons = reasons + ["上下文继承: 补齐缺失维度"]
+        reasons = list(mapped.reasons)
+        if inherited_keys:
+            reasons.append(f"上下文继承: 补齐缺失维度 {inherited_keys}")
+        if group_by:
+            reasons.append(f"分组优先: 已忽略继承的「{group_by}」过滤（本轮要按它分组）")
 
         return MappedQuery(
             original=mapped.original,
@@ -72,6 +78,7 @@ class QueryContext:
             resolved_synonyms=mapped.resolved_synonyms,
             clarification=mapped.clarification,
             reasons=reasons,
+            ambiguous_synonyms=mapped.ambiguous_synonyms,
         )
 
     def update_from(self, mapped: MappedQuery) -> None:

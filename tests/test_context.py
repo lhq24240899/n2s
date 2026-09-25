@@ -38,3 +38,24 @@ def test_explicit_overrides_context():
     ctx = QueryContext(region="华东")
     merged = ctx.inherit(_mapped("华北区收入", entities={"region": "华北"}))
     assert merged.entities["region"] == "华北"  # 显式说华北，覆盖华东
+
+
+def test_inherit_skips_grouped_dimension():
+    """本轮要「按业务线分组」时，不能把上一轮的业务线过滤继承进来。
+
+    回归用例：先问「华东区可靠性…」，再问「各业务线的准时率」，
+    若沿用 business_line=reliability，结果只剩一个数值。
+    """
+    ctx = QueryContext(business_line="reliability", region="华东")
+    merged = ctx.inherit(_mapped("各业务线的检测准时率", entities={"group_by": "business_line"}))
+
+    assert "business_line" not in merged.entities, "分组维度不应被继承成过滤条件"
+    assert merged.entities["group_by"] == "business_line"
+    assert merged.entities["region"] == "华东", "其他维度仍按多轮规则继承"
+    assert any("分组优先" in r for r in merged.reasons)
+
+
+def test_inherit_still_fills_when_not_grouped():
+    ctx = QueryContext(business_line="reliability")
+    merged = ctx.inherit(_mapped("准时率是多少"))
+    assert merged.entities["business_line"] == "reliability"
