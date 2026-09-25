@@ -42,6 +42,10 @@ class PromptBuilder:
             parts.append(f"- {t.name}({cols})  -- {t.description}")
             for col, ref_t, ref_c in t.foreign_keys:
                 parts.append(f"  外键: {t.name}.{col} -> {ref_t}.{ref_c}")
+            # 枚举类字段的可选值：显著降低 LLM 把口语原话（如"华南区"）写进 WHERE 的幻觉
+            for col, values in (t.sample_values or {}).items():
+                opts = ", ".join(f"'{v}'" for v in values)
+                parts.append(f"  取值约束: {t.name}.{col} 仅能取 {opts}")
 
         if glossary:
             rendered = glossary.render()

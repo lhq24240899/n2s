@@ -136,23 +136,39 @@ class MappedQuery:
 class SemanticLayer:
     """语义中台：聚合指标、同义词、知识图谱，并提供「按指标生成口径 Glossary」。"""
 
+    # 实体键 -> 数据库列；用于把「用户口语」转成「必须落到 SQL 的规范过滤条件」
+    DEFAULT_ENTITY_COLUMNS = {
+        "region": "labs.region",
+        "business_line": "business_lines.code",
+    }
+
     def __init__(
         self,
         metrics: list[Metric],
         synonyms: list[Synonym],
         graph: KnowledgeGraph,
         base_entries: list[GlossaryEntry] | None = None,
+        entity_columns: dict[str, str] | None = None,
     ):
         self.metrics = {m.id: m for m in metrics}
         self.synonyms = SynonymMap(synonyms)
         self.graph = graph
         self.base_entries = base_entries or []
+        self.entity_columns = entity_columns or dict(self.DEFAULT_ENTITY_COLUMNS)
 
     def get_metric(self, mid: str) -> Optional[Metric]:
         return self.metrics.get(mid)
 
-    def glossary_for(self, metric_id: Optional[str] = None) -> Glossary:
-        """把指定指标（及基础术语）渲染成 Glossary，注入 prompt 作为业务口径约束。"""
+    def glossary_for(
+        self,
+        metric_id: Optional[str] = None,
+        entities: Optional[dict] = None,
+    ) -> Glossary:
+        """把指定指标（及基础术语 + 已识别实体）渲染成 Glossary，注入 prompt 作为业务约束。
+
+        entities 里的区域/业务线会被转成**硬过滤条件**下发，避免 LLM 把用户口语
+        （如"华南区"）当成数据库取值写进 WHERE，导致匹配 0 行、结果为 NULL。
+        """
         ms: list[GlossaryMetric] = []
         if metric_id and metric_id in self.metrics:
             m = self.metrics[metric_id]
@@ -162,7 +178,32 @@ class SemanticLayer:
                     f"{m.definition}  [SQL参考: {m.sql_hint}]",
                 )
             )
-        return Glossary(metrics=ms, entries=list(self.base_entries))
+
+        entries = list(self.base_entries)
+        if entities:
+            entries.extend(self._entity_entries(entities))
+        return Glossary(metrics=ms, entries=entries)
+
+    def _entity_entries(self, entities: dict) -> list[GlossaryEntry]:
+        """把已识别实体渲染成「必须使用的规范过滤条件」。"""
+        notes = {
+            "region": "用户口语可能带'区'字（如'华南区'），但库内规范值不带，务必用此值",
+            "business_line": "这是业务线 code，不要用中文名",
+        }
+        out: list[GlossaryEntry] = []
+        for key, column in self.entity_columns.items():
+            value = entities.get(key)
+            if not value:
+                continue
+            out.append(
+                GlossaryEntry(
+                    f"本次过滤-{key}",
+                    f"必须使用 {column} = '{value}'"
+                    f"（{notes.get(key, '务必使用该规范值')}；"
+                    f"禁止写成 '{value}区' 或用户原话）",
+                )
+            )
+        return out
 
 
 class SemanticMapper:
@@ -208,6 +249,10 @@ class SemanticMapper:
             if r in question:
                 entities["region"] = r
                 reasons.append(f"区域实体:{r}")
+                # 归一化口语写法："华南区" -> "华南"，避免 LLM 把带"区"的原话写进 WHERE
+                if f"{r}区" in normalized:
+                    normalized = normalized.replace(f"{r}区", r)
+                    reasons.append(f"区域归一化:{r}区->{r}")
 
         # 4) 时间实体（粗粒度）
         if "上个月" in question:

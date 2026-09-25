@@ -150,7 +150,13 @@ def render_answer(out: dict) -> None:
     # 单值 -> 大数字卡片；多行 -> 表格
     if rows and len(rows) == 1 and len(rows[0]) == 1:
         label = mapped.metric.name if mapped.metric else (cols[0] if cols else "结果")
-        st.metric(label=label, value=_fmt(rows[0][0]))
+        if rows[0][0] is None:
+            st.warning(
+                "查询已执行成功，但**无匹配数据**：过滤条件与库内取值可能不一致"
+                "（如区域/业务线的写法）。可换个说法，或确认维度取值后重试。"
+            )
+        else:
+            st.metric(label=label, value=_fmt(rows[0][0]))
     elif rows:
         st.dataframe([dict(zip(cols, r)) for r in rows])
     else:

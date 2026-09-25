@@ -43,8 +43,10 @@ class GRGQueryEngine:
         # 多轮上下文继承（追问"那华南区呢" -> 仅替换区域，业务线/指标/时间沿用）
         merged = self.context.inherit(mapped)
 
-        # 组装口径 Glossary（只注入本轮解析到的指标，控制 prompt 体积）
-        glossary = self.layer.glossary_for(merged.metric.id if merged.metric else None)
+        # 组装口径 Glossary（本指标口径 + 已识别实体作为硬过滤约束，控制 prompt 体积）
+        glossary = self.layer.glossary_for(
+            merged.metric.id if merged.metric else None, merged.entities
+        )
         self.pipeline.glossary = glossary
 
         res, cols, rows = self.pipeline.query(merged.normalized)
