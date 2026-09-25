@@ -125,6 +125,17 @@ class MetadataSettings(BaseModel):
     cache_ttl: float = 300.0       # api 模式的进程内缓存秒数
 
 
+class EsSettings(BaseModel):
+    """外部 Elasticsearch 集群（第二种执行引擎的落点）。"""
+
+    enabled: bool = False
+    host: str = ""                 # 如 https://es-cn-xxx.public.elasticsearch.aliyuncs.com:9200
+    user: str = "elastic"
+    password: str = ""
+    index: str = "device_events"   # 设备日志演示索引
+    timeout: float = 15.0
+
+
 class LogSettings(BaseModel):
     level: str = "INFO"
     fmt: str = "text"            # text | json
@@ -142,6 +153,7 @@ class Settings(BaseSettings):
     auth: AuthSettings = AuthSettings()
     api: ApiSettings = ApiSettings()
     metadata: MetadataSettings = MetadataSettings()
+    es: EsSettings = EsSettings()
     retrieval: RetrievalSettings = RetrievalSettings()
     embedding: EmbeddingSettings = EmbeddingSettings()
     kb: KBSettings = KBSettings()

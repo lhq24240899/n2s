@@ -20,3 +20,4 @@ venv/
 .DS_Store
 .metadata_snapshot.json
 evals/last_report.json
+evals/last_es_report.json

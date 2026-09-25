@@ -299,9 +299,11 @@ python examples/grg_demo.py
 ### 8.5 测试与评估
 
 ```bash
-pytest -q                        # 144 个离线用例：检索/校验/linker/semantic/context/grg
+pytest -q                        # 172 个离线用例：检索/校验/linker/semantic/context/grg
                                  #   + kb(混合RAG)/rerank/graph(图编排)/auth/policy/api/mcp/metadata
+                                 #   + dsl(IR->ES DSL/PPL)/es_engine(MockTransport 端到端)
 python examples/eval_run.py      # 57 条在线评估（真 LLM + 真库）→ execution accuracy
+python examples/es_eval.py       # 9 条在线评估（真 ES 集群）→ 第二执行引擎 execution accuracy
 ```
 
 测试分层：`tests/doubles.py` 提供确定性替身（不联网、不花钱、不碰真库），
@@ -674,3 +676,70 @@ python examples/metadata_check.py           # 有变更打印明细并退出码 
 
 配合上游的**库级只读 + 行级权限**（第 12 节）与这里的**schema 变更检测**，
 "对接企业数据系统"的三件套就齐了：元数据自动获取、权限可执行、变更可发现。
+
+---
+
+## 14. 第二种执行引擎：一份 IR，编译到 SQL / ES DSL / PPL
+
+对应 JD「自然语言转 **SQL/PPL/DSL**」。这里的关键设计不是"再写一套 prompt"，而是**中间表示（IR）**：
+
+```
+问题 ──(确定性规则填槽)──► QueryIR ──┬─► ES Query DSL ──► 真集群执行（阿里云 ES 9.3.2）
+                                     └─► OpenSearch PPL ──► 编译产物（PPL 是 OpenSearch 的语言，ES 不能执行）
+```
+
+**为什么不让 LLM 直接写 ES JSON / PPL**：那等于每种语言各赌一次格式化（括号、保留字、字段名全靠模型），
+且校验、权限、审计都要重写三遍。有了 IR，LLM/规则只负责**填槽**，各语言的语法正确性由**编译器**保证；
+校验与行级权限作用在 IR 上——换执行引擎不换安全等级。
+
+| 文件 | 职责 |
+|---|---|
+| `nl2sql/dsl.py` | `QueryIR` + 两个编译器：`to_es_dsl()` / `to_ppl()`，以及响应解析器 `parse_es_response()` |
+| `nl2sql/es_backend.py` | REST 执行器：**只暴露 search/count/ping，没有任何写方法**，与只读承诺一致 |
+| `examples/es_engine.py` | 问题→IR 的确定性规则 + `HybridRouter`（域路由 + 失败回落）+ 权限映射 |
+| `examples/setup_es_demo.py` | 灌 1222 条设备日志，**按构造**生成（标准答案是生成时就写死的常量） |
+| `examples/es_eval.py` | 9 条真机评估，`--min-accuracy` 可接 CI |
+
+```bash
+python examples/setup_es_demo.py      # 建索引 + 灌数据 + 打印标准答案
+python examples/es_eval.py            # 真集群对拍
+```
+
+### 14.1 真机验证结果（阿里云 ES 9.3.2）
+
+```
+[PASS] E01 华东区最近7天的ERROR告警有多少条 -> 42
+[PASS] E02 各区域最近7天的ERROR告警数量 -> {华东:42, 华南:30, 华北:25}
+[PASS] E03 各区域最近30天的ERROR告警数量 -> {华东:60, 华南:42, 华北:35}
+[PASS] E04 最近30天共有多少条ERROR告警 -> 137
+[PASS] E05 包含「温度超限」的告警最近7天有多少条 -> 49
+[PASS] E06 各实验室最近7天的ERROR告警数量 -> 3 行全中
+[PASS] E07 告警最多的区域是哪个 -> 华东      [PASS] E08 告警最少 -> 华北
+[PASS] E09 最近7天各级别有多少条日志 -> {ERROR:97, WARN:145, INFO:470}
+通过 9/9 = 100.0%（单次 ~55ms）
+```
+
+标准答案不是"跑一遍记下来的数字"，而是**按构造推导**的：数据生成时就写死了各区域各级别的条数，
+所以种子重灌、隔天重跑，答案依然精确成立（这也是为什么数据跨度刻意小于查询窗口——否则最老的文档会
+滑出 `now-7d`，答案漂移，评估就不可重复了）。
+
+### 14.2 三个真机踩坑（都写进了代码注释/测试，不是口口相传）
+
+1. **公网入口是 `http` 不是 `https`**：写 `https://` 会 TLS 握手失败（`WRONG_VERSION_NUMBER` /
+   `UNEXPECTED_EOF`），很容易被误判成"白名单没放行"。先试 http。
+2. **别发 `compatible-with=N` 的 Accept 头**：本机实测 ES 9.3.2 对
+   `application/vnd.elasticsearch+json; compatible-with=8`（**和 =9**）一律返回
+   `400 media_type_header_exception`。客户端不该绑架集群版本——改用通用 `application/json`，7/8/9 通吃。
+   （`tests/test_es_engine.py::test_headers_do_not_pin_es_major_version` 守住这条）
+3. **公网访问白名单为空**：阿里云 ES 默认不放行任何 IP，TCP 9200 直接不通。
+
+### 14.3 路由与降级：加第二种引擎不能让既有能力变脆弱
+
+`HybridRouter` 只在问题属于**事件流水域**（告警/异常/日志/事件）时走 ES，其余全部走原 SQL 引擎；
+ES 报错时**自动回落 SQL**并在 `reasons` 里标注。行级权限由 `scope_filters_from_policy()` 从同一个
+`DataPolicy` 映射成 ES `terms` 过滤——`labs.region → region`、`business_lines.code → business_line`，
+**换引擎不换安全等级**。
+
+> 面试价值：**「PPL 你真跑过吗？」** —— 诚实回答：PPL 是 OpenSearch 的语言，阿里云 ES 不能执行，
+> 所以这里 PPL 是**编译器产物**（同一份 IR 编译出的文本，随结果一起返回可对照），ES DSL 才是真执行路径。
+> 把"能不能跑"和"能不能编译"分开讲，比含糊其辞更可信。

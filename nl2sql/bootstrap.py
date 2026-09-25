@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 from .auth import Principal
 from .config import Settings, get_settings, setup_logging
 from .db import build_db
+from .es_backend import build_es_backend
 from .embedding import build_embedder
 from .kb import build_doc_retriever
 from .llm import build_llm
@@ -113,6 +114,15 @@ def make_engine_factory(
     """
     settings = ctx.settings
 
+    # 第二种执行引擎（ES）：backend 无状态、线程安全，整个 factory 只建一次复用。
+    es_backend = build_es_backend(settings)
+    es_engine = None
+    if es_backend is not None:
+        from examples.es_engine import EsQueryEngine
+
+        es_engine = EsQueryEngine(es_backend, index=settings.es.index)
+        _log.info("已启用第二执行引擎 ES: index=%s", settings.es.index)
+
     def factory(principal: Principal, policy: DataPolicy):
         guard = PolicyGuard(policy)  # 每会话独立：applied 不跨会话累积
         _log.info(
@@ -125,6 +135,12 @@ def make_engine_factory(
             # 图编排：GraphRunner 暴露与 pipeline 相同的 query() 契约，
             # 引擎逻辑一行不改即完成编排替换（见 graph.GraphRunner 的说明）。
             engine.runner = _make_graph_runner(ctx, guard)
+        if es_engine is not None:
+            # 事件流水问题走 ES；行级权限从同一 policy 映射，安全等级不降级。
+            from examples.es_engine import HybridRouter, scope_filters_from_policy
+
+            scope = scope_filters_from_policy(policy)
+            return HybridRouter(engine, es_engine, scope_filters=scope)
         return engine
 
     return factory
