@@ -74,7 +74,10 @@ class SchemaLinker:
             reasons.append(f"兜底核心表: {sorted(names)}")
 
         self.last_reasons = reasons
-        return list(names)
+        # 必须**稳定排序**后返回：set 的迭代顺序受 PYTHONHASHSEED 影响（跨进程随机），
+        # 直接 list(set) 会让每次运行喂给 LLM 的 schema 顺序不同 -> 同一问题两次结果不一致。
+        # 实测表现：评估集出现 flaky（B02 同输入一次 0.88 一次 0.81）。问数要可复现。
+        return sorted(names)
 
     def _graph_tables(self, question: str) -> list[tuple[str, str]]:
         """用知识图谱把问题里的业务术语映射到物理表。

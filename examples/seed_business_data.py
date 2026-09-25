@@ -22,16 +22,20 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# ---- 业务板块（真实口径，对齐 business_lines.name）+ 构造参数 ----
+# ---- 业务板块（广电计量 002967 的真实业务结构）----
+# 板块名对齐 business_lines.name；季度基准营收单位万元。
+# 量级按该集团公开年报口径模拟：年营收约 32 亿（= 季度合计 8 亿 ≈ 80000 万元），
+# 结构与真实盘面一致——计量校准 + 可靠性与环境试验是两大主力，合计约占六成。
+# 毛利率参考检测行业常识：计量/可靠性（重资产、设备折旧高）偏低，软件测评/集成电路（人力密集）偏高。
 # (板块名, code, 季度基准营收万元, 基准毛利率%)
 SEGMENTS: list[tuple[str, str, float, float]] = [
-    ("可靠性与环境试验", "reliability", 12000.0, 45.0),
-    ("电磁兼容检测", "emc", 6500.0, 52.0),
-    ("集成电路测试与分析", "ic", 5200.0, 58.0),
-    ("计量服务", "calibration", 7600.0, 55.0),
-    ("软件测评", "data_science", 3800.0, 62.0),
-    ("生命科学", "life_science", 2900.0, 48.0),
-    ("EHS评价服务", "ehs", 2100.0, 40.0),
+    ("计量服务", "calibration", 24000.0, 48.0),
+    ("可靠性与环境试验", "reliability", 20000.0, 44.0),
+    ("电磁兼容检测", "emc", 11000.0, 53.0),
+    ("集成电路测试与分析", "ic", 9500.0, 57.0),
+    ("生命科学", "life_science", 6500.0, 50.0),
+    ("软件测评", "data_science", 5000.0, 62.0),
+    ("EHS评价服务", "ehs", 4000.0, 41.0),
 ]
 
 # 季度序列：2024Q1 ~ 2026Q2（第 10 期为"最近一个季度"）
@@ -75,13 +79,32 @@ DDL = [
     "ALTER TABLE labs ADD COLUMN IF NOT EXISTS headcount int",
 ]
 
-# 实验室资源：按 id 确定性推导（不用随机，保证可复算）
-def _lab_resource(lab_id: int) -> tuple[int, int, int]:
-    return (
-        2010 + (lab_id * 7) % 15,          # established_year
-        100 + (lab_id * 37) % 700,         # equipment_count
-        50 + (lab_id * 53) % 450,          # headcount
-    )
+# ---- 实验室/基地网络：按该集团真实的全国布局（总部广州 + 各区域基地）----
+# (名称, 城市, 区域, 成立年份, 设备台数, 在职人数)
+# 规模按真实梯度：总部最大，华东/华南基地次之，新设基地较小；
+# 合计约 4415 台设备 / 3315 人，与该集团公开的"数千台套、数千员工"量级一致。
+LABS: list[tuple[str, str, str, int, int, int]] = [
+    ("广电计量检测（广州）有限公司", "广州", "华南", 2002, 860, 620),   # 总部
+    ("广电计量检测（深圳）有限公司", "深圳", "华南", 2011, 420, 310),
+    ("广电计量检测（北京）有限公司", "北京", "华北", 2010, 380, 290),
+    ("广电计量检测（上海）有限公司", "上海", "华东", 2012, 350, 260),
+    ("广电计量检测（无锡）有限公司", "无锡", "华东", 2013, 300, 220),
+    ("广电计量检测（西安）有限公司", "西安", "西北", 2015, 210, 160),
+    ("广电计量检测（武汉）有限公司", "武汉", "华中", 2016, 190, 150),
+    ("广电计量检测（成都）有限公司", "成都", "西南", 2015, 200, 155),
+    ("广电计量检测（天津）有限公司", "天津", "华北", 2017, 160, 120),
+    ("广电计量检测（青岛）有限公司", "青岛", "华北", 2018, 140, 105),
+    ("广电计量检测（南京）有限公司", "南京", "华东", 2016, 175, 135),
+    ("广电计量检测（苏州）有限公司", "苏州", "华东", 2018, 150, 110),
+    ("广电计量检测（杭州）有限公司", "杭州", "华东", 2019, 130, 100),
+    ("广电计量检测（长沙）有限公司", "长沙", "华中", 2017, 145, 115),
+    ("广电计量检测（沈阳）有限公司", "沈阳", "华北", 2019, 120, 90),
+    ("广电计量检测（重庆）有限公司", "重庆", "西南", 2020, 110, 85),
+    ("广电计量检测（郑州）有限公司", "郑州", "华中", 2020, 105, 80),
+    ("广电计量检测（合肥）有限公司", "合肥", "华东", 2021, 95, 75),
+    ("广电计量检测（厦门）有限公司", "厦门", "华南", 2021, 90, 70),
+    ("广电计量检测（东莞）有限公司", "东莞", "华南", 2022, 85, 65),
+]
 
 
 def revenue_of(q: int, base: float, growth: float) -> float:
@@ -125,9 +148,16 @@ def expected(rows: list[tuple]) -> str:
         f"# 毛利率最高板块: {by_margin[2]} = {by_margin[5]}%",
         f"# 同比最高板块: {by_yoy[2]} = {by_yoy[4]}%",
         f"# 2025 全年营收合计: {total_2025}",
-        "# 实验室资源（按 id 推导）: " + ", ".join(
-            f"lab{lid} 设备{_lab_resource(lid)[1]}台/人员{_lab_resource(lid)[2]}人"
-            for lid in range(1, 6)),
+    ]
+    total_eq = sum(l[4] for l in LABS)
+    total_hc = sum(l[5] for l in LABS)
+    by_region: dict[str, int] = {}
+    for l in LABS:
+        by_region[l[2]] = by_region.get(l[2], 0) + l[4]
+    lines += [
+        f"# 实验室网络: {len(LABS)} 个基地，设备合计 {total_eq} 台，人员合计 {total_hc} 人",
+        "# 各区域设备数: " + ", ".join(f"{k}={v}" for k, v in sorted(by_region.items())),
+        f"# 设备最多的基地: {max(LABS, key=lambda l: l[4])[0]} = {max(LABS, key=lambda l: l[4])[4]} 台",
     ]
     return "\n".join(lines)
 
@@ -158,14 +188,28 @@ def main(argv: list[str] | None = None) -> int:
         "VALUES (%s, %s, %s, %s, %s, %s)",
         rows,
     )
-    ids = [r[0] for r in cur.execute("SELECT id FROM labs ORDER BY id").fetchall()]
-    for lid in ids:
-        y, eq, hc = _lab_resource(lid)
-        cur.execute(
-            "UPDATE labs SET established_year=%s, equipment_count=%s, headcount=%s WHERE id=%s",
-            (y, eq, hc, lid),
-        )
-    print(f"\n已写入 {len(rows)} 行到 business_segment_revenue；已更新 {len(ids)} 个实验室资源字段")
+    # 实验室网络：前 5 个沿用现有 id（保住 reports/equipment 的外键关联），改写为真实基地；
+    # 其余基地按 id 递增新增。重跑幂等（先清空新增部分）。
+    cur.execute("SELECT COALESCE(MAX(id), 0) FROM labs")
+    max_id = cur.fetchone()[0]
+    if max_id > len(LABS):
+        cur.execute("DELETE FROM labs WHERE id > %s", (len(LABS),))
+    for idx, (name, city, region, year, eq, hc) in enumerate(LABS, start=1):
+        cur.execute("SELECT 1 FROM labs WHERE id = %s", (idx,))
+        if cur.fetchone():
+            cur.execute(
+                "UPDATE labs SET name=%s, city=%s, region=%s, "
+                "established_year=%s, equipment_count=%s, headcount=%s WHERE id=%s",
+                (name, city, region, year, eq, hc, idx),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO labs (id, name, city, region, "
+                "established_year, equipment_count, headcount) VALUES (%s,%s,%s,%s,%s,%s,%s)",
+                (idx, name, city, region, year, eq, hc),
+            )
+    print(f"\n已写入 {len(rows)} 行到 business_segment_revenue；"
+          f"实验室网络 {len(LABS)} 个基地已就绪")
     conn.close()
     return 0
 

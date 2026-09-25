@@ -100,7 +100,8 @@ CASES: list[dict] = [
     # ============ B. 设备 / 实验室 ============
     _c("指标-利用率", "B01", "各实验室设备利用率", compare="rows",
        truth_sql="SELECT l.name, AVG(e.utilization) FROM equipment e JOIN labs l ON e.lab_id=l.id GROUP BY l.name"),
-    _c("指标-利用率", "B02", "上海集成电路实验室的设备利用率是多少", t_util(lab="上海集成电路实验室")),
+    _c("指标-利用率", "B02", "广电计量检测（上海）有限公司的设备利用率是多少",
+       t_util(lab="广电计量检测（上海）有限公司")),
     _c("指标-利用率", "B03", "华南区的设备利用率是多少", t_util(region="华南")),
     _c("指标-利用率", "B04", "华北的设备利用率是多少", t_util(region="华北")),
     _c("总量", "B05", "一共有多少台设备", "SELECT COUNT(*) FROM equipment"),

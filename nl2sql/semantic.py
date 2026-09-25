@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -289,6 +290,9 @@ class SemanticMapper:
     }
     # "所有"**不是**分组触发词：它是全称限定，语义是"合起来一共多少"
     # （评估集实测：「所有实验室的设备总数是多少」被误判成按实验室分组，返回 5 行而非总数）。
+    # 机构/基地全称模式：命中即视为长实体，优先于词级同义词（见 map() 第 0 步）
+    _FULL_NAME_RE = re.compile(r"[\u4e00-\u9fa5A-Za-z（）()]{2,}有限公司")
+
     GROUP_TRIGGERS = ("各", "各个", "每个", "每", "按", "分别", "不同")
 
     # 总量问句：「多少台 / 多少个 / 总数」这类**计数意图**。
@@ -317,9 +321,24 @@ class SemanticMapper:
 
     def map(self, question: str) -> MappedQuery:
         reasons: list[str] = []
-        syns = self.layer.synonyms.resolve(question)
-        normalized = question
         entities: dict = {}
+
+        # 0) 长实体优先：公司/基地**全称**先匹配并从问题中屏蔽，再做词级同义词展开。
+        #    否则「广电计量检测（上海）有限公司的设备利用率」里的"计量"会被当成
+        #    "计量服务"业务线 -> 生成 WHERE b.code='calibration' 这种问句里没有的过滤
+        #    （评估集 B02 实测：本应 0.88，却返回被污染后的 0.81）。
+        masked = question
+        m = self._FULL_NAME_RE.search(question)
+        if m:
+            full = m.group(0)
+            masked = question.replace(full, " ")
+            entities["lab"] = full
+            reasons.append(f"长实体(机构全称):{full}")
+
+        syns = self.layer.synonyms.resolve(masked)
+        # normalized 保留**原问题**：全称要留给 LLM 做 l.name 过滤，
+        # 屏蔽只作用于同义词展开（否则模型拿不到"上海"这个条件，会干脆不加过滤）。
+        normalized = question
         ambiguous: list[Synonym] = []
         resolved: list[str] = []
 

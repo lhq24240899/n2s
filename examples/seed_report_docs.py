@@ -23,16 +23,39 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 INDEX = "inspection_reports"
 
-# ---- 真实业务词表（维度真实） ----
-LABS = ["广州计量实验室", "深圳可靠性实验室", "北京电磁兼容实验室",
-        "上海集成电路实验室", "无锡可靠性实验室"]
+# ---- 真实业务词表（维度真实）----
+# 实验室：与该集团全国基地一致（同 examples/seed_business_data.py 的 LABS）
+LABS = [
+    "广电计量检测（广州）有限公司", "广电计量检测（深圳）有限公司",
+    "广电计量检测（北京）有限公司", "广电计量检测（上海）有限公司",
+    "广电计量检测（无锡）有限公司", "广电计量检测（西安）有限公司",
+    "广电计量检测（武汉）有限公司", "广电计量检测（成都）有限公司",
+    "广电计量检测（天津）有限公司", "广电计量检测（青岛）有限公司",
+]
+# 检测项目：按该集团七大业务板块的真实服务目录
 TEST_ITEMS = [
-    "挥发性有机化合物", "重金属含量", "电磁兼容性", "环境可靠性",
-    "食品添加剂", "微生物限度", "RoHS 有害物质", "盐雾试验",
+    "计量校准-几何量", "计量校准-热学", "计量校准-力学", "计量校准-电磁",
+    "高低温循环试验", "湿热试验", "随机振动试验", "中性盐雾试验",
+    "电磁兼容-辐射发射(RE)", "电磁兼容-传导发射(CE)", "电磁兼容-静电放电抗扰度(ESD)",
+    "集成电路-功能测试", "集成电路-失效分析",
+    "软件功能与性能测试", "信息安全等级保护测评",
+    "食品中重金属检测", "微生物限度检查",
+    "环境空气检测", "水质检测", "职业卫生检测",
+]
+# 检测依据（真实标准号，报告全文检索的高频词）
+STANDARDS = [
+    "GB/T 2423.1", "GB/T 2423.10", "GB/T 2423.17", "GB/T 2423.22",
+    "IEC 61000-4-2", "GB 9254", "ISO 16750-4", "JJF 1101",
+    "CNAS-CL01", "ISO/IEC 17025", "GB 4806.7", "GB 5749",
+    "GB/T 18883", "GBZ/T 189.10", "GB/T 25000.51",
+]
+# 样品：该集团真实服务的下游行业（汽车/通信/航空航天/轨交/医疗/食品/环保）
+SAMPLES = [
+    "汽车零部件", "动力电池包", "通信基站设备", "智能手机整机",
+    "医疗监护仪", "工业控制器", "航空电子部件", "轨道牵引设备",
+    "食品包装材料", "饮用水", "土壤", "电子元器件", "家用电器", "医用耗材",
 ]
 CONCLUSIONS = ["合格", "不合格", "符合", "不符合", "N.D."]
-SAMPLES = ["饮用水", "土壤", "电子产品整机", "汽车零部件", "食品包装材料",
-           "医用耗材", "锂电池组", "通信设备"]
 
 MAPPING = {
     "settings": {"number_of_shards": 1, "number_of_replicas": 0},
@@ -42,6 +65,7 @@ MAPPING = {
             "lab_name": {"type": "keyword"},
             "sample_name": {"type": "text"},
             "test_item": {"type": "text"},
+            "standard": {"type": "keyword"},
             "conclusion_text": {"type": "keyword"},
             "report_date": {"type": "date"},
         }
@@ -64,7 +88,8 @@ def generate(num: int = 2000) -> list[dict]:
             "report_id": f"RPT-{today.year}-{10000 + i}",
             "lab_name": lab,
             "sample_name": SAMPLES[(i // len(LABS)) % len(SAMPLES)],
-            "test_item": TEST_ITEMS[(i // 3) % len(TEST_ITEMS)],
+            "test_item": TEST_ITEMS[i % len(TEST_ITEMS)],
+            "standard": STANDARDS[(i // 5) % len(STANDARDS)],
             "conclusion_text": _BUCKETS[i % len(_BUCKETS)],
             "report_date": (today - timedelta(days=(i * 7) % 365)).isoformat(),
         })
