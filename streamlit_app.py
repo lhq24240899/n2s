@@ -45,13 +45,14 @@ SOURCE_LABEL = {
     "fallback_generic": "🟠 检索无命中 · 通用兜底生成",
 }
 
+# 侧边栏推荐问题：均为「真跑过、确认有返回数据」的问题，保证演示不冷场
 EXAMPLES = [
     "华东区上个月可靠性试验的准时完成率是多少",
     "那华南区呢？",
-    "集成电路测试的检测一次通过率",
-    "各实验室设备利用率",
     "华东区上个月可靠性试验的检测服务收入是多少",
-    "那个做环境的实验室利用率怎么样",
+    "各业务线的检测准时率是多少",
+    "可靠性业务的报告出具周期是多少天",
+    "各实验室设备利用率",
 ]
 
 
@@ -215,9 +216,17 @@ def render_answer(out: dict) -> None:
         )
 
     if is_empty and res.sql:
-        # 没数据时自动展开 SQL，便于直接排查（无需再点开）
-        st.caption("⬇️ 未返回数据，已自动展开生成的 SQL 便于排查：")
+        # 没数据时自动展开 SQL + 诊断信息（本轮过滤实体 / 库内行数），便于直接排查
+        st.caption("⬇️ 未返回数据，已自动展开生成的 SQL 与诊断信息：")
         st.code(res.sql, language="sql")
+        st.caption(f"本轮识别实体：`{mapped.entities}`")
+        try:
+            _host, counts = datasource_selfcheck()
+            st.caption(
+                "当前库核心表行数：" + " · ".join(f"{k} {v}" for k, v in counts.items())
+            )
+        except Exception:  # noqa: BLE001
+            pass
     else:
         with st.expander("🔍 生成的 SQL"):
             st.code(res.sql or "（无）", language="sql")
