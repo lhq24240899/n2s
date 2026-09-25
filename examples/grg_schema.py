@@ -39,6 +39,9 @@ def build_tables() -> list[TableSchema]:
                 "name": "varchar",
                 "city": "varchar",
                 "region": "varchar",  # 华东/华南/华北/...
+                "established_year": "int",   # 成立年份
+                "equipment_count": "int",    # 设备台数（实验室资源统计）
+                "headcount": "int",          # 在职人数
             },
             description="实验室表",
             sample_values={"region": ["华东", "华南", "华北", "华中", "西南", "西北", "东北"]},
@@ -142,6 +145,24 @@ def build_tables() -> list[TableSchema]:
             description="检测记录表",
             foreign_keys=[("order_id", "trust_orders", "id")],
         ),
+        TableSchema(
+            name="business_segment_revenue",
+            columns={
+                "id": "int",
+                "report_date": "date",          # 报告期（季末：2024-03-31 ... 2026-06-30）
+                "business_segment": "varchar",  # 板块名，与 business_lines.name 同义
+                "revenue": "decimal",           # 营收（万元）—— **财务口径**
+                "revenue_yoy": "decimal",       # 同比（%）
+                "gross_margin": "decimal",      # 毛利率（%）
+            },
+            description="业务板块经营表（财务口径，分季度披露）",
+            sample_values={
+                "business_segment": [
+                    "可靠性与环境试验", "电磁兼容检测", "集成电路测试与分析",
+                    "计量服务", "软件测评", "生命科学", "EHS评价服务",
+                ]
+            },
+        ),
     ]
 
 
@@ -165,7 +186,93 @@ def build_metrics() -> list[Metric]:
             ),
             source_tables=["contracts", "trust_orders", "reports"],
             dimensions=["区域", "实验室", "业务线", "时间"],
-            aliases=["收入", "营收", "检测收入", "合同金额", "合同总金额"],
+            # 口径治理：这里只留**合同/开票**语义的别名。
+            # 此前 "营收"/"合同总金额" 挂在收入指标上，导致问「已开票的合同总金额」时
+            # 命中本指标（经报告关联）而与"合同表直接求和"冲突——评估集实测抓到过。
+            # 现财务口径另立 segment_revenue，"营收"归财务、"合同金额"归合同，各走各路。
+            aliases=["收入", "检测收入", "检测服务收入", "开票收入"],
+        ),
+        Metric(
+            id="contract_amount",
+            name="合同金额",
+            level=MetricLevel.GROUP,
+            domain="通用",
+            definition=(
+                "SUM(contracts.amount)，**合同口径**（可按 settled_status 过滤）。"
+                "与『检测服务收入』不同：后者只统计已开票且报告已出具的合同，两者数值不相等，"
+                "问『合同总金额』走本口径，不要用收入口径顶替"
+            ),
+            # sql_hint 刻意**不带** settled_status 过滤：带了会被 LLM 照抄到
+            # "每个客户的合同总金额"（不该过滤）上——评估集实测抓到过（C05）。
+            # 过滤条件应由问句决定，不写死在口径模板里。
+            sql_hint="SELECT SUM(amount) AS contract_amount FROM contracts",
+            source_tables=["contracts"],
+            dimensions=["区域", "客户", "时间"],
+            aliases=["合同金额", "合同总金额", "合同额", "签约金额"],
+        ),
+        Metric(
+            id="segment_revenue",
+            name="业务板块营收",
+            level=MetricLevel.GROUP,
+            domain="经营",
+            definition=(
+                "**财务口径**的分板块营收（万元），来自 business_segment_revenue.revenue，"
+                "按报告期 report_date（季末）披露。与『检测服务收入』（合同/开票口径）不同源，不可混用"
+            ),
+            sql_hint=(
+                "SELECT SUM(revenue) AS revenue FROM business_segment_revenue "
+                "WHERE report_date = (SELECT MAX(report_date) FROM business_segment_revenue)"
+            ),
+            source_tables=["business_segment_revenue"],
+            dimensions=["业务板块", "时间"],
+            aliases=["营收", "营业额", "营业收入", "板块营收", "经营收入"],
+        ),
+        Metric(
+            id="revenue_yoy",
+            name="营收同比",
+            level=MetricLevel.GROUP,
+            domain="经营",
+            definition="business_segment_revenue.revenue_yoy，相对去年同期的增长率（%）",
+            sql_hint=(
+                "SELECT business_segment, revenue_yoy FROM business_segment_revenue "
+                "WHERE report_date = (SELECT MAX(report_date) FROM business_segment_revenue) "
+                "ORDER BY revenue_yoy DESC LIMIT 1"
+            ),
+            source_tables=["business_segment_revenue"],
+            dimensions=["业务板块", "时间"],
+            aliases=["同比", "同比增长率", "营收增长", "增长率"],
+        ),
+        Metric(
+            id="equipment_stock",
+            name="设备保有量",
+            level=MetricLevel.OPERATION,
+            domain="通用",
+            definition=(
+                "**资源台账口径**的设备台数：SUM(labs.equipment_count)。"
+                "注意与『设备利用率』不同源——后者来自 equipment 表的逐台记录；"
+                "问『有多少台设备』应走本口径，不要 COUNT(equipment.id)"
+            ),
+            sql_hint="SELECT SUM(equipment_count) AS equipment_count FROM labs",
+            source_tables=["labs"],
+            dimensions=["区域", "实验室"],
+            # 注意：不含"多少台设备"——那是 equipment 表逐台台账的 COUNT 口径（评估集 B05/B06），
+            # 与本口径（labs 资源台账 1055 台）不是一回事，别名必须切开，否则互相污染。
+            aliases=["设备台数", "设备数量", "设备保有量", "设备总数"],
+        ),
+        Metric(
+            id="gross_margin",
+            name="毛利率",
+            level=MetricLevel.GROUP,
+            domain="经营",
+            definition="business_segment_revenue.gross_margin，单位 %",
+            sql_hint=(
+                "SELECT business_segment, gross_margin FROM business_segment_revenue "
+                "WHERE report_date = (SELECT MAX(report_date) FROM business_segment_revenue) "
+                "ORDER BY gross_margin DESC LIMIT 1"
+            ),
+            source_tables=["business_segment_revenue"],
+            dimensions=["业务板块", "时间"],
+            aliases=["毛利率", "毛利", "毛利率水平"],
         ),
         Metric(
             id="on_time_completion_rate",
@@ -318,6 +425,62 @@ def build_knowledge_graph() -> KnowledgeGraph:
 
 def build_examples() -> list[SQLExample]:
     return [
+        SQLExample(
+            id="ex_lab_equipment_stock",
+            question="各实验室的设备台数是多少",
+            sql="SELECT name, equipment_count FROM labs ORDER BY name",
+            domain=["实验室"],
+            intent=["分组"],
+            tables=["labs"],
+            metrics=["设备保有量"],
+            dimensions=["实验室"],
+            keywords=["设备台数", "各实验室", "设备数量"],
+        ),
+        SQLExample(
+            id="ex_segment_revenue_latest",
+            question="最近一个季度各业务板块的营收是多少",
+            sql=(
+                "SELECT business_segment, revenue FROM business_segment_revenue "
+                "WHERE report_date = (SELECT MAX(report_date) FROM business_segment_revenue) "
+                "ORDER BY revenue DESC"
+            ),
+            domain=["经营"],
+            intent=["分组"],
+            tables=["business_segment_revenue"],
+            metrics=["业务板块营收"],
+            dimensions=["业务板块", "时间"],
+            keywords=["营收", "各业务板块", "最近一个季度", "板块"],
+        ),
+        SQLExample(
+            id="ex_segment_yoy_top",
+            question="哪个业务板块的营收同比增长最快",
+            sql=(
+                "SELECT business_segment, revenue_yoy FROM business_segment_revenue "
+                "WHERE report_date = (SELECT MAX(report_date) FROM business_segment_revenue) "
+                "ORDER BY revenue_yoy DESC LIMIT 1"
+            ),
+            domain=["经营"],
+            intent=["排名"],
+            tables=["business_segment_revenue"],
+            metrics=["营收同比"],
+            dimensions=["业务板块", "时间"],
+            keywords=["同比", "增长最快", "板块", "营收"],
+        ),
+        SQLExample(
+            id="ex_segment_margin_top",
+            question="毛利率最高的业务板块是哪个",
+            sql=(
+                "SELECT business_segment, gross_margin FROM business_segment_revenue "
+                "WHERE report_date = (SELECT MAX(report_date) FROM business_segment_revenue) "
+                "ORDER BY gross_margin DESC LIMIT 1"
+            ),
+            domain=["经营"],
+            intent=["排名"],
+            tables=["business_segment_revenue"],
+            metrics=["毛利率"],
+            dimensions=["业务板块", "时间"],
+            keywords=["毛利率", "最高", "板块"],
+        ),
         SQLExample(
             id="ex_ontime_relia_east",
             question="华东区上个月可靠性试验的准时完成率是多少",
