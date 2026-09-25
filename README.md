@@ -53,6 +53,7 @@
 nl2sql/
 ├── pyproject.toml / requirements.txt / .env.example
 ├── streamlit_app.py            # ★Web UI 入口（Streamlit Cloud 的 Main file）
+├── TESTCASES.md                # ★功能测试用例（含实测标准答案 + 执行记录表）
 ├── .streamlit/secrets.toml.example  # Streamlit secrets 模板（本地复制为 secrets.toml）
 ├── nl2sql/                     # 核心包
 │   ├── config.py               # pydantic-settings 配置 + 结构化日志
