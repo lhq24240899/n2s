@@ -37,25 +37,12 @@ def _vec_literal(vec: list[float]) -> str:
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
 
-class PgVectorStore:
-    """pgvector 文档库：建表 + 写入 + 三路检索。"""
+class _PgConnMixin:
+    """共用的 Postgres 连接管理：autocommit + 异常即弃连接（BUG-05 的教训）。"""
 
-    def __init__(
-        self,
-        dsn: str,
-        table: str = "kb_docs",
-        dim: int = 1536,
-        timeout: float = 10.0,
-    ):
-        if not dsn:
-            raise ValueError("未配置 DB__DSN，无法使用 pgvector 知识库")
-        self.dsn = dsn
-        self.table = table
-        self.dim = dim
-        self.timeout = timeout
-        self._conn = None
-
-    # ---------------- 连接 ----------------
+    dsn: str
+    timeout: float
+    _conn = None
 
     def _connect(self):
         if self._conn is None or getattr(self._conn, "closed", False):
@@ -67,6 +54,7 @@ class PgVectorStore:
         return self._conn
 
     def _discard(self) -> None:
+        """丢弃当前连接，下一次调用自动重连（不把坏状态的连接留给后续查询）。"""
         conn, self._conn = self._conn, None
         if conn is not None:
             try:
@@ -83,8 +71,30 @@ class PgVectorStore:
                     return cur.fetchall()
                 return None
         except Exception:  # noqa: BLE001
-            self._discard()  # 坏连接不留给下一次（见 BUG-05）
+            self._discard()
             raise
+
+    def close(self) -> None:
+        self._discard()
+
+
+class PgVectorStore(_PgConnMixin):
+    """pgvector 文档库：建表 + 写入 + 三路检索。"""
+
+    def __init__(
+        self,
+        dsn: str,
+        table: str = "kb_docs",
+        dim: int = 1536,
+        timeout: float = 10.0,
+    ):
+        if not dsn:
+            raise ValueError("未配置 DB__DSN，无法使用 pgvector 知识库")
+        self.dsn = dsn
+        self.table = table
+        self.dim = dim
+        self.timeout = timeout
+        self._conn = None
 
     # ---------------- 建表 ----------------
 
@@ -241,5 +251,91 @@ class PgVectorStore:
             h.reasons = [f"关键词命中 {int(h.score)} 个"]
         return hits
 
-    def close(self) -> None:
-        self._discard()
+
+class PgExampleVectorIndex(_PgConnMixin):
+    """SQL 示例库的向量索引：把「示例问题」向量化，供检索层做**语义召回**。
+
+    为什么单独一张表而不是复用 kb_docs？
+    - 语义不同：kb_docs 是"知识文档"，这里是"(问题, SQL) 范例"，落库只需问题文本；
+    - 检索层只需 `(example_id, 相似度)`，融合由 `RetrievalService` 用 RRF 完成，
+      这样标签分与向量分始终是**两条独立信号**，可解释性不丢。
+    """
+
+    def __init__(
+        self,
+        dsn: str,
+        table: str = "sql_example_vec",
+        dim: int = 1536,
+        timeout: float = 10.0,
+    ):
+        if not dsn:
+            raise ValueError("未配置 DB__DSN，无法使用示例库向量索引")
+        self.dsn = dsn
+        self.table = table
+        self.dim = dim
+        self.timeout = timeout
+        self._conn = None
+
+    def ensure_schema(self) -> None:
+        self._exec("CREATE EXTENSION IF NOT EXISTS vector")
+        self._exec(
+            f"""
+            CREATE TABLE IF NOT EXISTS {self.table} (
+                id         text PRIMARY KEY,
+                question   text NOT NULL,
+                embedding  vector({self.dim}),
+                updated_at timestamptz DEFAULT now()
+            )
+            """
+        )
+        self._exec(
+            f"CREATE INDEX IF NOT EXISTS {self.table}_emb_hnsw "
+            f"ON {self.table} USING hnsw (embedding vector_cosine_ops)"
+        )
+
+    def upsert(self, rows: list[dict]) -> int:
+        """rows: [{'id':..., 'question':..., 'embedding':[...]}, ...]"""
+        if not rows:
+            return 0
+        params = [
+            (r["id"], r["question"], _vec_literal(r["embedding"]) if r.get("embedding") else None)
+            for r in rows
+        ]
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.executemany(
+                    f"""
+                    INSERT INTO {self.table} (id, question, embedding)
+                    VALUES (%s, %s, %s::vector)
+                    ON CONFLICT (id) DO UPDATE SET
+                        question = EXCLUDED.question,
+                        embedding = EXCLUDED.embedding,
+                        updated_at = now()
+                    """,
+                    params,
+                )
+            return len(params)
+        except Exception:  # noqa: BLE001
+            self._discard()
+            raise
+
+    def search(self, embedding: list[float], top_k: int = 10) -> list[tuple[str, float]]:
+        """返回 [(example_id, 余弦相似度)]，按相似度降序。"""
+        lit = _vec_literal(embedding)
+        rows = self._exec(
+            f"""
+            SELECT id, 1 - (embedding <=> %s::vector) AS score
+            FROM {self.table}
+            WHERE embedding IS NOT NULL
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+            """,
+            (lit, lit, top_k),
+            fetch=True,
+        )
+        return [(r[0], float(r[1] or 0.0)) for r in (rows or [])]
+
+    def count(self) -> int:
+        rows = self._exec(f"SELECT COUNT(*) FROM {self.table}", fetch=True)
+        return int(rows[0][0]) if rows else 0

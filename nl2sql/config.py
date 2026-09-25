@@ -61,6 +61,16 @@ class KBSettings(BaseModel):
     rrf_k: int = 60              # RRF 融合常数（论文默认值）
     doc_max_chars: int = 1200    # 单条文档注入 prompt 的截断长度
 
+    # SQL 示例库的向量索引（让"长尾问句"也能召回相近范例）
+    example_table: str = "sql_example_vec"
+    example_top_k: int = 4
+    example_min_sim: float = 0.30  # 向量召回的相似度下限，避免引入无关范例
+
+    # rerank 精排（RRF 融合之后再做一次相关性精排）
+    rerank: bool = True
+    rerank_candidates: int = 8   # 进入精排的候选条数
+    rerank_min_score: float = 3.0  # 精排分数低于此值的候选被丢弃（避免无关资料污染 prompt）
+
 
 class PipelineSettings(BaseModel):
     max_retry: int = 1           # 生成失败后的重试次数（每次携带错误反馈）

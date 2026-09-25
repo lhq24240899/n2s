@@ -69,9 +69,12 @@ nl2sql/
 │   ├── validation.py           # SQLValidator（sqlglot AST 校验）
 │   ├── db.py                   # DBRunner ABC + Psycopg(EXPLAIN)（缺 DSN 报错）
 │   ├── embedding.py            # ★向量化：OpenAI 兼容 + 本地 HashingEmbedder（离线可测）
-│   ├── vectorstore.py          # ★pgvector + pg_trgm 知识库存储（三路召回）
-│   ├── kb.py                   # ★混合检索：RRF 融合 + 文档问答（带引用，降幻觉）
-│   └── pipeline.py             # Text2SQLPipeline 主流程编排
+│   ├── vectorstore.py          # ★pgvector + pg_trgm 存储（文档库 + 示例库向量索引）
+│   ├── fusion.py               # ★RRF 倒数排名融合（与存储/模型无关，可复用）
+│   ├── kb.py                   # ★混合检索：三路召回 + RRF + 精排 + 带引用文档问答
+│   ├── rerank.py               # ★精排层（LLM 打分 + 低分截断，可插拔换 cross-encoder）
+│   ├── graph.py                # ★LangGraph 版编排（六层节点化 + Critic 反思节点）
+│   └── pipeline.py             # Text2SQLPipeline 手写编排（与 graph.py 对照）
 ├── examples/                   # 演示知识库 + 端到端 demo
 │   ├── schema.py               # 通用演示知识库
 │   ├── demo.py                 # 通用端到端 demo
@@ -80,6 +83,7 @@ nl2sql/
 │   ├── grg_demo.py             # ★计量检测端到端 demo（单轮/多轮/澄清）
 │   ├── kb_docs.py              # ★企业知识库语料（19 篇：指标口径/术语/标准/排错 FAQ）
 │   ├── setup_kb.py             # ★建知识库：建表 + 向量化 + 写入 + 检索自检
+│   ├── graph_demo.py           # ★手写 pipeline vs LangGraph 对照演示
 │   └── setup_dev_db.py         # 在真实库建示例表 + 灌种子数据
 └── tests/                      # pytest 单测
 ```
@@ -368,21 +372,70 @@ streamlit run streamlit_app.py
 ### 10.3 建库与自检
 
 ```bash
-python examples/setup_kb.py                 # 建表 + 向量化 + 写入（幂等）
-python examples/setup_kb.py --demo          # 跑一组混合检索自检（打印三路命中明细）
+python examples/setup_kb.py                 # 建文档库 + 示例向量索引（幂等）
+python examples/setup_kb.py --demo          # 跑一组混合检索自检（打印三路命中 + 精排分）
 python examples/setup_kb.py --query "为什么问华南区查不到数据"
 ```
 
 知识库语料在 `examples/kb_docs.py`（19 篇：5 个指标口径 + 业务线/术语 + 检测标准 + 排错 FAQ），
 **每条都与 `grg_schema.py` 的指标口径严格对齐**——否则文档与数据打架，RAG 会变成新的幻觉来源。
 
-### 10.4 降幻觉的三层做法
+### 10.4 两阶段检索：召回 ⊃ 精排
+
+```
+标签分 ⊕ 示例向量  →  RRF  →  LLM 精排  →  低分截断  →  注入 prompt
+   （召回，求不漏）              （精排，求排序准 + 去噪）
+```
+
+- **召回阶段**同时覆盖两类语料：知识文档（关键词 / trgm / 向量三路）与 **SQL 示例库**
+  （标签分 ⊕ 示例问题向量，同样 RRF 融合）。长尾问句（"上个月华东片区可靠性这块的
+  验收及时比例是多少"）标签完全命不中，靠示例向量召回可以兜住。
+- **精排阶段**用 LLM 对候选打 0~10 分并**丢弃低于阈值的候选**。实测一句"为什么问华南区
+  查不到数据"会召回 8 条候选，精排后只剩 2 条真正相关的——把噪声挡在 prompt 之外，
+  是"降低模型幻觉"很实际的一环。
+- 精排接口可插拔（`Reranker`）：网关没有专用 rerank 模型时用 `LLMReranker`，
+  将来换 cross-encoder / 专用 rerank API 只需新增一个类。
+
+---
+
+## 11. 编排：手写 pipeline vs LangGraph
+
+同一批组件（Retriever / Linker / PromptBuilder / LLM / Validator / DB），**两套编排实现**：
+
+```
+START → retrieve → link → generate → validate ─ok→ execute → critique ─ok→ END
+                    ▲          │err           │err              │revise
+                    └──────────┴──────────────┘                  │
+                      还有重试额度则带反馈重生成 → fallback → END ←┘
+```
+
+| | `pipeline.py`（手写） | `graph.py`（LangGraph） |
+|---|---|---|
+| 控制流 | 嵌套 for/if，读一段才懂全貌 | 节点 + 条件边，**流转条件独立可读** |
+| 加一步（如 Critic） | 改主流程、易碰坏重试逻辑 | 加一个节点 + 一条边，**局部改动** |
+| 断点续跑 / 人工介入 | 需自己实现 | checkpoint + `interrupt` 原生支持 |
+| 可视化 | 手画 | `graph.mermaid()` 一键导出 |
+| 调试 | 自己的 trace | 每节点状态快照可回放 |
+
+**框架不解决什么**（这部分仍是自己的组件）：口径治理（Glossary / 语义层）、
+SQL 安全（sqlglot 白名单 + EXPLAIN 预检）、检索可解释性（reasons）、
+多轮上下文与澄清闭环 —— 换编排不会让这些变好。
+
+**Critic 反思节点**在这里承担"自检"职责：先做零成本规则检查（结果为空/全 NULL → 打回），
+再按需做 LLM 一致性复核（`critique_llm=True`，默认关以免每次查询都双倍成本）。
+
+```bash
+python examples/graph_demo.py               # 两条编排对照跑同一批问题
+python examples/graph_demo.py --llm-critic  # 额外开启 LLM 复核
+```
+
+### 11.1 降幻觉的三层做法（两套编排共用）
 
 | 层次 | 做法 |
 |---|---|
-| 生成前 | Schema Linking 限定表列 + 口径 Glossary + 知识库摘录（把"业务真相"喂进去） |
+| 生成前 | Schema Linking 限定表列 + 口径 Glossary + 知识库摘录 + 示例向量召回（把"业务真相"喂进去） |
 | 生成中 | 温度 0；静态校验（sqlglot AST 白名单）+ 执行预检（EXPLAIN） |
-| 生成后 | 空结果自愈重生成；**RAG 答案强制带引用**，资料不足时明确说"资料中未涉及" |
+| 生成后 | **Critic 反思**：结果为空/全 NULL → 打回重生成；低分候选截断；RAG 答案强制带引用，资料不足时明确说"资料中未涉及" |
 
 
 

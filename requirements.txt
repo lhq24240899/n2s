@@ -11,5 +11,8 @@ psycopg[binary]>=3.1
 # Web UI（Streamlit Cloud 部署入口：streamlit_app.py）
 streamlit>=1.36
 
+# 编排框架：LangGraph 版编排（nl2sql/graph.py）——与手写 pipeline 形成对照
+langgraph>=0.2
+
 # 开发依赖（测试）
 pytest>=8.0

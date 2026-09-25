@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 from .embedding import Embedder
+from .fusion import rrf_fuse  # noqa: F401  对外仍可从 kb 导入，实现放在 fusion.py
 from .llm import LLMClient
 from .vectorstore import DocHit, PgVectorStore
 
@@ -69,12 +70,17 @@ class HybridDocRetriever:
         top_k: int = 4,
         rrf_k: int = 60,
         per_channel: int = 10,
+        reranker=None,
+        rerank_candidates: int = 8,
     ):
         self.store = store
         self.embedder = embedder
         self.top_k = top_k
         self.rrf_k = rrf_k
         self.per_channel = per_channel
+        # 两阶段检索：RRF 融合负责"召回"，精排负责"排序准"
+        self.reranker = reranker
+        self.rerank_candidates = max(rerank_candidates, top_k)
 
     def retrieve(self, question: str) -> list[DocHit]:
         tokens = tokenize_cn(question)
@@ -94,8 +100,8 @@ class HybridDocRetriever:
             [[h.id for h in kw], [h.id for h in tr], [h.id for h in vec]], k=self.rrf_k
         )
 
-        out: list[DocHit] = []
-        for doc_id, score in fused[: self.top_k]:
+        candidates: list[DocHit] = []
+        for doc_id, score in fused[: self.rerank_candidates]:
             base = by_id[doc_id]
             # 把三路各自的原因都带上，最终给用户看到的是"为什么召回这一条"
             reasons: list[str] = []
@@ -103,7 +109,7 @@ class HybridDocRetriever:
                 rank = next((i + 1 for i, h in enumerate(hits) if h.id == doc_id), None)
                 if rank:
                     reasons.append(f"{label} rank{rank}")
-            out.append(
+            candidates.append(
                 DocHit(
                     id=base.id,
                     title=base.title,
@@ -115,7 +121,11 @@ class HybridDocRetriever:
                     else [f"RRF 融合得分 {score:.4f}"],
                 )
             )
-        return out
+
+        # 第二阶段：精排（LLM/cross-encoder），从候选中挑出最终 top_k
+        if self.reranker is not None:
+            return self.reranker.rerank(question, candidates, self.top_k)
+        return candidates[: self.top_k]
 
     def search_summary(self, question: str) -> dict:
         """给 UI 用的检索明细（三路各自的原始结果 + 融合结果），便于解释与调参。"""
@@ -175,8 +185,10 @@ def answer_with_docs(
     return llm.generate(build_doc_prompt(question, docs, max_chars), RAG_SYSTEM_PROMPT)
 
 
-def build_doc_retriever(settings, embedder: Embedder) -> HybridDocRetriever:
-    """工厂：从 Settings 构建知识库检索器。"""
+def build_doc_retriever(settings, embedder: Embedder, llm: LLMClient | None = None) -> HybridDocRetriever:
+    """工厂：从 Settings 构建知识库检索器（含可选精排）。"""
+    from .rerank import build_reranker
+
     store = PgVectorStore(
         dsn=settings.db.dsn,
         table=settings.kb.table,
@@ -188,4 +200,6 @@ def build_doc_retriever(settings, embedder: Embedder) -> HybridDocRetriever:
         embedder=embedder,
         top_k=settings.kb.top_k,
         rrf_k=settings.kb.rrf_k,
+        reranker=build_reranker(settings, llm),
+        rerank_candidates=settings.kb.rerank_candidates,
     )

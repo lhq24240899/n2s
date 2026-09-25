@@ -106,36 +106,56 @@ def get_engine():
     setup_logging(settings.log.level, settings.log.fmt)
 
     registry = build_registry(settings.db.dialect)
-    pipeline = Text2SQLPipeline(
-        registry=registry,
-        store=build_store(),
-        llm=build_llm(settings.llm),        # 缺 LLM__API_KEY 会直接抛错
-        db=build_db(settings.db, registry),  # 缺 DB__DSN 会直接抛错
-        top_k=settings.retrieval.top_k,
-        min_score=settings.retrieval.min_score,
-        max_retry=settings.pipeline.max_retry,
-    )
+    llm = build_llm(settings.llm)  # 缺 LLM__API_KEY 会直接抛错
+    store = build_store()
+
     st.session_state.engine = GRGQueryEngine(
-        pipeline,
+        Text2SQLPipeline(
+            registry=registry,
+            store=store,
+            llm=llm,
+            db=build_db(settings.db, registry),  # 缺 DB__DSN 会直接抛错
+            retriever=_build_retriever(settings, store, llm),
+            top_k=settings.retrieval.top_k,
+            min_score=settings.retrieval.min_score,
+            max_retry=settings.pipeline.max_retry,
+        ),
         build_semantic_layer(),
-        doc_retriever=_build_doc_retriever(settings),
+        doc_retriever=_build_doc_retriever(settings, llm),
         doc_max_chars=settings.kb.doc_max_chars,
     )
     return st.session_state.engine
 
 
-def _build_doc_retriever(settings):
-    """企业知识库混合检索器（pgvector + pg_trgm + 关键词 → RRF）。
+def _build_embedder(settings):
+    """向量化器；构建失败返回 None（上层自动降级为纯标签检索/纯 SQL 问数）。"""
+    try:
+        from nl2sql.embedding import build_embedder
+
+        return build_embedder(settings.embedding, settings.llm)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _build_retriever(settings, store, llm):
+    """SQL 示例检索：标签分 ⊕ 示例向量召回（RRF 融合）。未装向量库时自动退化为纯标签。"""
+    from nl2sql.retrieval import build_retriever
+
+    embedder = _build_embedder(settings) if settings.kb.enabled else None
+    return build_retriever(settings, store, embedder)
+
+
+def _build_doc_retriever(settings, llm):
+    """企业知识库混合检索器（pgvector + pg_trgm + 关键词 → RRF → LLM 精排）。
 
     构建失败不影响主流程：自动降级为纯 SQL 问数。
     """
     if not settings.kb.enabled:
         return None
     try:
-        from nl2sql.embedding import build_embedder
         from nl2sql.kb import build_doc_retriever
 
-        return build_doc_retriever(settings, build_embedder(settings.embedding, settings.llm))
+        return build_doc_retriever(settings, _build_embedder(settings), llm)
     except Exception:  # noqa: BLE001
         return None
 
