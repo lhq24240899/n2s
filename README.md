@@ -144,6 +144,7 @@ PIPELINE__MAX_RETRY=1
 | Schema 太大 | `SchemaLinker` 只抽候选表 + 1 跳外键邻居，最小相关 schema |
 | 幻觉字段 | `SQLValidator` 用 sqlglot 做**表白名单 + 列白名单**，AST 级拦截 |
 | 生成错了没法发现 | `DBRunner.explain`（生产为 EXPLAIN）做执行预检 |
+| SQL 正确但匹配 0 行 / 全 NULL | **空结果自愈**：`query()` 检测到空结果，带「过滤条件可能不匹配」反馈重生成一次（`retry_on_empty`，可关）；UI 自动展开 SQL |
 | 重试后仍失败 | 回退到最相关示例 SQL，`source=fallback_template` |
 | 定位故障层 | `source` 字段 + `PipelineTrace`（每步 attempt 都有记录） |
 

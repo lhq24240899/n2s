@@ -124,6 +124,35 @@ def config_status() -> tuple[bool, str]:
     return True, "配置就绪"
 
 
+SELFCHECK_TABLES = [
+    "labs",
+    "business_lines",
+    "trust_orders",
+    "reports",
+    "equipment",
+    "test_records",
+]
+
+
+def datasource_selfcheck() -> tuple[str, dict]:
+    """自检：当前 App 实际连的是哪台库、关键表有没有数据。
+
+    很多「查不到数据」其实是 App 连到了另一个空库，或种子数据没灌进去。
+    """
+    engine = get_engine()
+    db = engine.pipeline.db
+    dsn = getattr(db, "dsn", "") or ""
+    host = dsn.split("@")[-1].split("/")[0] if "@" in dsn else "(未知)"
+    counts: dict = {}
+    for t in SELFCHECK_TABLES:
+        try:
+            _, rows = db.execute(f"SELECT COUNT(*) FROM {t}")
+            counts[t] = rows[0][0]
+        except Exception as e:  # noqa: BLE001
+            counts[t] = f"ERROR: {e}"
+    return host, counts
+
+
 # ---------------------------------------------------------------------------
 # 3) 结果渲染
 # ---------------------------------------------------------------------------
@@ -146,6 +175,9 @@ def render_answer(out: dict) -> None:
     cols, rows = out["cols"], out["rows"]
 
     st.caption(SOURCE_LABEL.get(res.source.value, res.source.value))
+
+    # 空结果判定：无行 或 全部为 NULL
+    is_empty = (not rows) or all(v is None for r in rows for v in r)
 
     # 单值 -> 大数字卡片；多行 -> 表格
     if rows and len(rows) == 1 and len(rows[0]) == 1:
@@ -173,8 +205,13 @@ def render_answer(out: dict) -> None:
             f"> 数据来源：`{'`、`'.join(m.source_tables)}`"
         )
 
-    with st.expander("🔍 生成的 SQL"):
-        st.code(res.sql or "（无）", language="sql")
+    if is_empty and res.sql:
+        # 没数据时自动展开 SQL，便于直接排查（无需再点开）
+        st.caption("⬇️ 未返回数据，已自动展开生成的 SQL 便于排查：")
+        st.code(res.sql, language="sql")
+    else:
+        with st.expander("🔍 生成的 SQL"):
+            st.code(res.sql or "（无）", language="sql")
 
     with st.expander("🧭 语义映射（可解释）"):
         for r in mapped.reasons:
@@ -210,6 +247,17 @@ with st.sidebar:
         if "engine" in st.session_state:
             st.session_state.engine.reset_context()
         st.rerun()
+
+    st.divider()
+    if st.button("🔌 数据源自检"):
+        st.session_state.do_selfcheck = True
+    if st.session_state.pop("do_selfcheck", False):
+        try:
+            host, counts = datasource_selfcheck()
+            st.caption(f"当前连接：`{host}`")
+            st.dataframe({"表": list(counts), "行数": [str(v) for v in counts.values()]})
+        except Exception as e:  # noqa: BLE001
+            st.error(f"自检失败：{e}")
 
     st.caption("数据源：Neon PostgreSQL（需先用 setup_dev_db.py 建表灌数）")
 

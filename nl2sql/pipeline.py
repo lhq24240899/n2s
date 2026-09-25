@@ -47,6 +47,7 @@ class Text2SQLPipeline:
         top_k: int = 5,
         min_score: float = 1.0,
         max_retry: int = 1,
+        retry_on_empty: bool = True,
     ):
         self.registry = registry
         self.store = store
@@ -59,11 +60,14 @@ class Text2SQLPipeline:
         self.retriever = retriever or RetrievalService(store, min_score=min_score)
         self.top_k = top_k
         self.max_retry = max_retry
+        # 空结果自愈：SQL 能执行但匹配 0 行 / 全 NULL 时，带反馈重生成一次
+        # （这类失败静态校验与 EXPLAIN 都发现不了，只有执行后才知道）
+        self.retry_on_empty = retry_on_empty
         self._log = logging.getLogger("nl2sql.pipeline")
 
     # ---------------- 对外 API ----------------
 
-    def run(self, question: str) -> GenerationResult:
+    def run(self, question: str, pre_feedback: Optional[str] = None) -> GenerationResult:
         trace = PipelineTrace(question=question)
 
         # 1) 检索
@@ -84,7 +88,7 @@ class Text2SQLPipeline:
         self._log.info("候选表: %s", allowed)
 
         # 3) 生成 + 校验 + 预检 + 重试
-        error_feedback: Optional[str] = None
+        error_feedback: Optional[str] = pre_feedback
         last_raw = ""
         for attempt in range(self.max_retry + 1):
             prompt = self.prompt.build(
@@ -136,9 +140,43 @@ class Text2SQLPipeline:
             ResultSource.FALLBACK_TEMPLATE, sql, last_raw, trace, error_feedback
         )
 
-    def query(self, question: str) -> tuple[GenerationResult, list[str], list[tuple]]:
-        """run + 真实执行，返回 (结果, 列名, 行数据)，便于端到端演示。"""
-        res = self.run(question)
+    # 空结果自愈时回灌给 LLM 的反馈
+    EMPTY_FEEDBACK = (
+        "上一次生成的 SQL 语法正确、也通过了数据库预检，但执行后**返回 0 行或全为 NULL**。"
+        "这通常说明过滤条件的取值与库内真实数据不一致，例如："
+        "区域被写成了用户口语（如 '华南区'）而库里实际是 '华南'；"
+        "业务线用了中文名而库里是英文 code；状态/口径字段取值写错。"
+        "请严格使用『可用表结构』里『取值约束』给出的值，"
+        "并且不要为问题中未提及的维度添加过滤条件。"
+    )
+
+    def query(
+        self,
+        question: str,
+        pre_feedback: Optional[str] = None,
+    ) -> tuple[GenerationResult, list[str], list[tuple]]:
+        """run + 真实执行，返回 (结果, 列名, 行数据)，便于端到端演示。
+
+        额外做一层「空结果自愈」：SQL 能跑通但匹配 0 行 / 全 NULL 时，
+        带反馈重新生成一次——这是静态校验与 EXPLAIN 都覆盖不到的失败类型。
+        """
+        res = self.run(question, pre_feedback=pre_feedback)
+        cols, rows = self._execute(res)
+
+        if (
+            self.retry_on_empty
+            and res.sql
+            and res.source is ResultSource.LLM
+            and self._is_empty(cols, rows)
+        ):
+            self._log.warning("结果为空或全 NULL，触发空结果自愈（带反馈重生成）")
+            res2 = self.run(question, pre_feedback=self.EMPTY_FEEDBACK)
+            cols2, rows2 = self._execute(res2)
+            return res2, cols2, rows2
+
+        return res, cols, rows
+
+    def _execute(self, res: GenerationResult) -> tuple[list[str], list[tuple]]:
         cols: list[str] = []
         rows: list[tuple] = []
         if res.sql:
@@ -146,7 +184,14 @@ class Text2SQLPipeline:
                 cols, rows = self.db.execute(res.sql)
             except Exception as e:  # noqa: BLE001
                 res.error = f"执行失败: {e}"
-        return res, cols, rows
+        return cols, rows
+
+    @staticmethod
+    def _is_empty(cols: list[str], rows: list[tuple]) -> bool:
+        """空结果判定：无行，或所有单元格均为 NULL。"""
+        if not rows:
+            return True
+        return all(v is None for r in rows for v in r)
 
     # ---------------- 内部工具 ----------------
 
