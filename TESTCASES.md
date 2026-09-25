@@ -1,4 +1,4 @@
-# 功能测试用例 · 广电计量智能问数系统
+# 功能测试用例 · 计量检测智能问数系统
 
 适用范围：Streamlit 页面（`streamlit_app.py`）与命令行（`python examples/grg_demo.py`）。
 "预期结果"中的数值是**从当前 Neon 库里实测得出的标准答案**，不是估计值。

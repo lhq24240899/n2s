@@ -72,9 +72,9 @@ nl2sql/
 ├── examples/                   # 演示知识库 + 端到端 demo
 │   ├── schema.py               # 通用演示知识库
 │   ├── demo.py                 # 通用端到端 demo
-│   ├── grg_schema.py           # ★广电计量领域知识（表/指标/同义词/知识图谱/示例）
-│   ├── grg_engine.py           # ★广电计量引擎编排（真实 LLM + 真实 DB）
-│   ├── grg_demo.py             # ★广电计量端到端 demo（单轮/多轮/澄清）
+│   ├── grg_schema.py           # ★计量检测领域知识（表/指标/同义词/知识图谱/示例）
+│   ├── grg_engine.py           # ★计量检测引擎编排（真实 LLM + 真实 DB）
+│   ├── grg_demo.py             # ★计量检测端到端 demo（单轮/多轮/澄清）
 │   └── setup_dev_db.py         # 在真实库建示例表 + 灌种子数据
 └── tests/                      # pytest 单测
 ```
@@ -97,7 +97,7 @@ pip install -r requirements.txt        # 或: pip install -e .
 python examples/setup_dev_db.py
 
 # 4) 跑端到端 demo（真实 LLM + 真实数据库）
-python examples/grg_demo.py     # 广电计量 4 场景
+python examples/grg_demo.py     # 计量检测 4 场景
 python examples/demo.py         # 通用 3 场景
 
 # 5) 跑单元测试（使用 tests/doubles 里的离线替身，不花真钱、不碰真库）
@@ -174,11 +174,11 @@ PIPELINE__MAX_RETRY=1
 
 ---
 
-## 8. 广电计量行业适配（语义层 + 多轮 + 报告助手）
+## 8. 计量检测行业适配（语义层 + 多轮 + 报告助手）
 
 通用引擎解决「自然语言→SQL」，但计量检测行业真正难的是「业务语言→数据语义」。
 本项目的差异化价值就在新增的**语义层**（`nl2sql/semantic.py` + `nl2sql/context.py`），
-它把广电计量的行业知识显式化，作为 LLM 与业务之间的「翻译层」。
+它把计量检测行业的业务知识显式化，作为 LLM 与业务之间的「翻译层」。
 
 ### 8.1 语义层四大件
 
@@ -189,7 +189,7 @@ PIPELINE__MAX_RETRY=1
 | `KnowledgeGraph`（实体关系） | 实验室-区域-业务线-标准等关系，增强 Schema Linking | §3.2 业务知识图谱 |
 | `SemanticMapper.map()` | 把问题确定性映射为「归一化问题+指标+实体」 | §4.1 意图识别+实体抽取+语义层映射 |
 
-实例化见 `examples/grg_schema.py`：9 张 LIMS 风格核心表、5 个广电计量指标
+实例化见 `examples/grg_schema.py`：9 张 LIMS 风格核心表、5 个计量检测指标
 （检测服务收入/检测准时率/报告出具周期/设备利用率/检测一次通过率）、同义词库、知识图谱、带标签示例库。
 
 ### 8.2 六阶段管道（在原引擎上叠加语义映射）
@@ -220,7 +220,7 @@ Text2SQLPipeline.run(归一化问题, glossary=解析指标口径)
 追问只说"华南区"时，自动继承 `{业务线=可靠性, 指标=准时率, 时间=上个月}`，
 仅替换区域——这正是你 §4.3 要求的「继承上下文、只替换变化维度」。
 
-### 8.4 跑广电计量 demo
+### 8.4 跑计量检测 demo
 
 ```bash
 python examples/grg_demo.py
@@ -250,7 +250,7 @@ pytest -q            # 共 24 个用例：检索/校验/linker/pipeline + 新增
 | 三、报告助手 | 语义层与查询引擎已可复用；`MappedQuery` + 口径说明天然支撑「确定性模板生成描述」 | 定时触发/多步编排/报告模板(YAML)/推送企业微信 |
 | 四、扩展优化 | 检索层已留 `reasons` 可解释接口，便于叠 BM25/向量 | 反馈闭环、NL→PPL/DSL 对接数字化实验室管控平台 |
 
-**关键判断落地**：广电计量已有数据中台/数仓，本项目数据层直接对接 `PsycopgRunner`（只读账户 +
+**关键判断落地**：该集团已有数据中台/数仓，本项目数据层直接对接 `PsycopgRunner`（只读账户 +
 EXPLAIN 预检 + 审计日志），重点投入在语义层而非重复建设数据接入——与你文档结论一致。
 演示用的确定性替身（`MockLLM`/`MockDBRunner`/`GRGMockLLM`/`GRGSampleDB`）只保留在 `tests/doubles.py`
 供离线单测使用，生产代码已强制走真实 LLM 与真实数据库。
@@ -291,6 +291,8 @@ streamlit run streamlit_app.py
 
 ### 9.3 架构说明（为什么这样接）
 
+- **机构名称可配置**：页面/标题上的机构名统一由 `streamlit_app.py` 顶部的 `DISPLAY_NAME`
+  常量控制，想换名只改那一行（不涉及任何业务逻辑）。
 - Cloud 上**没有 `.env`**，密钥走 `st.secrets`；`streamlit_app.py` 启动时把 secrets 展平后写入
   环境变量（`LLM__BASE_URL` 等），`pydantic-settings` 便能像读 `.env` 一样读到——**核心引擎零改动**。
 - 每个浏览器会话**独立持有一个 `GRGQueryEngine`**（含独立 `QueryContext`），所以多轮上下文

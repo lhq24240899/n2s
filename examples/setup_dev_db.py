@@ -1,6 +1,6 @@
 """在真实数据库（.env 的 DB__DSN）中创建示例表并灌入可复现的种子数据。
 
-用途：让 `demo.py`（orders / users）与 `grg_demo.py`（广电计量 9 张表）能端到端
+用途：让 `demo.py`（orders / users）与 `grg_demo.py`（计量检测 9 张表）能端到端
 真实跑通。这些表是「演示用」数据，与生产无关，**随时可整体 DROP**（见脚本底部
 的 TEARDOWN 说明，或直接 DROP TABLE 列出的表名）。
 
@@ -39,7 +39,7 @@ def _ddl() -> list[str]:
         "CREATE TABLE orders ("
         "  id int, user_id int, total_amount numeric, status varchar, created_at timestamp)",
 
-        # ---------- 广电计量 9 张核心表 ----------
+        # ---------- 计量检测 9 张核心表 ----------
         "CREATE TABLE labs ("
         "  id int, name varchar, city varchar, region varchar)",
         "CREATE TABLE business_lines (id int, code varchar, name varchar)",
@@ -211,7 +211,7 @@ def main() -> None:
             _seed(cur)
             print("已灌入种子数据。")
     print("\n完成。可运行：")
-    print("  python examples/grg_demo.py   # 广电计量 4 场景端到端")
+    print("  python examples/grg_demo.py   # 计量检测 4 场景端到端")
     print("  python examples/demo.py       # 通用 3 场景端到端")
     print("\nTEARDOWN（如需清空）：")
     print("  DROP TABLE " + ", ".join(all_tables) + ";")

@@ -1,4 +1,4 @@
-"""广电计量问数引擎编排：把通用 pipeline + 语义层 + 多轮上下文组合成业务引擎。
+"""计量检测问数引擎编排：把通用 pipeline + 语义层 + 多轮上下文组合成业务引擎。
 
 对外只暴露一个 ask(question)，内部完成：
   语义映射 → 歧义澄清? → 多轮上下文继承 → 组装口径 Glossary
@@ -9,7 +9,7 @@ LLM 与 DB 均为真实实现（由 build_llm / build_db 注入）：
   不再需要业务感知的确定性 Mock。
 - 真实 DB 由 PsycopgRunner 执行 EXPLAIN 预检与查询，返回真实数据。
 
-语义层（semantic.py / grg_schema.py）承载广电计量行业知识，是这套系统
+语义层（semantic.py / grg_schema.py）承载计量检测行业知识，是这套系统
 区别于通用 Text-to-SQL 的关键。
 """
 from __future__ import annotations
@@ -21,7 +21,7 @@ from nl2sql.semantic import SemanticLayer, SemanticMapper
 
 
 class GRGQueryEngine:
-    """广电计量问数引擎：语义映射 + 多轮上下文 + 通用 pipeline 的组合层。"""
+    """计量检测问数引擎：语义映射 + 多轮上下文 + 通用 pipeline 的组合层。"""
 
     def __init__(self, pipeline: Text2SQLPipeline, layer: SemanticLayer):
         self.pipeline = pipeline

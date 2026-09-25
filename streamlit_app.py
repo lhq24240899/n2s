@@ -1,4 +1,6 @@
-"""广电计量 · 智能问数系统 —— Streamlit 入口（部署时的 Main file）。
+"""计量检测 · 智能问数系统 —— Streamlit 入口（部署时的 Main file）。
+
+页面显示名称统一由下方 `DISPLAY_NAME` 常量控制：改那一行即可整体换名。
 
 部署到 Streamlit Community Cloud：
   1. 仓库：https://github.com/lhq24240899/n2s
@@ -28,7 +30,14 @@ if str(_ROOT) not in sys.path:
 
 import streamlit as st
 
-st.set_page_config(page_title="广电计量 · 智能问数", page_icon="📊", layout="wide")
+# ============================================================
+# 页面显示的机构名称（想换名只改这一行；不涉及任何业务逻辑）
+# ============================================================
+DISPLAY_NAME = "计量检测集团"
+
+st.set_page_config(
+    page_title=f"{DISPLAY_NAME} · 智能问数", page_icon="📊", layout="wide"
+)
 
 SOURCE_LABEL = {
     "llm": "✅ LLM 生成 · 通过静态校验 + 执行预检",
@@ -223,7 +232,7 @@ def render_answer(out: dict) -> None:
 # ---------------------------------------------------------------------------
 # 4) 页面
 # ---------------------------------------------------------------------------
-st.title("📊 广电计量 · 自然问数系统")
+st.title(f"📊 {DISPLAY_NAME} · 自然问数系统")
 st.caption(
     "语义层驱动的 NL2SQL：可解释检索 · Schema Linking · sqlglot 校验 · "
     "EXPLAIN 预检 · 多轮上下文 · 失败回退"

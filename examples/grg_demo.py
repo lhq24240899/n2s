@@ -1,11 +1,11 @@
-"""广电计量智能问数 · 端到端演示（真实 LLM + 真实数据库）。
+"""计量检测智能问数 · 端到端演示（真实 LLM + 真实数据库）。
 
 运行：
     python examples/grg_demo.py
 
 前置：
   1) 在 .env 填好 LLM__* 与 DB__DSN；
-  2) 用 `python examples/setup_dev_db.py` 建 9 张广电计量示例表并灌数据。
+  2) 用 `python examples/setup_dev_db.py` 建 9 张计量检测示例表并灌数据。
 
 演示覆盖：
   1) 单轮语义映射：华东区上个月可靠性试验的准时完成率

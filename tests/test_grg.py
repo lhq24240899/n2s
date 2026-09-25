@@ -1,4 +1,4 @@
-"""广电计量引擎端到端测试：单轮、多轮、歧义澄清。"""
+"""计量检测引擎端到端测试：单轮、多轮、歧义澄清。"""
 from __future__ import annotations
 
 import sys

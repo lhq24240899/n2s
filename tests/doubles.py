@@ -98,7 +98,7 @@ class MockDBRunner(DBRunner):
 
 
 # ============================================================
-# 广电计量业务感知替身（原 examples.grg_engine.GRGMockLLM / GRGSampleDB）
+# 计量检测业务感知替身（原 examples.grg_engine.GRGMockLLM / GRGSampleDB）
 # ============================================================
 
 _BL_CODE_TO_CN = {
