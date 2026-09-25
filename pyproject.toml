@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nl2sql-platform"
+version = "0.1.0"
+description = "Production-grade natural language to SQL (NL2SQL) querying system: explainable retrieval + schema linking + LLM generation + validation + execution dry-run + fallback"
+requires-python = ">=3.10"
+dependencies = [
+    "sqlglot>=25.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "openai>=1.30",
+    "psycopg[binary]>=3.1",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.setuptools.packages.find]
+include = ["nl2sql*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
