@@ -7,13 +7,30 @@
 
 当前提供两个编译目标：
 - `to_es_dsl()`   → Elasticsearch Query DSL（真集群执行：阿里云 ES）
-- `to_ppl()`      → OpenSearch PPL（**仅编译产物**；PPL 是 OpenSearch 的语言，
-  阿里云 ES 不能执行 —— 诚实标注"需 OpenSearch"，不假装能跑）
+- `to_ppl()`      → OpenSearch PPL（连 OpenSearch 时经 `_plugins/_ppl` **真执行**；
+  连普通 ES 时执行器探测不到该端点，自动降级为"仅编译产物"）
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
+
+# ES date math（now-7d / now-30d / now-2h）-> PPL 用的绝对时间字符串。
+# OpenSearch PPL 的 where 不支持 ES 的 date math，编译器把相对窗口换算成执行时刻的绝对时间。
+_NOW_REL = re.compile(r"^now-(\d+)([dhw])$")
+_UNIT_SECONDS = {"d": 86400, "h": 3600, "w": 604800}
+
+
+def _abs_since(value: str, now: Optional[datetime] = None) -> str:
+    """把 now-7d 这类相对时间换算成 'YYYY-MM-DD HH:MM:SS'；不是相对时间则原样返回。"""
+    m = _NOW_REL.match(str(value))
+    if not m:
+        return str(value)
+    seconds = int(m.group(1)) * _UNIT_SECONDS[m.group(2)]
+    dt = (now or datetime.now(timezone.utc)) - timedelta(seconds=seconds)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
 @dataclass
@@ -43,7 +60,9 @@ class IRFilter:
             vs = ", ".join(f"'{v}'" if isinstance(v, str) else str(v) for v in self.value)
             return f"{self.field} in ({vs})"
         if self.op in ("gte", "lte"):
-            return f"{self.field} {'>=' if self.op == 'gte' else '<='} {self.value}"
+            op = ">=" if self.op == "gte" else "<="
+            v = _abs_since(self.value) if self.op in ("gte", "lte") else self.value
+            return f"{self.field} {op} '{v}'"
         if self.op == "match":
             return f"match({self.field}, '{self.value}')"
         raise ValueError(f"未知过滤 op: {self.op}")

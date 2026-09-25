@@ -86,30 +86,45 @@ def main(argv: list[str] | None = None) -> int:
     eng = EsQueryEngine(backend, index=settings.es.index)
     cases = [c for c in ES_CASES if not args.id or c["id"] in args.id]
 
-    records, passed = [], 0
+    records, passed, ppl_pass, ppl_total = [], 0, 0, 0
     for c in cases:
         t0 = time.time()
         out = eng.ask(c["question"])
         dt = (time.time() - t0) * 1000
         if out.get("type") != "result":
             ok_case, detail = False, f"非结果返回: {out.get('message') or out.get('type')}"
+            ppl_ok, ppl_detail = None, "主查询失败"
         else:
             ok_case, detail = compare(c["kind"], out["rows"], c["expected"])
+            ppl_info = out.get("ppl") or {}
+            if ppl_info.get("status") == "executed":
+                ppl_total += 1
+                ppl_ok, ppl_detail = compare(c["kind"], ppl_info.get("rows") or [], c["expected"])
+                ppl_pass += bool(ppl_ok)
+            else:
+                ppl_ok, ppl_detail = None, ppl_info.get("status_detail") or ppl_info.get("status")
         passed += bool(ok_case)
         records.append({
             "id": c["id"], "question": c["question"], "ok": ok_case,
-            "detail": detail, "ms": round(dt, 1),
-            "es_dsl": out.get("es_dsl"), "ppl": out.get("ppl"),
+            "detail": detail, "ppl_ok": ppl_ok, "ppl_detail": ppl_detail,
+            "ms": round(dt, 1), "es_dsl": out.get("es_dsl"), "ppl": out.get("ppl"),
             "rows": out.get("rows"),
         })
-        print(f"[{'PASS' if ok_case else 'FAIL'}] {c['id']} {c['question']} -> {detail} ({dt:.0f}ms)")
+        ppl_mark = "?" if ppl_ok is None else ("P" if ppl_ok else "X")
+        print(f"[{'PASS' if ok_case else 'FAIL'}|ppl:{ppl_mark}] {c['id']} {c['question']} -> {detail}")
 
     total = len(cases)
     acc = passed / total if total else 0.0
-    print(f"\n通过 {passed}/{total} = {acc:.1%}")
+    print(f"\nES DSL  通过 {passed}/{total} = {acc:.1%}")
+    if ppl_total:
+        print(f"PPL     通过 {ppl_pass}/{ppl_total} = {ppl_pass / ppl_total:.1%}"
+              f"（{total - ppl_total} 条仅编译未执行）")
+    else:
+        print("PPL     本轮全部为编译产物（后端不是 OpenSearch 或 PPL 端点不可用）")
 
     report = {"engine": "es", "version": info, "index": settings.es.index,
-              "passed": passed, "total": total, "accuracy": acc, "records": records}
+              "passed": passed, "total": total, "accuracy": acc,
+              "ppl_passed": ppl_pass, "ppl_total": ppl_total, "records": records}
     Path("evals").mkdir(exist_ok=True)
     Path("evals/last_es_report.json").write_text(
         json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")

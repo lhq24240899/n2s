@@ -685,7 +685,8 @@ python examples/metadata_check.py           # 有变更打印明细并退出码 
 
 ```
 问题 ──(确定性规则填槽)──► QueryIR ──┬─► ES Query DSL ──► 真集群执行（阿里云 ES 9.3.2）
-                                     └─► OpenSearch PPL ──► 编译产物（PPL 是 OpenSearch 的语言，ES 不能执行）
+                                     └─► OpenSearch PPL ──► _plugins/_ppl 真执行（Aiven OpenSearch）
+                                                              └ 普通 ES 上自动降级为"仅编译产物"
 ```
 
 **为什么不让 LLM 直接写 ES JSON / PPL**：那等于每种语言各赌一次格式化（括号、保留字、字段名全靠模型），
@@ -740,6 +741,21 @@ ES 报错时**自动回落 SQL**并在 `reasons` 里标注。行级权限由 `sc
 `DataPolicy` 映射成 ES `terms` 过滤——`labs.region → region`、`business_lines.code → business_line`，
 **换引擎不换安全等级**。
 
-> 面试价值：**「PPL 你真跑过吗？」** —— 诚实回答：PPL 是 OpenSearch 的语言，阿里云 ES 不能执行，
-> 所以这里 PPL 是**编译器产物**（同一份 IR 编译出的文本，随结果一起返回可对照），ES DSL 才是真执行路径。
-> 把"能不能跑"和"能不能编译"分开讲，比含糊其辞更可信。
+### 14.4 PPL 真执行：Aiven OpenSearch 接入（同一份 IR，第二个后端）
+
+`ElasticsearchBackend.execute_ppl()` 走 OpenSearch 的 `_plugins/_ppl` 端点；每次 `ask()` 都会
+双路执行——ES DSL 与 PPL 各跑一遍，`ppl.status` 标注 `executed` / `compiled-only`：
+后端探测不到 PPL 端点（普通 ES，如阿里云）就自动降级，主结果不受影响。
+
+方言差异消化在**编译器**里（这正是 IR 方案的价值）：PPL 的 `where` 不认 ES 的 date math（`now-7d`），
+`to_ppl()` 把相对窗口换算成执行时刻的绝对时间（`_abs_since()`，可注入 now 做离线单测）。
+
+```bash
+# 连 Aiven OpenSearch 时跑双路对拍（ES 侧与 PPL 侧分别和标准答案比对）
+ES__HOST=https://noahdemo-noahdemo.b.aivencloud.com:26380 python examples/es_eval.py
+```
+
+> 面试价值：**「PPL 你真跑过吗？」** —— 跑过。同一份 IR 在阿里云 ES 上编译成 ES DSL 真执行，
+> 在 Aiven OpenSearch 上编译成 PPL 经 `_plugins/_ppl` 真执行，两条路径各自与标准答案对拍；
+> PPL 不可用时自动降级为编译产物并如实标注。把"能不能跑"和"能不能编译"分开讲，
+> 且两张成绩单都拿得出，比任何单引擎故事都硬。

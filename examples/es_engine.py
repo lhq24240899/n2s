@@ -59,17 +59,26 @@ class EsQueryEngine:
         except Exception as e:  # noqa: BLE001 - ES 不可用时明确报错（上层可降级）
             return {"type": "error", "message": f"ES 查询失败: {e}", "engine": "es"}
 
-        ppl = ir.to_ppl()  # 编译产物：展示"同一份 IR 还能编译成 PPL（需 OpenSearch 执行）"
+        ppl = ir.to_ppl()  # 编译产物：同一份 IR 也能编译成 PPL
+        # PPL 双路：连 OpenSearch 时真执行；普通 ES 上 _plugins/_ppl 不存在 -> 降级为"仅编译"
+        ppl_payload: dict = {"query": ppl, "status": "compiled-only"}
+        try:
+            ppl_cols, ppl_rows = self.backend.execute_ppl(ppl)
+            ppl_payload.update(status="executed", columns=ppl_cols, rows=ppl_rows)
+        except Exception as e:  # noqa: BLE001 - PPL 不可用不影响主结果
+            ppl_payload["status_detail"] = str(e)[:120]
+
         return {
             "type": "result",
             "engine": "es",
             "columns": cols,
             "rows": rows,
             "es_dsl": dsl,
-            "ppl": ppl,
+            "ppl": ppl_payload,
             "entities": {"index": ir.index, "filters": [(f.field, f.op, f.value) for f in ir.filters]},
             "reasons": [f"IR->ES DSL 编译（{len(ir.filters)} 个过滤, "
-                        f"{'按 ' + ir.group_by + ' 分组' if ir.group_by else '全局聚合'})"],
+                        f"{'按 ' + ir.group_by + ' 分组' if ir.group_by else '全局聚合'})",
+                        f"PPL: {ppl_payload['status']}"],
             "row_count": len(rows),
             "empty": len(rows) == 0,
         }

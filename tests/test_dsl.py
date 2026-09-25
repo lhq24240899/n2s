@@ -22,7 +22,21 @@ def test_filter_to_es_term_and_range():
 def test_filter_to_ppl():
     assert IRFilter("level", "term", "ERROR").to_ppl() == "level = 'ERROR'"
     assert IRFilter("region", "terms", ["华东", "华南"]).to_ppl() == "region in ('华东', '华南')"
-    assert IRFilter("ts", "gte", "now-7d").to_ppl() == "ts >= now-7d"
+    # 相对窗口翻译成绝对时间（PPL 不认 ES date math）
+    got = IRFilter("ts", "gte", "now-7d").to_ppl()
+    assert got.startswith("ts >= '") and got.endswith("'") and "now-" not in got
+    assert IRFilter("v", "lte", 100).to_ppl() == "v <= '100'"
+
+
+def test_abs_since_translation():
+    from datetime import datetime, timezone
+
+    from nl2sql.dsl import _abs_since
+
+    fixed = datetime(2026, 9, 26, 12, 0, 0, tzinfo=timezone.utc)
+    assert _abs_since("now-7d", now=fixed) == "2026-09-19 12:00:00"
+    assert _abs_since("now-2h", now=fixed) == "2026-09-26 10:00:00"
+    assert _abs_since("2026-01-01", now=fixed) == "2026-01-01"   # 非相对时间原样返回
 
 
 def test_metric_count_emits_empty_es_but_named_ppl():
@@ -113,10 +127,8 @@ def test_ppl_group_filter_sort():
         limit=3,
     )
     ppl = ir.to_ppl()
-    assert ppl == (
-        "source=device_events | where level = 'ERROR' and ts >= now-7d "
-        "| stats count() as cnt by region | sort - cnt | head 3"
-    )
+    assert "| where level = 'ERROR' and ts >= '" in ppl
+    assert "| stats count() as cnt by region | sort - cnt | head 3" in ppl
 
 
 # ---------------- parse_es_response ----------------

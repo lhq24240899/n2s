@@ -80,6 +80,33 @@ class ElasticsearchBackend:
         resp = self.search(index, body)
         return parse_es_response(resp, ir)
 
+    def ppl_supported(self) -> bool:
+        """探测 /_plugins/_ppl 端点：OpenSearch 为 True，普通 Elasticsearch 为 False。"""
+        try:
+            r = self._client.get("/_plugins/_ppl/stats", headers=self._headers())
+            return r.status_code == 200
+        except Exception:  # noqa: BLE001
+            return False
+
+    def execute_ppl(self, ppl_query: str) -> tuple[list[str], list[tuple]]:
+        """真执行 PPL（OpenSearch _plugins/_ppl）。失败抛 EsError，上层降级。
+
+        PPL 响应契约：{"schema": [{"name": ..., "type": ...}], "datarows": [[...], ...]}
+        """
+        try:
+            r = self._client.post(
+                "/_plugins/_ppl", json={"query": ppl_query}, headers=self._headers())
+            if r.status_code != 200:
+                raise EsError(f"PPL {r.status_code}: {r.text[:300]}")
+            body = r.json()
+            cols = [f.get("name", "") for f in body.get("schema", [])]
+            rows = [tuple(row) for row in body.get("datarows", [])]
+            return cols, rows
+        except EsError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise EsError(f"PPL 请求失败: {e}") from e
+
     def close(self) -> None:
         try:
             self._client.close()

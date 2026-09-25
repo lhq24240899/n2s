@@ -22,9 +22,16 @@ def _transport_handler(responses: list[dict]):
 
     def handler(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content.decode("utf-8")) if request.content else {}
-        calls.append({"path": request.url.raw_path.decode(), "body": body})
-        # 简单桩：分组查询返回两个桶，全局 count 回 hits.total
-        if "group" in body.get("aggs", {}):
+        path = request.url.raw_path.decode()
+        calls.append({"path": path, "body": body})
+        if path == "/_plugins/_ppl":
+            # OpenSearch PPL 响应契约：schema + datarows
+            payload = {
+                "schema": [{"name": "region", "type": "string"}, {"name": "cnt", "type": "long"}],
+                "datarows": [["华东", 42], ["华南", 30]],
+                "status": 200,
+            }
+        elif "group" in body.get("aggs", {}):
             buckets = [
                 {"key": "华东", "doc_count": 42},
                 {"key": "华南", "doc_count": 30},
@@ -106,8 +113,10 @@ def test_ask_group_end_to_end():
     assert out["type"] == "result" and out["engine"] == "es"
     assert out["columns"] == ["region", "cnt"]
     assert ("华东", 42) in out["rows"]
-    # 必须同时给出两种编译产物
-    assert "es_dsl" in out and "source=device_events" in out["ppl"]
+    # 必须同时给出两种编译产物；mock 端点响应 200 -> PPL 状态为已执行
+    assert "source=device_events" in out["ppl"]["query"]
+    assert out["ppl"]["status"] == "executed"
+    assert out["ppl"]["rows"] == [("华东", 42), ("华南", 30)]
     # 确认请求打到了正确的 _search 路径且 size=0
     assert calls[0]["path"] == "/device_events/_search"
     assert calls[0]["body"]["size"] == 0
