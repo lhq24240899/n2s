@@ -74,6 +74,12 @@ nl2sql/
 │   ├── kb.py                   # ★混合检索：三路召回 + RRF + 精排 + 带引用文档问答
 │   ├── rerank.py               # ★精排层（LLM 打分 + 低分截断，可插拔换 cross-encoder）
 │   ├── graph.py                # ★LangGraph 版编排（六层节点化 + Critic 反思节点）
+│   ├── auth.py                 # ★鉴权：JWT 签发/校验 + 角色→scope（认证与授权分离）
+│   ├── policy.py               # ★数据权限：表/列/指标白名单 + 行级过滤注入（sqlglot）
+│   ├── service.py              # ★服务层：会话/限流/并发闸门/审计/序列化（框架无关）
+│   ├── api.py                  # ★FastAPI 智能体 API（四道门：认证/授权/数据权限/执行安全）
+│   ├── mcp_server.py           # ★MCP server（只读工具，供 IDE / 其它智能体调用）
+│   ├── bootstrap.py            # ★装配层（三个入口共用同一套上下文与引擎工厂）
 │   └── pipeline.py             # Text2SQLPipeline 手写编排（与 graph.py 对照）
 ├── examples/                   # 演示知识库 + 端到端 demo
 │   ├── schema.py               # 通用演示知识库
@@ -84,8 +90,11 @@ nl2sql/
 │   ├── kb_docs.py              # ★企业知识库语料（19 篇：指标口径/术语/标准/排错 FAQ）
 │   ├── setup_kb.py             # ★建知识库：建表 + 向量化 + 写入 + 检索自检
 │   ├── graph_demo.py           # ★手写 pipeline vs LangGraph 对照演示
+│   ├── api_server.py           # ★启动智能体 API（uvicorn）
 │   └── setup_dev_db.py         # 在真实库建示例表 + 灌种子数据
 └── tests/                      # pytest 单测
+    ├── doubles.py              # 离线替身（MockLLM / GRGMockLLM / GRGSampleDB）
+    └── service_factory.py      # 共享装配：用替身搭出真实服务栈（API/MCP 测试复用）
 ```
 
 > 与你最初示例的 7 模块一一对应：`models`↔数据模型、`knowledge`↔知识库、
@@ -111,6 +120,10 @@ python examples/demo.py         # 通用 3 场景
 
 # 5) 跑单元测试（使用 tests/doubles 里的离线替身，不花真钱、不碰真库）
 pytest -q
+
+# 6) 起智能体 API / MCP server（第 12 节）
+python examples/api_server.py --port 8000      # → http://127.0.0.1:8000/docs
+python -m nl2sql.mcp_server                    # stdio，给 IDE / 其它智能体用
 ```
 
 输出会清晰展示三种最终来源：
@@ -157,7 +170,12 @@ PIPELINE__MAX_RETRY=1
 | 问「各业务线/各实验室」却只返回一个总数 | 语义层识别**分组维度**（`各/按/每个 + 维度词`）→ Glossary 下发 `GROUP BY` 指令（每行一个取值），且**不再把同维度继承成过滤条件** |
 | 会话中途答错一次后，后面全查不到数据 | 连接用 **autocommit**（每语句独立事务）避免坏语句毒化整条连接，并**异常即弃连接重连**——否则 PostgreSQL 的 `current transaction is aborted` 会让整条连接持续失败 |
 | 文档类问题（"EMC 是什么""为什么华南区查不到数据"） | 走**企业知识库混合 RAG**：关键词 + pg_trgm + pgvector 三路召回 → RRF 融合 → **只依据资料作答并标注引用**，避免 RAG 变成新的幻觉源 |
-| 重试后仍失败 | 回退到最相关示例 SQL，`source=fallback_template` |
+| 谁能查、能查哪些数据 | **四道门**（第 12 节）：JWT 认证 → scope 授权 → 数据权限（无权表不进 prompt、指标级拒绝、行级过滤注入 SQL）→ 库级只读 |
+| 同一条问题不同角色看到的口径不一样 | 令牌携带 `regions / business_lines` → 合成 `DataPolicy` → **过滤条件注入 SQL 的 WHERE**（不是查完再截断，聚合值本身就是对的） |
+| 调用方把 LLM 预算刷干 / 下游被打崩 | 按主体的**令牌桶限流**（429 + `Retry-After`）+ **有界并发信号量**（超时即拒绝），即"算力调度"的最小有效形态 |
+| 出了事怎么追溯 | **审计**：谁/何时/问什么/生成什么 SQL/返回几行/是否被拒绝，落结构化日志并可从 `/v1/audit` 查 |
+| 只读会不会只是"约定" | 不止：`DB__READONLY=true` 时连接后执行 `SET default_transaction_read_only = on`，写入会被**数据库本身**拒绝（实测 `cannot execute INSERT in a read-only transaction`），且连接不被毒化 |
+| 重试后仍失败 | 回退到最相关示例 SQL，`source=fallback_template`；**回退路径同样过数据权限**，过不了就置空 SQL |
 | 定位故障层 | `source` 字段 + `PipelineTrace`（每步 attempt 都有记录） |
 
 ---
@@ -174,17 +192,28 @@ PIPELINE__MAX_RETRY=1
    但务必保留 `reasons` 可解释性。
 5. **`linker.py`**：可换成用 LLM 做一次实体抽取，但结果必须限制在 schema 白名单内。
 6. **知识库**：把你的真实 `TableSchema` / `SQLExample` 填进 `examples/schema.py` 即可。
+7. **权限与审计**（第 12 节已实现，生产需替换三处）：
+   - `auth.py` 的 JWT 换成企业 **IdP / SSO** 签发的令牌（保留 `Principal` 抽象即可，其余不动）；
+   - `policy.py` 的 `DEFAULT_POLICIES` 换成读**权限系统/元数据中心**（角色 → 表/列/指标/行级规则）；
+   - 数据库侧再叠一层：**只读账户**（`GRANT SELECT`）+ 行级安全（PG RLS）。
+     代码里的 `DB__READONLY` 是"会话级只读"，与账户级只读不冲突，属于纵深防御。
 
 ---
 
 ## 7. 设计取舍（面试可讲的要点）
 
-- **为什么不用向量？** 向量召回黑盒、难调试、冷启动难。标签/关键词可解释、零依赖，
-  对「指标/维度/意图」这类强结构化查询效果足够好；长尾再叠 BM25/向量。
+- **为什么一开始不上向量？** 向量召回黑盒、难调试、冷启动难；标签/关键词可解释、零依赖，
+  对「指标/维度/意图」这类强结构化查询效果足够好。**先用可解释方案把上限摸清**，
+  确认长尾问句（"上个月华东片区可靠性这块的验收及时比例"）标签命不中之后，
+  再叠三路混合召回 + RRF + 精排——且**始终保留 `reasons`**，不让召回变回黑盒。
 - **为什么校验放两层？** 静态校验（sqlglot AST）拦语法/写操作/幻觉字段；
   执行预检（EXPLAIN）拦「语法合法但运行期才暴露」的问题（类型不匹配、权限、视图不存在）。
+- **为什么权限要放四层（认证/授权/数据权限/库级只读）？** 单一防线必然有盲区：
+  AST 白名单管不到"语义合法但越权"的查询，行级过滤在应用层、总有绕过的可能。
+  每层只解决一类问题、互不重复，且**最后一层落在数据库**——应用层全被绕过也写不进数据。
 - **为什么回退有两级？** 检索无命中（连参考都没有）→ 通用兜底；有命中但 LLM 屡错
   → 回退到已被口径验证过的示例 SQL，保证「至少有可用答案」而不是空手而归。
+  但**回退路径同样过数据权限**：宁可不返回数据，也不返回越权 SQL。
 
 ---
 
@@ -262,11 +291,13 @@ python examples/grg_demo.py
 ### 8.5 测试
 
 ```bash
-pytest -q            # 共 24 个用例：检索/校验/linker/pipeline + 新增 semantic/context/grg
+pytest -q            # 共 120 个用例：检索/校验/linker/pipeline/semantic/context/grg
+                     #   + kb(混合RAG)/rerank/graph(图编排)/auth/policy/api/mcp
 ```
 
-新增测试：`tests/test_semantic.py`（同义词/歧义/指标解析）、`tests/test_context.py`（多轮继承）、
-`tests/test_grg.py`（端到端单轮/多轮/澄清）。
+测试分层：`tests/doubles.py` 提供确定性替身（不联网、不花钱、不碰真库），
+`tests/service_factory.py` 用替身搭出**真实服务栈**（真实 QueryService + 引擎 + 语义层 + 权限层），
+因此 `test_api.py` / `test_mcp.py` 覆盖的是真实调用链，而不是 mock 出来的假接口。
 
 ### 8.6 落地路线（对应你 §六）
 
@@ -424,9 +455,15 @@ SQL 安全（sqlglot 白名单 + EXPLAIN 预检）、检索可解释性（reason
 **Critic 反思节点**在这里承担"自检"职责：先做零成本规则检查（结果为空/全 NULL → 打回），
 再按需做 LLM 一致性复核（`critique_llm=True`，默认关以免每次查询都双倍成本）。
 
+**编排可替换，引擎零改动**：`graph.GraphRunner` 让图暴露与 `pipeline` 相同的
+`query()` 契约（外加 `glossary / doc_context / guard` 三个可变属性），
+因此引擎只换 `runner` 就能在两种编排间切换——这也顺带证明了"换编排不换安全等级"：
+数据权限守卫在两条路径上都生效（有单测守着）。
+
 ```bash
 python examples/graph_demo.py               # 两条编排对照跑同一批问题
 python examples/graph_demo.py --llm-critic  # 额外开启 LLM 复核
+python examples/api_server.py --orchestrator graph   # API 也可切到图编排
 ```
 
 ### 11.1 降幻觉的三层做法（两套编排共用）
@@ -436,6 +473,116 @@ python examples/graph_demo.py --llm-critic  # 额外开启 LLM 复核
 | 生成前 | Schema Linking 限定表列 + 口径 Glossary + 知识库摘录 + 示例向量召回（把"业务真相"喂进去） |
 | 生成中 | 温度 0；静态校验（sqlglot AST 白名单）+ 执行预检（EXPLAIN） |
 | 生成后 | **Critic 反思**：结果为空/全 NULL → 打回重生成；低分候选截断；RAG 答案强制带引用，资料不足时明确说"资料中未涉及" |
+
+---
+
+## 12. 智能体 API：FastAPI + MCP + 只读数据权限
+
+三个入口，一套内核：`bootstrap.py` 装配一次，`api.py`（HTTP）、`mcp_server.py`（MCP）、
+`streamlit_app.py`（Web UI）共用同一个 `QueryService` 与引擎工厂
+——避免"三个入口三套行为"这种最常见的腐化。
+
+### 12.1 四道门（职责不重叠、也不留缺口）
+
+```
+请求
+ ├─① 认证  Bearer JWT           你是谁 → 401 / 503（未配密钥）
+ ├─② 授权  scope 声明式校验      能做什么动作 → 403
+ ├─③ 数据权限  DataPolicy        能看哪些数据 → 生成前收窄、生成后改写 SQL
+ └─④ 执行安全  AST 白名单 + EXPLAIN + 库级只读   能执行什么 → 拒绝并回退
+```
+
+- **① 认证**：HS256 JWT，固定算法（防 `alg=none` 降级）、校验 `exp/iss/aud`。
+  **权限一律以服务端角色映射为准**——即便令牌里被塞了越权 scope，也不会跟着越权。
+- **② 授权**：接口只声明"需要哪个 scope"（如 `Depends(require(Scope.QUERY_ASK))`），
+  不写 `if role == "admin"`；角色 → scope 的映射只在 `auth.py` 一处维护。
+- **③ 数据权限**（`policy.py`）落在三处：
+  1. **生成前摘掉无权表**：LLM 看不到的表就写不出来，比事后拦截干净；
+  2. **指标级拒绝**：明确回"你的角色无权查询该指标"，而不是给一条被拦的 SQL；
+  3. **生成后列级拦截 + 行级过滤注入**：用 sqlglot 找到**真正引用该表的那层 SELECT**，
+     把 `region = '华东'` 之类谓词 **AND 进 WHERE**（而非查完再在 Python 里过滤——
+     那样行数/聚合值已经算错了）。SQL 未引用该表时**如实标注"未生效"**，绝不假装过滤成功。
+- **④ 执行安全**：AST 白名单 + EXPLAIN 预检 + **`SET default_transaction_read_only = on`**。
+  前三道都在应用层；最后一道在数据库层——即使应用层被绕过，`INSERT/DROP/UPDATE`
+  也会被 PG 直接拒绝（实测：`cannot execute INSERT in a read-only transaction`）。
+
+> 回退路径同样过权限。实测踩到过：重试耗尽后回退到示例模板 SQL，而模板带着被禁字段，
+> **越权数据被直接返回**。现在 `pipeline.py` 与 `graph.py` 的 fallback 都必须过 `guard.post_sql`，
+> 过不了就把 `sql` 置空（宁可不返回数据）。这条有单测守着。
+
+### 12.2 服务层（`service.py`，刻意不依赖 FastAPI）
+
+| 能力 | 做法 | 为什么必须有 |
+|---|---|---|
+| 会话 | 每会话一个引擎（独立多轮上下文）+ **TTL 过期 + 容量上限（LRU）** | 不做这两件事的 Agent 服务，跑一夜就 OOM |
+| 会话归属 | `owner` 校验，换个 `session_id` 不能接管别人的上下文 | 否则等于越权读别人的历史问题与口径 |
+| 限流 | 按 `sub` 的令牌桶，超限 429 + `Retry-After` | 防某个调用方把 LLM 预算刷干 |
+| 并发闸门 | 有界信号量（`API__MAX_CONCURRENCY`），排队超时即拒绝 | 这就是"算力调度"最有效的形态：保护下游而不是让它雪崩 |
+| 审计 | 谁/何时/问什么/生成什么 SQL/返回几行/是否被拒绝，落结构化日志 + 内存环形缓冲 | 只读系统同样要审计：泄露常发生在"合法查询"里 |
+
+**并发模型（容易被忽略的细节）**：引擎内部是同步阻塞的（openai SDK、psycopg 都是同步客户端），
+所以路由写成普通 `def`，让 FastAPI 丢进线程池，再用信号量限制真正打到 LLM 的并发。
+若写成 `async def` 直接调同步代码，会**阻塞事件循环**，把整台服务拖死。
+
+### 12.3 接口一览
+
+| 方法 | 路径 | 权限 | 说明 |
+|---|---|---|---|
+| GET | `/health` | — | 探活：DB/KB/会话数/并发占用 |
+| POST | `/v1/auth/token` | — | 自助签发令牌（**仅本地演示**，需 `AUTH__DEV_TOKEN_ENDPOINT=true`） |
+| GET | `/v1/whoami` | 登录 | 当前身份、角色、scope、数据范围 |
+| GET | `/v1/schema` | `schema:read` | **按角色过滤**的表/指标目录（敏感字段会被标记） |
+| POST | `/v1/kb/search` | `kb:read` | 知识库混合检索（带召回依据） |
+| POST | `/v1/ask` | `query:ask` | 问数：`result / rag / clarification / denied` 四种结果 |
+| POST | `/v1/sessions/{id}/reset` | `query:ask` | 重置会话上下文 |
+| GET | `/v1/audit` | `audit:read` | 近期审计记录（仅 admin） |
+
+### 12.4 跑起来
+
+```bash
+# 1) 签发令牌（本地演示；生产应接企业 IdP）
+python -m nl2sql.auth --role analyst --sub alice
+python -m nl2sql.auth --role analyst --sub east-mgr --regions 华东    # 带数据范围的令牌
+
+# 2) 起 HTTP 服务（文档：http://127.0.0.1:8000/docs）
+python examples/api_server.py --port 8000
+# 或： uvicorn "nl2sql.api:create_app" --factory --port 8000
+
+# 3) 起 MCP server（stdio，给 IDE / 其它智能体用）
+python -m nl2sql.mcp_server                    # 默认 analyst（只读）
+python -m nl2sql.mcp_server --transport sse --port 8765
+```
+
+实测（真 LLM + 真 Neon 库，uvicorn + curl）：
+
+```jsonc
+// POST /v1/ask {"question": "各实验室设备利用率"}   ← 令牌限定 regions=["华东"]
+{
+  "type": "result", "row_count": 3,
+  "rows": [["上海集成电路实验室", 0.88], ["无锡可靠性实验室", 0.83], ["广州计量实验室", 0.81]],
+  "sql": "SELECT l.name, AVG(e.utilization) AS utilization FROM equipment AS e
+          JOIN labs AS l ON e.lab_id = l.id
+          WHERE l.region = '华东' GROUP BY l.name ORDER BY utilization DESC",
+  "data_scope": ["已注入行级过滤: labs.region IN ['华东']"]
+}
+```
+
+同一个问题，不带数据范围的令牌会返回全部 5 个实验室——**权限差异体现在 SQL 上**，
+而不是查完再截断，所以聚合值本身也是正确的。
+
+### 12.5 MCP：给智能体用，不是给前端用
+
+HTTP API 面向前端；MCP 面向**宿主模型**——把能力以「工具 + 说明」注册出去，模型自己决定何时调用。
+
+| 工具 | 用途 |
+|---|---|
+| `ask_business_question(question, session_id)` | 自然语言问数（支持多轮、分组、口径问答） |
+| `list_metrics()` / `list_tables()` / `get_table_schema(table)` | 先看可用指标与字段，再提问，命中率更高 |
+| `search_knowledge(query, top_k)` | 知识库检索（返回召回依据，可解释） |
+| `reset_session(session_id)` | 换话题时清空上下文 |
+
+安全性：**根本没有注册任何写操作工具**；角色由启动参数/环境变量固定；
+数据权限与 HTTP 入口完全一致（行级过滤同样注入 SQL）。
 
 
 

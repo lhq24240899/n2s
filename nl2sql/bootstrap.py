@@ -1,0 +1,186 @@
+"""装配层：从 Settings 一次性构建「LLM + DB + 语义层 + 知识库 + 编排」的运行时上下文。
+
+为什么要单独一层？
+  api.py / mcp_server.py / streamlit_app.py 都需要同一套装配逻辑；
+  各自复制一遍的后果是"三个入口行为不一致"——这是 Agent 项目最常见的腐化方式。
+
+`make_engine_factory` 返回的是**按主体构造引擎**的工厂：
+每个会话拿到自己的 pipeline + engine + guard，
+所以"多轮上下文"和"权限事实（applied）"都不会跨会话串台。
+"""
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from typing import Any, Callable, Optional
+
+from .auth import Principal
+from .config import Settings, get_settings, setup_logging
+from .db import build_db
+from .embedding import build_embedder
+from .kb import build_doc_retriever
+from .llm import build_llm
+from .pipeline import Text2SQLPipeline
+from .policy import DataPolicy, PolicyGuard
+
+_log = logging.getLogger("nl2sql.bootstrap")
+
+
+@dataclass
+class AppContext:
+    """运行时上下文：所有入口共享同一份（无状态、可复用）。"""
+
+    settings: Settings
+    registry: Any
+    store: Any
+    layer: Any
+    llm: Any = None
+    db: Any = None
+    embedder: Any = None
+    doc_retriever: Any = None
+
+
+def build_app_context(
+    settings: Optional[Settings] = None,
+    *,
+    need_llm: bool = True,
+    need_db: bool = True,
+    need_kb: bool = True,
+) -> AppContext:
+    """构建上下文。领域知识（表/指标/同义词/示例/知识库语料）来自 examples/。"""
+    settings = settings or get_settings()
+    setup_logging(settings.log.level, settings.log.fmt)
+
+    from examples.grg_schema import build_registry, build_semantic_layer, build_store
+
+    registry = build_registry(settings.db.dialect)
+    store = build_store()
+    layer = build_semantic_layer()
+
+    llm = build_llm(settings.llm) if need_llm else None
+    db = build_db(settings.db, registry) if need_db else None
+
+    embedder = None
+    doc_retriever = None
+    if need_kb and getattr(settings.kb, "enabled", True):
+        try:
+            embedder = build_embedder(settings.embedding, settings.llm)
+            doc_retriever = build_doc_retriever(settings, embedder, llm)
+        except Exception as e:  # noqa: BLE001 - 知识库不可用不应阻塞问数主流程
+            _log.warning("知识库初始化失败，降级为纯 SQL 问数: %s", e)
+
+    return AppContext(
+        settings=settings,
+        registry=registry,
+        store=store,
+        layer=layer,
+        llm=llm,
+        db=db,
+        embedder=embedder,
+        doc_retriever=doc_retriever,
+    )
+
+
+def make_engine_factory(
+    ctx: AppContext,
+    *,
+    orchestrator: str = "pipeline",
+) -> Callable[[Principal, DataPolicy], Any]:
+    """返回 `factory(principal, policy) -> engine`。
+
+    orchestrator = "pipeline"（手写编排）| "graph"（LangGraph 编排）；
+    两者共用同一批组件与同一套权限守卫，只换编排方式——便于对照与演示。
+    """
+    settings = ctx.settings
+
+    def factory(principal: Principal, policy: DataPolicy):
+        guard = PolicyGuard(policy)  # 每会话独立：applied 不跨会话累积
+        _log.info(
+            "构建引擎: sub=%s role=%s orchestrator=%s data_scope=%s",
+            principal.sub, principal.role.value, orchestrator, policy.describe(),
+        )
+        pipeline = _make_pipeline(ctx, guard)
+        engine = _make_engine(ctx, pipeline, guard)
+        if orchestrator == "graph":
+            # 图编排：GraphRunner 暴露与 pipeline 相同的 query() 契约，
+            # 引擎逻辑一行不改即完成编排替换（见 graph.GraphRunner 的说明）。
+            engine.runner = _make_graph_runner(ctx, guard)
+        return engine
+
+    return factory
+
+
+def _make_graph_runner(ctx: AppContext, guard: PolicyGuard):
+    from .graph import GraphRunner, Text2SQLGraph
+
+    settings = ctx.settings
+    graph = Text2SQLGraph(
+        registry=ctx.registry,
+        store=ctx.store,
+        llm=ctx.llm,
+        db=ctx.db,
+        retriever=_build_store_retriever(ctx),
+        top_k=settings.retrieval.top_k,
+        min_score=settings.retrieval.min_score,
+        max_retry=settings.pipeline.max_retry,
+        critique_llm=bool(getattr(settings.pipeline, "critique_llm", False)),
+        guard=guard,
+    )
+    return GraphRunner(graph)
+
+
+def _build_store_retriever(ctx: AppContext):
+    """示例库检索器：有向量索引时用「标签 ⊕ 向量 → RRF」，否则退回纯标签。"""
+    try:
+        from .retrieval import build_retriever
+
+        if ctx.embedder is None:
+            raise RuntimeError("embedder 未初始化")
+        return build_retriever(ctx.settings, ctx.store, ctx.embedder)
+    except Exception as e:  # noqa: BLE001
+        _log.warning("示例库向量检索不可用，退回标签检索: %s", e)
+        return None
+
+
+def _make_pipeline(ctx: AppContext, guard: PolicyGuard) -> Text2SQLPipeline:
+    settings = ctx.settings
+    pipeline = Text2SQLPipeline(
+        registry=ctx.registry,
+        store=ctx.store,
+        llm=ctx.llm,
+        db=ctx.db,
+        retriever=_build_store_retriever(ctx),
+        top_k=settings.retrieval.top_k,
+        min_score=settings.retrieval.min_score,
+        max_retry=settings.pipeline.max_retry,
+    )
+    pipeline.guard = guard
+    return pipeline
+
+
+def _make_engine(ctx: AppContext, pipeline: Text2SQLPipeline, guard: PolicyGuard):
+    settings = ctx.settings
+    from examples.grg_engine import GRGQueryEngine
+
+    return GRGQueryEngine(
+        pipeline,
+        ctx.layer,
+        doc_retriever=ctx.doc_retriever,
+        doc_max_chars=settings.kb.doc_max_chars,
+        guard=guard,
+    )
+
+
+def build_service(settings: Optional[Settings] = None, *, orchestrator: str = "pipeline", **kw):
+    """一步到位：上下文 -> 服务（api.py / mcp_server.py 都从这里拿）。"""
+    from .service import QueryService
+
+    ctx = build_app_context(settings, **kw)
+    return QueryService(
+        make_engine_factory(ctx, orchestrator=orchestrator),
+        settings=ctx.settings,
+        registry=ctx.registry,
+        layer=ctx.layer,
+        db=ctx.db,
+        doc_retriever=ctx.doc_retriever,
+    ), ctx

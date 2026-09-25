@@ -31,6 +31,41 @@ class DBSettings(BaseModel):
     dsn: str = ""                # 必填；缺省时 build_db 直接抛错
     dry_run: bool = True         # 是否用 EXPLAIN / LIMIT 1 做执行预检
     timeout: float = 10.0
+    # 库级只读：连接后 SET default_transaction_read_only = on。
+    # 与 SQLValidator 的 AST 白名单形成双保险——即使有 SQL 绕过静态校验，
+    # 数据库也会直接拒绝写操作。生产务必保持 true。
+    readonly: bool = True
+    # 语句超时：防止一条慢查询占满连接（资源/算力保护）。
+    statement_timeout_ms: int = 5000
+
+
+class AuthSettings(BaseModel):
+    """鉴权设置（FastAPI / MCP server 共用）。"""
+
+    enabled: bool = True
+    secret: str = ""             # HS256 密钥；生产必须注入固定随机值
+    issuer: str = "nl2sql"
+    audience: str = "nl2sql-agent"
+    ttl_seconds: int = 3600
+    # 仅本地演示：允许 /v1/auth/token 自助签发令牌（生产必须 false）
+    dev_token_endpoint: bool = False
+
+
+class ApiSettings(BaseModel):
+    """服务层设置（限流 / 并发 / 会话 / 审计）。"""
+
+    title: str = "计量检测智能问数 API"
+    version: str = "1.0.0"
+    # 每主体每分钟最大请求数（令牌桶，粗略但够用的算力保护）
+    rate_limit_per_min: int = 30
+    # 同时打到 LLM/DB 的最大请求数（超出排队，排队超时返回 429）
+    max_concurrency: int = 4
+    queue_timeout: float = 20.0
+    # 会话：每会话独立多轮上下文；超时/超量自动清理
+    session_ttl_seconds: int = 1800
+    max_sessions: int = 200
+    # 审计日志内存保留条数（同时按结构化日志输出，便于接 Loki/ES）
+    audit_buffer: int = 500
 
 
 class RetrievalSettings(BaseModel):
@@ -74,6 +109,7 @@ class KBSettings(BaseModel):
 
 class PipelineSettings(BaseModel):
     max_retry: int = 1           # 生成失败后的重试次数（每次携带错误反馈）
+    critique_llm: bool = False   # 图编排下是否开启 LLM 结果复核（默认关，省成本）
 
 
 class LogSettings(BaseModel):
@@ -90,6 +126,8 @@ class Settings(BaseSettings):
     )
     llm: LLMSettings = LLMSettings()
     db: DBSettings = DBSettings()
+    auth: AuthSettings = AuthSettings()
+    api: ApiSettings = ApiSettings()
     retrieval: RetrievalSettings = RetrievalSettings()
     embedding: EmbeddingSettings = EmbeddingSettings()
     kb: KBSettings = KBSettings()

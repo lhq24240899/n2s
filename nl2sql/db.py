@@ -39,23 +39,55 @@ class PsycopgRunner(DBRunner):
     因为本地每次运行脚本都是新连接，而 Web 端一个会话会长期复用同一条连接）。
 
     第二道保险：任何异常都会丢弃当前连接，下次调用自动重连。
+
+    只读加固（第三道保险，纵深防御）：
+    - `readonly=True` 时连接后执行 `SET default_transaction_read_only = on`，
+      此后这条连接上的任何写操作都会被**数据库本身**拒绝
+      （报 `cannot execute INSERT in a read-only transaction`）。
+      即使某条 SQL 绕过了 sqlglot 的 AST 白名单（例如通过只读视图/函数副作用），
+      数据库这一层仍然拦得住——这是权限设计里"不依赖单一防线"的做法。
+    - `statement_timeout_ms` 限制单条语句耗时，避免一条慢查询把连接和 LLM 预算占满。
     """
 
-    def __init__(self, dsn: str, dialect: str = "postgres", timeout: float = 10.0):
+    def __init__(
+        self,
+        dsn: str,
+        dialect: str = "postgres",
+        timeout: float = 10.0,
+        readonly: bool = True,
+        statement_timeout_ms: int = 5000,
+    ):
         self.dsn = dsn
         self.dialect = dialect
         self.timeout = timeout
+        self.readonly = readonly
+        self.statement_timeout_ms = statement_timeout_ms
         self._conn = None
 
     def _connect(self):
         if self._conn is None or getattr(self._conn, "closed", False):
             import psycopg  # 懒加载，未安装时报清晰错误
 
-            self._conn = psycopg.connect(
+            conn = psycopg.connect(
                 self.dsn,
                 connect_timeout=int(self.timeout),
                 autocommit=True,  # 只读场景：避免一条坏语句毒化整个会话
             )
+            try:
+                with conn.cursor() as cur:
+                    if self.readonly:
+                        cur.execute("SET default_transaction_read_only = on")
+                    if self.statement_timeout_ms:
+                        # 注意：SET 语句不接受绑定参数（PG 语法限制，会报 syntax error at "$1"），
+                        # 改用 set_config() —— 它是普通函数调用，支持参数化，避免拼接 SQL。
+                        cur.execute(
+                            "SELECT set_config('statement_timeout', %s, false)",
+                            (str(int(self.statement_timeout_ms)),),
+                        )
+            except Exception:
+                conn.close()
+                raise
+            self._conn = conn
         return self._conn
 
     def _discard(self) -> None:
@@ -100,4 +132,10 @@ def build_db(settings, registry=None) -> DBRunner:
             "未配置 DB__DSN，无法构建真实 DB 执行器。"
             "请在 .env 中填入 DB__DSN（如 postgresql://user:pwd@host/db）。"
         )
-    return PsycopgRunner(settings.dsn, dialect=settings.dialect, timeout=settings.timeout)
+    return PsycopgRunner(
+        settings.dsn,
+        dialect=settings.dialect,
+        timeout=settings.timeout,
+        readonly=getattr(settings, "readonly", True),
+        statement_timeout_ms=getattr(settings, "statement_timeout_ms", 5000),
+    )

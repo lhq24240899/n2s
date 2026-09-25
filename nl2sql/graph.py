@@ -98,6 +98,7 @@ class Text2SQLGraph:
         min_score: float = 1.0,
         max_retry: int = 1,
         critique_llm: bool = False,
+        guard=None,
     ):
         self.registry = registry
         self.store = store
@@ -112,6 +113,8 @@ class Text2SQLGraph:
         self.max_retry = max_retry
         # 是否额外调用 LLM 做"结果一致性复核"（默认关，避免每次查询都双倍成本）
         self.critique_llm = critique_llm
+        # 数据权限守卫（与 pipeline 同一套）——保证"换编排方式不换安全等级"
+        self.guard = guard
         self._log = logging.getLogger("nl2sql.graph")
         self.app = self._build()
 
@@ -171,6 +174,9 @@ class Text2SQLGraph:
         if not candidate:
             candidate = self.registry.names()
         schemas = self.registry.link(candidate)
+        if self.guard is not None:
+            # 与 pipeline 一致：无权表不出现在 prompt 里
+            schemas = self.guard.constrain_schemas(schemas)
         return self._merge(
             state,
             f"link：候选表 {len(schemas)} 张 {[t.name for t in schemas]}",
@@ -205,9 +211,14 @@ class Text2SQLGraph:
 
     def _n_validate(self, state: SQLGraphState) -> dict:
         err = self.validator.validate(state.get("sql") or "", state.get("allowed_tables") or [])
+        sql = state.get("sql")
+        if err is None and self.guard is not None:
+            # 数据权限：列级拦截 + 行级过滤注入（与 pipeline 行为一致）
+            sql, err = self.guard.post_sql(sql or "")
         return self._merge(
             state,
             "validate：通过" if err is None else f"validate：拦截（{err[:60]}）",
+            sql=sql,
             error=err,
         )
 
@@ -260,6 +271,8 @@ class Text2SQLGraph:
 
         if not hits:
             schemas = self.registry.link(self.registry.names())
+            if self.guard is not None:
+                schemas = self.guard.constrain_schemas(schemas)
             prompt = self.prompt.build(
                 state["question"], schemas, [], glossary, state.get("error"), state.get("doc_context")
             )
@@ -270,6 +283,18 @@ class Text2SQLGraph:
             sql = hits[0].example.sql
             raw = state.get("raw") or ""
             source = ResultSource.FALLBACK_TEMPLATE.value
+
+        # 回退路径同样必须过数据权限。否则"重试耗尽"会变成绕过权限的后门：
+        # 实测就出现过模板 SQL 带着被禁字段被直接执行、把越权数据返回给用户的情况。
+        if sql and self.guard is not None:
+            sql, guard_err = self.guard.post_sql(sql)
+            if guard_err:
+                self._log.warning("回退路径被数据权限拦截: %s", guard_err)
+                return self._merge(
+                    state,
+                    f"fallback：数据权限拦截（{source}）",
+                    sql=None, raw=raw, source=source, error=guard_err,
+                )
 
         cols: list[str] = []
         rows: list[tuple] = []
@@ -406,3 +431,35 @@ def build_graph(settings, registry, store, llm, db, glossary=None, retriever=Non
         min_score=settings.retrieval.min_score,
         max_retry=settings.pipeline.max_retry,
     )
+
+
+class GraphRunner:
+    """把 Text2SQLGraph 适配成 pipeline 的 `query()` 契约。
+
+    引擎（GRGQueryEngine）只依赖 runner 暴露的四个可变属性
+    （glossary / doc_context / guard / llm）与 query() 方法，
+    因此"手写 pipeline"和"LangGraph 图"可以**互换而不改引擎一行代码**——
+    这也正是上面那段"框架给了什么、没给什么"的实证：
+    编排可替换，业务组件（口径/校验/权限）本来就是自己的。
+    """
+
+    def __init__(self, graph: Text2SQLGraph):
+        self.graph = graph
+        self.llm = graph.llm
+        self.glossary = None
+        self.doc_context = None
+        self.guard = None
+
+    def query(self, question: str, pre_feedback=None):
+        # 关键：把当前生效的口径与数据权限同步进图。
+        # 否则"换了编排方式"就会悄悄绕过行级权限——换编排绝不能换安全等级。
+        self.graph.guard = self.guard
+        self.graph.glossary = self.glossary
+        res = self.graph.run(
+            question,
+            pre_feedback=pre_feedback,
+            doc_context=self.doc_context,
+            glossary=self.glossary,
+        )
+        return res, list(getattr(res, "cols", []) or []), list(getattr(res, "rows", []) or [])
+

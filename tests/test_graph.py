@@ -16,6 +16,7 @@ from nl2sql.config import Settings
 from nl2sql.db import DBRunner
 from nl2sql.graph import Text2SQLGraph
 from nl2sql.models import ResultSource
+from nl2sql.policy import DataPolicy, PolicyGuard, RowFilter
 
 from examples.grg_schema import build_registry, build_store
 from tests.doubles import GRGMockLLM, GRGSampleDB
@@ -121,3 +122,59 @@ def test_mermaid_export_available():
 def test_llm_critic_disabled_by_default():
     res = _graph().run(QUESTION)
     assert res.critique == "规则检查通过"
+
+
+# ---------------------------------------------------------------------------
+# 数据权限：两条编排必须表现一致（换编排不能换安全等级）
+# ---------------------------------------------------------------------------
+
+GROUP_Q = "各实验室设备利用率"
+
+
+def test_graph_applies_row_level_filter():
+    guard = PolicyGuard(
+        DataPolicy(row_filters=(RowFilter("labs", "region", ("华东",)),), dialect="postgres")
+    )
+    g = _graph()
+    g.guard = guard
+    res = g.run(GROUP_Q)
+    assert "l.region = '华东'" in res.sql
+    assert any("已注入行级过滤" in n for n in guard.applied)
+
+
+def test_graph_blocks_unauthorized_column():
+    guard = PolicyGuard(DataPolicy(denied_columns=frozenset({"amount"}), dialect="postgres"))
+    g = _graph()
+    g.guard = guard
+    res = g.run("华东区上个月可靠性试验的检测服务收入是多少")
+    # 触及被禁字段的 SQL 不应被放行执行（要么重生成成功，要么回退且不带越权 SQL）
+    assert res.sql is None or "amount" not in res.sql.lower()
+
+
+def test_graph_runner_swaps_orchestration_without_touching_engine():
+    """GraphRunner 让引擎在「手写 pipeline / LangGraph 图」之间切换，引擎代码零改动。"""
+    from nl2sql.graph import GraphRunner
+    from nl2sql.pipeline import Text2SQLPipeline
+
+    from examples.grg_engine import GRGQueryEngine
+    from examples.grg_schema import build_semantic_layer
+
+    settings = Settings()
+    registry = build_registry(settings.db.dialect)
+    store = build_store()
+    guard = PolicyGuard(
+        DataPolicy(row_filters=(RowFilter("labs", "region", ("华东",)),), dialect="postgres")
+    )
+    pipeline = Text2SQLPipeline(
+        registry=registry, store=store, llm=GRGMockLLM(),
+        db=GRGSampleDB(registry, dialect=settings.db.dialect),
+        top_k=settings.retrieval.top_k, min_score=settings.retrieval.min_score, max_retry=1,
+    )
+    pipeline.guard = guard
+    engine = GRGQueryEngine(
+        pipeline, build_semantic_layer(), guard=guard, runner=GraphRunner(_graph())
+    )
+    out = engine.ask(GROUP_Q)
+    assert out["type"] == "result"
+    assert "l.region = '华东'" in out["result"].sql  # 行级权限在图编排下同样生效
+    assert out["rows"][0][0] == 0.81                 # 华东设备利用率（替身固定值）

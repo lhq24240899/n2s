@@ -30,6 +30,7 @@ from __future__ import annotations
 from nl2sql.context import QueryContext
 from nl2sql.kb import answer_with_docs, build_sql_doc_block
 from nl2sql.pipeline import Text2SQLPipeline
+from nl2sql.policy import PolicyViolation
 from nl2sql.semantic import MappedQuery, SemanticLayer, SemanticMapper
 
 # 视为"确认"的答复（去掉标点后精确匹配，避免把新问题误判成确认）
@@ -49,6 +50,8 @@ class GRGQueryEngine:
         layer: SemanticLayer,
         doc_retriever=None,
         doc_max_chars: int = 1200,
+        guard=None,
+        runner=None,
     ):
         self.pipeline = pipeline
         self.layer = layer
@@ -58,6 +61,11 @@ class GRGQueryEngine:
         # 可选：企业知识库混合检索器（三路召回 + RRF）。不传则退化为纯 SQL 问数。
         self.doc_retriever = doc_retriever
         self.doc_max_chars = doc_max_chars
+        # 可选：数据权限守卫（policy.PolicyGuard）。不传则不做数据权限约束（本地 demo 场景）。
+        self.guard = guard
+        # 编排方式可替换：pipeline（手写）或 GraphRunner（LangGraph）。
+        # 两者暴露同样的四个属性 + query()，因此引擎逻辑完全不用改。
+        self.runner = runner or pipeline
 
     # ---------------- 对外 API ----------------
 
@@ -145,6 +153,19 @@ class GRGQueryEngine:
         # 多轮上下文继承（追问"那华南区呢" -> 仅替换区域，业务线/指标/时间沿用）
         merged = self.context.inherit(mapped)
 
+        # 数据权限①：指标级拒绝。放在继承之后，才能连"追问带出来的旧指标"一起管住。
+        # 明确拒绝比"生成一条被拦的 SQL"体验好得多，也避免把无权口径泄露到提示里。
+        if self.guard is not None:
+            try:
+                self.guard.check_metric(merged.metric)
+            except PolicyViolation as e:
+                return {
+                    "type": "denied",
+                    "message": e.reason,
+                    "detail": e.detail,
+                    "mapped": merged,
+                }
+
         # 企业知识库混合检索（三路召回 + RRF）。
         # 用「本轮问题」而不是继承后的文本，避免继承来的维度词把文档检索带偏。
         docs = self.doc_retriever.retrieve(mapped.normalized) if self.doc_retriever else []
@@ -166,10 +187,21 @@ class GRGQueryEngine:
         glossary = self.layer.glossary_for(
             merged.metric.id if merged.metric else None, merged.entities
         )
-        self.pipeline.glossary = glossary
-        self.pipeline.doc_context = build_sql_doc_block(docs, self.doc_max_chars) or None
+        runner = self.runner
+        runner.glossary = glossary
+        runner.doc_context = build_sql_doc_block(docs, self.doc_max_chars) or None
+        # 数据权限②：把守卫交给编排层，由它负责"隐藏无权表 + 列级拦截 + 行级过滤注入"
+        runner.guard = self.guard
 
-        res, cols, rows = self.pipeline.query(merged.normalized)
+        try:
+            res, cols, rows = runner.query(merged.normalized)
+        except (PolicyViolation, PermissionError) as e:
+            return {
+                "type": "denied",
+                "message": getattr(e, "reason", None) or str(e),
+                "detail": getattr(e, "detail", ""),
+                "mapped": merged,
+            }
 
         # 更新上下文，供下一轮继承
         self.context.update_from(merged)

@@ -109,7 +109,7 @@
 | 用例ID | 操作 | 预期结果 | 实际结果 | 结论 |
 |---|---|---|---|---|
 | G-01 | 终端执行 `python examples/grg_demo.py` | 输出华东 **0.9167** vs 华南 **0.8889**，并附口径说明 | | |
-| G-02 | 终端执行 `pytest -q` | **61 passed**（离线，不花真钱、不碰真库） | | |
+| G-02 | 终端执行 `pytest -q` | **120 passed**（离线，不花真钱、不碰真库） | | |
 
 ---
 
@@ -135,6 +135,37 @@
 | I-05 | 同上，看第二个场景（`西南区…` 必然为空） | 轨迹应为：`critique：结果为空 → 要求修正` → `generate：第 2 次生成（带错误反馈重生成）` → …… → `fallback`；`max_retry=1` 时**不应出现第 3 次生成** | | |
 | I-06 | `python examples/graph_demo.py --llm-critic` | Critic 额外调用 LLM 做一致性复核（会多一次模型调用）；默认关闭 | | |
 
+### J. 智能体 API / MCP / 只读数据权限
+
+前置：`python examples/api_server.py --port 8000`（文档 http://127.0.0.1:8000/docs）。
+本地演示需在 `.env` 里设 `AUTH__SECRET`（任意随机串）与 `AUTH__DEV_TOKEN_ENDPOINT=true`。
+
+| 用例ID | 操作 / 输入 | 预期结果 | 实际结果 | 结论 |
+|---|---|---|---|---|
+| J-01 | `curl /health`（不带令牌） | **200** 且 `status=ok`，含 `db.ok / kb.enabled / sessions / concurrency` | | |
+| J-02 | 带令牌 `POST /v1/ask`，问 `华东区上个月可靠性试验的准时完成率是多少` | **200**，`type=result`、`row_count=1`、`sql` 非空、`request_id` 与 `latency_ms` 齐备 | | |
+| J-03 | 不带 `Authorization` 调用 `/v1/ask` | **401**，响应头含 `WWW-Authenticate: Bearer` | | |
+| J-04 | 用被篡改/过期的令牌调用 | **401**（过期与伪造都要拦下） | | |
+| J-05 | 用 `role=viewer` 的令牌问数 | **403**，提示缺少 `query:ask`；但 `/v1/schema` 仍 **200**（viewer 可看目录不可问数） | | |
+| J-06 | 用 analyst 令牌读 `/v1/audit` | **403**（仅 admin 可读审计） | | |
+| J-07 | 同一会话连问：`华东区…准时完成率` → `那华南区呢？`（同一个 `session_id`） | 第一次 **0.9167**，第二次 **0.8889**；第二次 reasons 含「上下文继承」 | | |
+| J-08 | alice 建会话 `s1` 后，bob 用同一 `session_id` 提问 | **403**「会话属于其它用户」——**换 session_id 不能接管别人的上下文** | | |
+| J-09 | 用限制 `regions=["华东"]` 的令牌问 `各实验室设备利用率` | 返回**只含华东**的行；`sql` 里含 `WHERE l.region = '华东'`；`data_scope` 列出「已注入行级过滤」 | | |
+| J-10 | 同上换**不带数据范围**的令牌 | 返回全部 5 个实验室，`sql` 中无 `region =` 过滤 | | |
+| J-11 | 用只允许 `on_time_completion_rate` 的策略问收入类问题 | `type=denied`，`denied_reason` 为「无权查询指标」——**明确的业务拒绝，不是一条被拦的 SQL** | | |
+| J-12 | 连续快速调用（超过 `API__RATE_LIMIT_PER_MIN`） | 超出后返回 **429** 且带 `Retry-After` 响应头 | | |
+| J-13 | `GET /v1/schema` | 按角色过滤的表/指标目录；被列为敏感的字段带 `sensitive: true`；`data_scope` 说明当前数据范围 | | |
+| J-14 | `POST /v1/kb/search {"query":"EMC 是什么"}` | 返回命中条目 + `reasons`（关键词/trgm/向量名次 + RRF 得分 + 精排分） | | |
+| J-15 | 先问一个怪问题（如 `公司食堂满意度是多少`），再问 `集成电路测试的检测一次通过率` | 后者仍返回 **0.95**——**坏 SQL 不得毒化连接**（BUG-05 回归） | | |
+| J-16 | `GET /v1/audit`（admin） | 能看到 `sub/role/session/question/outcome/sql/rows/data_scope/latency_ms`，拒绝与限流同样有记录 | | |
+| J-17 | 用数据库工具直连执行 `INSERT/DROP/UPDATE`（走应用同一 DSN） | 被**数据库本身**拒绝：`cannot execute INSERT in a read-only transaction`；随后 `SELECT` 照常可用 | | |
+| J-18 | 执行 `SELECT pg_sleep(10)` | 超过 `DB__STATEMENT_TIMEOUT_MS`（默认 5s）被取消：`canceling statement due to statement timeout` | | |
+| J-19 | `python -m nl2sql.mcp_server` 后让宿主模型调用工具 | 注册 6 个工具；`ask_business_question` 返回 Markdown 表格 + SQL + 口径依据；**无任何写操作工具** | | |
+| J-20 | MCP 侧用限定华东的身份问 `各实验室设备利用率` | 输出里能看到 `l.region = '华东'` 与「数据权限」说明——**换入口不换安全等级** | | |
+| J-21 | `python examples/api_server.py --orchestrator graph` 后重复 J-02/J-09 | 结果一致（同样的 SQL 与行数），说明**换编排不改安全策略** | | |
+
+---
+
 ## 三、执行记录
 
 | 项 | 内容 |
@@ -157,6 +188,8 @@
 | BUG-03 | 问 `那个做环境的实验室利用率怎么样` → 澄清 → 回 `是的`，结果答成了**检测服务收入** | **澄清流程不闭环**：`GRGQueryEngine.ask()` 遇到歧义就 `return`，既没记住原问题、也没保存消歧结果。用户回「是的」被当成一个**全新问题**（里面没有"利用率"），于是解析不出指标，进而**继承上一轮的旧指标**（此前问过收入）；另外歧义同义词的 `value` 是空的，确认了也无从消歧 | ① 歧义词补上规范词与取值（`那个做环境的` → canonical `可靠性` / value `reliability`），确认后可重写原问题；② `MappedQuery` 新增 `ambiguous_synonyms`，把歧义词带回上层；③ 引擎新增**待澄清态 `pending`**：用户确认后用规范词**重写原问题再跑一遍**，指标/维度不丢、上下文不被污染；④ 仅把「明确确认」或「短且自身无指标的补充答复」当作澄清回应，带指标的新问题仍按新问题处理；⑤ `reset_context()` 一并清空 `pending` |
 | BUG-04 | 问 `各业务线的检测准时率是多少`，只返回**一个数值 0.9167**，而不是按业务线分组的多个值 | 两个原因叠加：① **语义层没有「分组」概念**——"各业务线"被当成普通问句，且多轮把上一轮的 `business_line=reliability`、`region=华东` **继承成过滤条件**，等于问成了"华东+可靠性这一条线"；② **数据只有可靠性一条线有报告**（其他业务线 0 条），即使正确分组也只能出 1 行 | ① 语义层新增**分组维度识别**：`各/按/每个 + 业务线/实验室/区域` → `entities["group_by"]`，并在 Glossary 里下发「必须 `GROUP BY` 该维度、每个取值一行、不要再对该维度加过滤」；② `QueryContext.inherit()` 对**本轮要分组的维度不再继承过滤**（reasons 里会写「分组优先: 已忽略继承的…」）；③ `setup_dev_db.py` 补种 4 条业务线的委托单与报告（计量 0.875 / EMC 0.8 / 集成电路 0.8333 / 数据科学 0.8），可靠性数据保持不变 |
 | BUG-05 | **会话中途答错一次之后，后面所有问题都查不出数据**，页面提示 `执行失败: current transaction is aborted, commands ignored until end of transaction block`；但本地每次都正常 | `PsycopgRunner` **未使用 autocommit，且失败后从不 rollback**。PostgreSQL 中只要一条语句在事务里报错，整个事务就被标记为 aborted，此后**同一条连接上的所有语句都会持续报这个错**——一次坏 SQL 就把整条连接毒化。Web 端一个会话长期复用同一条连接 → 后续全废；本地每个脚本都是新连接 → 复现不出来 | `PsycopgRunner` 连接改为 **`autocommit=True`**（只读场景，每条语句各自独立成事务，坏语句不再污染后续）；再加第二道保险：**任何异常都丢弃当前连接**，下次调用自动重连（`_connect` 同时判断 `closed`）。已实测：坏语句 `EXPLAIN` 返回 False 后，紧接着的好语句照常返回数据 |
+| BUG-06 | 给 LangGraph 编排加上数据权限后，**回退路径仍会把越权数据返回给用户**：被禁字段（如 `contracts.amount`）在重试耗尽后，由示例模板 SQL 带着执行成功 | `pipeline.py` 的 fallback 分支最初**没有调用** `guard.post_sql`，`graph.py` 的 `_n_fallback` 更是完全没有权限概念。只要"重试耗尽"这条路没被权限覆盖，它就成了绕过权限的后门——**新增的防线若只覆盖主路径，等于没覆盖** | 两条编排的**所有**出口（首次生成 / 重试生成 / 通用回退 / 模板回退）统一过 `guard.post_sql`；拦截失败时**把 SQL 置空**（宁可不返回数据，也不返回越权 SQL），并在 trace 里记录「数据权限拦截」。由 `tests/test_graph.py::test_graph_blocks_unauthorized_column` 与 `tests/test_policy.py` 的列级/行级用例守住 |
+| BUG-07 | API 返回的 `glossary` 序列化时抛 `AttributeError: 'str' object has no attribute 'name'` | `Glossary.metrics` 实际是 `{名称: Metric}` 的**字典**（不是列表），直接迭代得到的是字符串键。属于"看着像列表就写 for-in"的想当然 | `service.py` 改为遍历 `glossary.metrics.values()`；并补了 API 层的响应断言 |
 
 ## 五、故障速查
 
@@ -167,6 +200,12 @@
 | 部署时报依赖安装失败 | Python 版本过新，无预编译 wheel | Python version 选 **3.12** 后 Reboot |
 | 数值与上表不符 | 数据库被重建 / 数据被改 | 重跑 `python examples/setup_dev_db.py` 复位 |
 | Secrets 改了不生效 | 生效有延迟 | 等待约 1 分钟，或 **Reboot app** |
+| API 报 **401** | 没带/伪造/过期令牌 | 加 `Authorization: Bearer <token>`；本地可用 `POST /v1/auth/token` 自助签发，或 `python -m nl2sql.auth --role analyst` |
+| API 报 **503** 且提示未配密钥 | 没设 `AUTH__SECRET` 也没开 dev 端点 | 设 `AUTH__SECRET=<随机串>`；生产请用固定高强度密钥 |
+| API 报 **403** | 角色缺 scope，或想接管别人的 `session_id` | 用足够权限的角色签发令牌；会话 ID 要唯一（省略即可用 `<用户>:default`） |
+| API 报 **429** | 触发限流或并发已满 | 降低频率；或调大 `API__RATE_LIMIT_PER_MIN` / `API__MAX_CONCURRENCY` |
+| 查询结果比预期少 | **数据权限生效**（令牌限定了区域/业务线） | 看响应里的 `data_scope` 与 `sql` 的 WHERE；这是设计行为，不是 bug |
+| MCP 客户端连不上（stdio） | `cwd` 不是项目根 / 未装依赖 | `cwd` 指向仓库根目录，先 `pip install -r requirements.txt` |
 
 ---
 

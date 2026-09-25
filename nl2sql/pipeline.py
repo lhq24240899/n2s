@@ -65,6 +65,9 @@ class Text2SQLPipeline:
         self.retry_on_empty = retry_on_empty
         # 企业知识库摘录（混合检索结果），由上层每轮注入；用于补充业务口径与已知坑
         self.doc_context: Optional[str] = None
+        # 数据权限守卫（policy.PolicyGuard），由上层每轮注入。
+        # 未注入时不改变任何行为；注入后：生成前收窄可见表、生成后做列级检查 + 行级过滤注入。
+        self.guard = None
         self._log = logging.getLogger("nl2sql.pipeline")
 
     # ---------------- 对外 API ----------------
@@ -84,6 +87,11 @@ class Text2SQLPipeline:
             candidate = self.registry.names()
             self._log.warning("未抽到候选表，使用全量 schema 进行通用尝试")
         schemas = self.registry.link(candidate)
+        if self.guard is not None:
+            # 数据权限：无权表直接不出现在 prompt 里（LLM 看不到，自然写不出）
+            schemas = self.guard.constrain_schemas(schemas)
+            if not schemas:
+                raise PermissionError("你的数据权限不允许查询该问题涉及的表")
         allowed = [t.name for t in schemas]
         trace.candidate_tables = candidate
         trace.allowed_tables = allowed
@@ -102,6 +110,11 @@ class Text2SQLPipeline:
             at = AttemptTrace(attempt_no=attempt + 1, prompt=prompt, raw=raw, sql=sql)
 
             err = self.validator.validate(sql, allowed)
+            if err is None and self.guard is not None:
+                # 数据权限：列级检查 + 行级过滤注入。改写后的 SQL 才是最终执行的 SQL，
+                # 因此要写回 at.sql / trace，保证"看到的 SQL"就是"真正执行的 SQL"。
+                sql, err = self.guard.post_sql(sql)
+                at.sql = sql
             if err is None:
                 ok, exec_err = self.db.explain(sql)
                 if ok:
@@ -130,6 +143,11 @@ class Text2SQLPipeline:
             last_raw = raw
             sql = self.extract_sql(raw)
             err = self.validator.validate(sql, self.registry.names())
+            # 回退路径同样必须过数据权限，否则"重试耗尽"就成了绕过权限的后门
+            if err is None and self.guard is not None:
+                sql, err = self.guard.post_sql(sql)
+                if err:
+                    sql = None  # 宁可不返回数据，也不返回越权 SQL
             return self._finish(
                 ResultSource.FALLBACK_GENERIC, sql, raw, trace, err
             )
@@ -137,9 +155,14 @@ class Text2SQLPipeline:
         # 4b) 模板回退：返回最相关示例的 SQL（已被我们的口径验证过）
         self._log.info("重试耗尽，回退到最相关示例 SQL")
         sql = hits[0].example.sql
-        self.validator.validate(sql, allowed)  # 复核模板（信任但校验）
+        guard_err = self.validator.validate(sql, allowed)  # 复核模板（信任但校验）
+        if guard_err is None and self.guard is not None:
+            sql, guard_err = self.guard.post_sql(sql)
+            if guard_err:
+                self._log.warning("回退模板未通过数据权限: %s", guard_err)
+                sql = None
         return self._finish(
-            ResultSource.FALLBACK_TEMPLATE, sql, last_raw, trace, error_feedback
+            ResultSource.FALLBACK_TEMPLATE, sql, last_raw, trace, guard_err or error_feedback
         )
 
     # 空结果自愈时回灌给 LLM 的反馈
