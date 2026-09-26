@@ -184,7 +184,7 @@ EXAMPLES = [
 # 设计：三种模式共用同一套 IR/语义层与安全护栏——**换引擎不换安全等级**。
 # ---------------------------------------------------------------------------
 ENGINE_OPTIONS = {
-    "SQL·PostgreSQL": "sql",
+    "🔢 SQL·PostgreSQL": "sql",
     "🔎 DSL · Elasticsearch": "es",
     "🧭 PPL · OpenSearch": "ppl",
 }
@@ -696,7 +696,7 @@ with st.sidebar:
         index=0,
         # key 带版本后缀：改过选项文案后，老浏览器 session 里存着的旧选项值不在新列表里，
         # Streamlit 会直接抛 StreamlitAPIException；换 key 可让旧值自然失效（避免线上白屏）。
-        key="engine_label_v2",
+        key="engine_label_v3",
         label_visibility="collapsed",
         help="SQL 走 PostgreSQL；DSL 走 Elasticsearch 的 _search；PPL 走 OpenSearch 的 _plugins/_ppl。"
              "三者共用同一份 IR/语义层与安全护栏。",
