@@ -31,6 +31,7 @@ from nl2sql.context import QueryContext
 from nl2sql.kb import answer_with_docs, build_sql_doc_block
 from nl2sql.pipeline import Text2SQLPipeline
 from nl2sql.policy import PolicyViolation
+from nl2sql.safety import SafetyGuard
 from nl2sql.semantic import MappedQuery, SemanticLayer, SemanticMapper
 
 # 视为"确认"的答复（去掉标点后精确匹配，避免把新问题误判成确认）
@@ -52,6 +53,7 @@ class GRGQueryEngine:
         doc_max_chars: int = 1200,
         guard=None,
         runner=None,
+        safety=None,
     ):
         self.pipeline = pipeline
         self.layer = layer
@@ -66,18 +68,50 @@ class GRGQueryEngine:
         # 编排方式可替换：pipeline（手写）或 GraphRunner（LangGraph）。
         # 两者暴露同样的四个属性 + query()，因此引擎逻辑完全不用改。
         self.runner = runner or pipeline
+        # 可选：输入安全护栏（nl2sql.safety.SafetyGuard）。不传则不过滤输入
+        # （仅用于内部测试 / 已被外层 QueryService 拦截的场景）。生产入口务必传入，
+        # 否则密钥提取 / 提示词注入 / PII / 越界问题会绕过护栏直接进 RAG 或 LLM。
+        self.safety = safety
 
     # ---------------- 对外 API ----------------
 
     def ask(self, question: str) -> dict:
-        # 上一轮在等澄清、且本轮是对澄清的回应 -> 回到原问题重跑
-        if self.pending is not None:
-            pending, self.pending = self.pending, None
-            if self._is_clarification_reply(question):
+        # 输入安全护栏：密钥 / 提示词注入 / PII / 越界 —— 入口即拦，
+        # 不进语义映射、不进 RAG、不进 LLM。这是对抗"问 apikey 是多少"这类攻击的最后关口。
+        # （FastAPI / MCP 路径在 QueryService.ask 已先拦一次；这里再拦，保证 Streamlit 直连也不漏）
+        if self.safety is not None:
+            # 第一步：硬拦截（注入 / 密钥 / PII）——任何输入都拦，含澄清回复里夹带的攻击。
+            ref = self.safety.screen(question, hard_only=True)
+            if ref is not None:
+                return self._refuse(ref)
+            # 澄清回复：已过硬拦截，不再判越界（避免"是的"被当成无关问题拒绝、
+            # 打断多轮澄清闭环）；交给原澄清逻辑回到上一轮问题重跑。
+            if self.pending is not None and self._is_clarification_reply(question):
+                pending, self.pending = self.pending, None
                 return self._resume(pending, question)
-            # 否则视为新问题，正常往下走（不污染上下文）
+            # 全新问题：完整拦截（含越界软拦截）。
+            ref = self.safety.screen(question, hard_only=False)
+            if ref is not None:
+                return self._refuse(ref)
+        else:
+            # 未配置护栏：保持原有澄清逻辑
+            if self.pending is not None:
+                pending, self.pending = self.pending, None
+                if self._is_clarification_reply(question):
+                    return self._resume(pending, question)
+                # 否则视为新问题，正常往下走（不污染上下文）
 
         return self._answer(self.mapper.map(question))
+
+    @staticmethod
+    def _refuse(ref) -> dict:
+        """把 SafetyGuard.Refusal 转成统一的 refused 响应。"""
+        return {
+            "type": "refused",
+            "category": ref.category.value,
+            "answer": ref.safe_reply,
+            "reason": ref.reason,
+        }
 
     def reset_context(self) -> None:
         self.context.reset()

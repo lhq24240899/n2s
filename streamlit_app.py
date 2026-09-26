@@ -14,6 +14,14 @@
   4. 数据库需先建表灌数：本地跑一次 `python examples/setup_dev_db.py`
      （数据写入 Neon，云端直接复用，无需在 Cloud 上再建）
 
+部署到 百度 AI Studio highcode（星河高代码应用）：
+  - 用 Dockerfile 部署，或在「启动命令」里填：
+      streamlit run streamlit_app.py --server.address=0.0.0.0 --server.port=8080 --server.headless=true
+  - 端口：优先读取平台注入的 $PORT，否则默认 8081（见文件顶部环境变量设置）。
+  - 密钥一律走平台「环境变量 / 密钥」配置，**不要写进 .env 提交**。必填：
+      LLM__BASE_URL / LLM__API_KEY / LLM__MODEL / DB__DSN
+  - 输入安全护栏已内置（问 apikey / 注入 / PII 会被直接拒绝，见 nl2sql/safety.py）。
+
 本地运行：
     streamlit run streamlit_app.py
 """
@@ -27,6 +35,19 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+# ---------------------------------------------------------------------------
+# 0) 云端部署端口绑定（必须在 import streamlit 之前设置）
+#    百度 AI Studio highcode 等平台会把监听端口写在 $PORT 环境变量里；
+#    没给时默认 8081（避开本地常用的 8501，也避开 AI Studio 服务部署惯用的 8080）。
+#    绑定 0.0.0.0 + headless，保证平台能从外部访问到。
+# ---------------------------------------------------------------------------
+_PORT = os.environ.get("PORT", "8081")
+os.environ.setdefault("STREAMLIT_SERVER_ADDRESS", "0.0.0.0")
+os.environ["STREAMLIT_SERVER_PORT"] = _PORT
+os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
+os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
+os.environ.setdefault("STREAMLIT_SERVER_ENABLE_CORS", "false")
 
 import streamlit as st
 
@@ -101,6 +122,7 @@ def get_engine():
     from nl2sql.db import build_db
     from nl2sql.llm import build_llm
     from nl2sql.pipeline import Text2SQLPipeline
+    from nl2sql.safety import SafetyGuard
 
     settings = get_settings()
     setup_logging(settings.log.level, settings.log.fmt)
@@ -125,6 +147,9 @@ def get_engine():
         layer,
         doc_retriever=_build_doc_retriever(settings, llm),
         doc_max_chars=settings.kb.doc_max_chars,
+        # 输入安全护栏：拦截密钥提取 / 提示词注入 / PII / 越界。
+        # 不接这一句，部署出去的 Streamlit 会被"问 apikey 是多少"类攻击绕过（直奔 RAG）。
+        safety=SafetyGuard(),
     )
     return st.session_state.engine
 
@@ -246,6 +271,11 @@ def render_doc_sources(docs: list) -> None:
 
 
 def render_answer(out: dict) -> None:
+    # 安全护栏拒绝：明确告知，不进入任何生成 / 检索
+    if out.get("type") == "refused":
+        st.warning(f"🚫 {out.get('answer', '该问题不在我的回答范围内。')}")
+        return
+
     # 歧义澄清：不进入生成
     if out.get("type") == "clarification":
         st.warning(f"❓ 需要澄清：{out['message']}")

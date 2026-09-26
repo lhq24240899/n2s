@@ -106,11 +106,17 @@ _OFFTOPIC_HINTS = [
 _OFFTOPIC_HINTS_RE = re.compile("|".join(_OFFTOPIC_HINTS), re.IGNORECASE)
 
 # 豁免：即便「无数据信号」也不拒绝（让其正常走链路，由 validator/回退兜底）。
-# 目的——**不误杀**正常的多轮追问、英文问句、问候、纯数字、SQL 注入探测串。
+# 目的——**不误杀**正常的多轮追问、确认回复、英文问句、问候、纯数字、SQL 注入探测串。
 _BENIGN_GREETING_RE = re.compile(r"你好|您好|hi|hello|在吗|早上好|晚上好", re.IGNORECASE)
 _BENIGN_SQLI_RE = re.compile(r"('|--|;|\bdrop\b|\bdelete\b|\binsert\b|\bupdate\b)", re.IGNORECASE)
 _FOLLOWUP_RE = re.compile(r"呢|那|这个|上一条|继续|还有|其他|同上|接着")
 _DIGITS_ONLY_RE = re.compile(r"^[\d\s\W]+$")
+# 确认类回复（与 grg_engine.CONFIRM_WORDS 对齐）：多轮澄清时用户回「是的/好的」等，
+# 必须放行（只过硬拦截），否则澄清闭环会断。
+_CONFIRM_RE = re.compile(
+    r"^(是|是的|是的呢|对|对的|嗯|嗯嗯|没错|确定|确认|可以|好|好的|行|没问题|yes|ok|okay|sure|y|yeah)$",
+    re.IGNORECASE,
+)
 
 
 class SafetyGuard:
@@ -123,7 +129,7 @@ class SafetyGuard:
     def __init__(self, *, enable_out_of_scope: bool = True):
         self.enable_out_of_scope = enable_out_of_scope
 
-    def screen(self, question: str) -> Optional[Refusal]:
+    def screen(self, question: str, *, hard_only: bool = False) -> Optional[Refusal]:
         if not question or not question.strip():
             return Refusal(
                 RefusalCategory.OUT_OF_SCOPE,
@@ -165,9 +171,11 @@ class SafetyGuard:
         # 判定逻辑（两层，避免误杀正常问数请求与多轮追问）：
         #   a) 命中显式越界话题词（天气/诗歌/电影…）→ 直接拒绝；
         #   b) 既不含数据信号、又不属于「豁免项」→ 拒绝。
-        # 豁免项：问候、含拉丁字母（英文问句）、纯数字串、SQL 注入探测串、
+        # 豁免项：问候、确认回复、含拉丁字母（英文问句）、纯数字串、SQL 注入探测串、
         #       短句多轮追问（那/呢/继续…）——这些放行给链路，由 validator/回退兜底。
-        if self.enable_out_of_scope:
+        # hard_only=True 时跳过本层（仅做硬拦截），用于澄清回复等已有上下文的输入，
+        # 避免「是的」这类确认词被当成越界问题拒绝、打断多轮澄清闭环。
+        if self.enable_out_of_scope and not hard_only:
             if _OFFTOPIC_HINTS_RE.search(q):
                 return Refusal(
                     RefusalCategory.OUT_OF_SCOPE,
@@ -202,7 +210,9 @@ class SafetyGuard:
 
     @staticmethod
     def _is_benign_exempt(text: str) -> bool:
-        """不拒绝的良性输入：问候 / 英文 / 纯数字 / SQLi 探测 / 短句多轮追问。"""
+        """不拒绝的良性输入：问候 / 确认回复 / 英文 / 纯数字 / SQLi 探测 / 短句多轮追问。"""
+        if _CONFIRM_RE.match(text):
+            return True
         if _BENIGN_GREETING_RE.search(text):
             return True
         if re.search(r"[a-zA-Z]", text):
