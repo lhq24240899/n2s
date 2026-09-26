@@ -63,7 +63,7 @@ class EsQueryEngine:
         # PPL 双路：连 OpenSearch 时真执行；普通 ES 上 _plugins/_ppl 不存在 -> 降级为"仅编译"
         ppl_payload: dict = {"query": ppl, "status": "compiled-only"}
         try:
-            ppl_cols, ppl_rows = self.backend.execute_ppl(ppl)
+            ppl_cols, ppl_rows = self.backend.execute_ppl(ppl, ir=ir)
             ppl_payload.update(status="executed", columns=ppl_cols, rows=ppl_rows)
         except Exception as e:  # noqa: BLE001 - PPL 不可用不影响主结果
             ppl_payload["status_detail"] = str(e)[:120]

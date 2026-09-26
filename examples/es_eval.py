@@ -22,7 +22,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from nl2sql.config import get_settings
-from nl2sql.es_backend import build_es_backend
+from nl2sql.es_backend import build_es_backend, resolve_index
 from examples.es_engine import EsQueryEngine
 
 # kind:
@@ -65,75 +65,120 @@ def compare(kind: str, rows: list[tuple], expected) -> tuple[bool, str]:
     return False, f"未知 kind: {kind}"
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="ES 第二执行引擎评估")
-    parser.add_argument("--min-accuracy", type=float, default=None)
-    parser.add_argument("--id", action="append", default=[])
-    args = parser.parse_args(argv)
+def _run_mode(settings, mode: str, cases: list[dict], min_accuracy: float | None) -> int:
+    """在指定引擎上跑一轮评估。
 
-    settings = get_settings()
-    backend = build_es_backend(settings)
+    mode="es"  -> 主指标是 **ES DSL 真执行**的结果（PPL 作为对照，可能仅编译）
+    mode="ppl" -> 主指标是 **PPL 真执行**的结果（DSL 作为对照）
+
+    同一份 QueryIR 编译出两种方言，所以两条链路跑的是同一批标准答案——
+    谁的通过率低，就说明是那个方言的编译或执行出了问题。
+    """
+    label = "Elasticsearch（DSL）" if mode == "es" else "OpenSearch（PPL）"
+    backend = build_es_backend(settings, mode=mode)
     if backend is None:
-        print("ES 未启用：请设置 ES__ENABLED=true 与 ES__HOST")
+        hint = "ES__ENABLED=true 与 ES__HOST" if mode == "es" else "ES__PPL_ENABLED=true 与 ES__PPL_HOST"
+        print(f"[{label}] 未启用：请设置 {hint}")
         return 2
     ok, info = backend.ping()
     if not ok:
-        print(f"ES 连接失败: {info}")
-        print("检查：控制台『安全配置 -> 公网访问白名单』，以及 ES__HOST 的 scheme（阿里云公网入口可能是 http）")
+        print(f"[{label}] 连接失败: {info}")
+        print("  检查：控制台『安全配置 → 公网访问白名单』；ES__HOST 的 scheme（阿里云公网入口是 http）")
         return 2
-    print(f"ES 已连接，版本 {info}，索引 {settings.es.index}\n")
+    index = resolve_index(settings, mode)
+    print(f"\n[{label}] 已连接，版本 {info}，索引 {index}\n")
 
-    eng = EsQueryEngine(backend, index=settings.es.index)
-    cases = [c for c in ES_CASES if not args.id or c["id"] in args.id]
+    eng = EsQueryEngine(backend, index=index)
+    other = "ppl" if mode == "es" else "es"
 
-    records, passed, ppl_pass, ppl_total = [], 0, 0, 0
+    records, passed, other_pass, other_total = [], 0, 0, 0
     for c in cases:
         t0 = time.time()
         out = eng.ask(c["question"])
         dt = (time.time() - t0) * 1000
+
+        if mode == "es":
+            other_info = out.get("ppl") or {}
+            other_rows = other_info.get("rows") or []
+            other_ran = other_info.get("status") == "executed"
+            other_detail = other_info.get("status_detail") or other_info.get("status")
+        else:
+            other_info = {"es_dsl": out.get("es_dsl")}
+            other_rows = out.get("rows") or []
+            other_ran = out.get("type") == "result"
+            other_detail = None
+
         if out.get("type") != "result":
             ok_case, detail = False, f"非结果返回: {out.get('message') or out.get('type')}"
-            ppl_ok, ppl_detail = None, "主查询失败"
-        else:
+            other_ran = False
+        elif mode == "es":
             ok_case, detail = compare(c["kind"], out["rows"], c["expected"])
+        else:
             ppl_info = out.get("ppl") or {}
-            if ppl_info.get("status") == "executed":
-                ppl_total += 1
-                ppl_ok, ppl_detail = compare(c["kind"], ppl_info.get("rows") or [], c["expected"])
-                ppl_pass += bool(ppl_ok)
+            if ppl_info.get("status") != "executed":
+                ok_case = False
+                detail = f"PPL 未真执行: {ppl_info.get('status_detail') or ppl_info.get('status')}"
             else:
-                ppl_ok, ppl_detail = None, ppl_info.get("status_detail") or ppl_info.get("status")
+                ok_case, detail = compare(c["kind"], ppl_info.get("rows") or [], c["expected"])
+
+        other_ok = None
+        if other_ran:
+            other_total += 1
+            other_ok, _ = compare(c["kind"], other_rows, c["expected"])
+            other_pass += bool(other_ok)
+
         passed += bool(ok_case)
         records.append({
-            "id": c["id"], "question": c["question"], "ok": ok_case,
-            "detail": detail, "ppl_ok": ppl_ok, "ppl_detail": ppl_detail,
-            "ms": round(dt, 1), "es_dsl": out.get("es_dsl"), "ppl": out.get("ppl"),
-            "rows": out.get("rows"),
+            "id": c["id"], "question": c["question"], "ok": ok_case, "detail": detail,
+            "other_ok": other_ok, "other_detail": other_detail, "ms": round(dt, 1),
+            "es_dsl": out.get("es_dsl"), "ppl": out.get("ppl"), "rows": out.get("rows"),
         })
-        ppl_mark = "?" if ppl_ok is None else ("P" if ppl_ok else "X")
-        print(f"[{'PASS' if ok_case else 'FAIL'}|ppl:{ppl_mark}] {c['id']} {c['question']} -> {detail}")
+        mark = "?" if other_ok is None else ("P" if other_ok else "X")
+        other_name = "ppl" if mode == "es" else "dsl"
+        print(f"[{'PASS' if ok_case else 'FAIL'}|{other_name}:{mark}] {c['id']} {c['question']} -> {detail}")
 
     total = len(cases)
     acc = passed / total if total else 0.0
-    print(f"\nES DSL  通过 {passed}/{total} = {acc:.1%}")
-    if ppl_total:
-        print(f"PPL     通过 {ppl_pass}/{ppl_total} = {ppl_pass / ppl_total:.1%}"
-              f"（{total - ppl_total} 条仅编译未执行）")
+    other_name = "PPL" if mode == "es" else "ES DSL"
+    print(f"\n{'ES DSL' if mode == 'es' else 'PPL    '} 通过 {passed}/{total} = {acc:.1%}   ← 本档主指标")
+    if other_total:
+        print(f"{other_name:7s} 通过 {other_pass}/{other_total} = {other_pass / other_total:.1%}"
+              f"（{total - other_total} 条未真执行）")
     else:
-        print("PPL     本轮全部为编译产物（后端不是 OpenSearch 或 PPL 端点不可用）")
+        print(f"{other_name:7s} 本轮未真执行（端点不支持该方言时降级为「仅编译」）")
 
-    report = {"engine": "es", "version": info, "index": settings.es.index,
-              "passed": passed, "total": total, "accuracy": acc,
-              "ppl_passed": ppl_pass, "ppl_total": ppl_total, "records": records}
+    out_json = Path("evals/last_es_report.json" if mode == "es" else "evals/last_es_report_ppl.json")
     Path("evals").mkdir(exist_ok=True)
-    Path("evals/last_es_report.json").write_text(
-        json.dumps(report, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
-    print("报告: evals/last_es_report.json")
+    out_json.write_text(json.dumps(
+        {"engine": mode, "version": info, "index": index, "passed": passed, "total": total,
+         "accuracy": acc, "other_passed": other_pass, "other_total": other_total,
+         "records": records}, ensure_ascii=False, indent=2, default=str), encoding="utf-8")
+    print(f"报告: {out_json}")
 
-    if args.min_accuracy is not None and acc < args.min_accuracy:
-        print(f"低于阈值 {args.min_accuracy:.0%}")
+    if min_accuracy is not None and acc < min_accuracy:
+        print(f"低于阈值 {min_accuracy:.0%}")
         return 1
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="ES DSL / OpenSearch PPL 第二执行引擎评估")
+    parser.add_argument("--min-accuracy", type=float, default=None)
+    parser.add_argument("--id", action="append", default=[])
+    parser.add_argument(
+        "--target", choices=["es", "ppl", "both"], default="es",
+        help="跑哪个引擎：es=Elasticsearch(DSL)、ppl=OpenSearch(PPL)、both=两档各跑一轮（双份成绩单）",
+    )
+    args = parser.parse_args(argv)
+
+    settings = get_settings()
+    cases = [c for c in ES_CASES if not args.id or c["id"] in args.id]
+    modes = ["es", "ppl"] if args.target == "both" else [args.target]
+
+    rc = 0
+    for mode in modes:
+        rc |= _run_mode(settings, mode, cases, args.min_accuracy)
+    return rc
 
 
 if __name__ == "__main__":

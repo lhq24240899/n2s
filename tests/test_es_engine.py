@@ -11,7 +11,7 @@ import httpx
 import pytest
 
 from nl2sql.dsl import IRFilter, QueryIR
-from nl2sql.es_backend import ElasticsearchBackend
+from nl2sql.es_backend import ElasticsearchBackend, EsError
 from examples.es_engine import EsQueryEngine, HybridRouter
 
 
@@ -26,9 +26,12 @@ def _transport_handler(responses: list[dict]):
         calls.append({"path": path, "body": body})
         if path == "/_plugins/_ppl":
             # OpenSearch PPL 响应契约：schema + datarows
+            # ⚠️ 列序与真实集群一致：`stats count() as cnt by region` 返回的是
+            #    ['cnt', 'region']（聚合列在 by 字段**之前**），而不是直觉上的 [分组, 指标]。
+            #    早期这个 mock 写成了理想顺序，把真实的列序 bug 掩盖了（真机跑到 0/9 才暴露）。
             payload = {
-                "schema": [{"name": "region", "type": "string"}, {"name": "cnt", "type": "long"}],
-                "datarows": [["华东", 42], ["华南", 30]],
+                "schema": [{"name": "cnt", "type": "long"}, {"name": "region", "type": "string"}],
+                "datarows": [[42, "华东"], [30, "华南"]],
                 "status": 200,
             }
         elif "group" in body.get("aggs", {}):
@@ -120,6 +123,50 @@ def test_ask_group_end_to_end():
     # 确认请求打到了正确的 _search 路径且 size=0
     assert calls[0]["path"] == "/device_events/_search"
     assert calls[0]["body"]["size"] == 0
+
+
+def test_ppl_columns_reordered_to_dsl_contract():
+    """真机踩坑：OpenSearch 的 PPL 把聚合列放在 by 字段**之前**（schema=['cnt','region']）。
+
+    必须按 ir.group_by 重排成 ['region','cnt'] 对齐 DSL 侧契约，
+    否则上层按 [key, value] 取值会整体错位（表现为"区域名和数字互换"）。
+    """
+    handler, _ = _transport_handler([])
+    backend = ElasticsearchBackend(
+        host="https://es.example:9200", user="elastic", password="x",
+        transport=httpx.MockTransport(handler),
+    )
+    eng, _ = _engine()
+    ir = eng.build_ir("各区域的告警数量")
+    cols, rows = backend.execute_ppl(
+        "source=device_events | stats count() as cnt by region", ir=ir)
+    assert cols == ["region", "cnt"]
+    assert rows == [("华东", 42), ("华南", 30)]
+
+
+def test_ppl_cjk_literal_raises_actionable_error():
+    """Calcite 按 ISO-8859-1 编码字面量：PPL 里任何中文字面量都必然 500。
+
+    这是 OpenSearch PPL 的引擎限制（换 U&'..' / like / match / 双引号都绕不过），
+    所以要给出**可操作的提示**，而不是把原始堆栈丢给用户。
+    """
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(500, json={"error": {
+            "reason": "There was internal problem at backend",
+            "details": "Failed to encode '华东' in character set 'ISO-8859-1'",
+            "type": "CalciteException"}})
+
+    backend = ElasticsearchBackend(
+        host="https://os.example:26380", user="avnadmin", password="x",
+        transport=httpx.MockTransport(handler),
+    )
+    eng, _ = _engine()
+    ir = eng.build_ir("华东区最近7天的ERROR告警数量")
+    with pytest.raises(EsError) as ei:
+        backend.execute_ppl(
+            "source=device_events | where region = '华东' | stats count() as cnt", ir=ir)
+    msg = str(ei.value)
+    assert "非 ASCII" in msg and "DSL" in msg
 
 
 def test_headers_do_not_pin_es_major_version():

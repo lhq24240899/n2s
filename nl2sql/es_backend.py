@@ -88,24 +88,60 @@ class ElasticsearchBackend:
         except Exception:  # noqa: BLE001
             return False
 
-    def execute_ppl(self, ppl_query: str) -> tuple[list[str], list[tuple]]:
+    def execute_ppl(self, ppl_query: str, ir=None) -> tuple[list[str], list[tuple]]:
         """真执行 PPL（OpenSearch _plugins/_ppl）。失败抛 EsError，上层降级。
 
         PPL 响应契约：{"schema": [{"name": ..., "type": ...}], "datarows": [[...], ...]}
+
+        ⚠️ 列序差异（真机踩坑）：OpenSearch 的 `stats count() as cnt by region` 返回
+        `schema = ['cnt', 'region']` —— **聚合列在 by 字段之前**，与 DSL 侧
+        `parse_es_response` 的 `[分组, 指标...]` 约定相反。传 ir 进来即可按列名重排对齐契约，
+        否则上层按 [key, value] 取值会整体错位（表现为"区域名和数字互换"）。
         """
         try:
             r = self._client.post(
                 "/_plugins/_ppl", json={"query": ppl_query}, headers=self._headers())
             if r.status_code != 200:
-                raise EsError(f"PPL {r.status_code}: {r.text[:300]}")
+                detail = r.text[:300]
+                # 已知引擎限制：Calcite 用 ISO-8859-1 编码字面量，非 ASCII（中文）直接 500。
+                # 这不是查询写错了，换语法（U&'..'/like/match/双引号）都绕不过去，要如实告知。
+                if "ISO-8859-1" in detail or "CalciteException" in detail:
+                    raise EsError(
+                        "PPL 引擎无法处理非 ASCII 字面量：Calcite 按 ISO-8859-1 编码中文字符串失败"
+                        "（OpenSearch PPL 的已知限制，非查询语法错误）。"
+                        "该问题查询请改用 DSL 档执行，或把过滤字段换成 ASCII 编码字段。"
+                    )
+                raise EsError(f"PPL {r.status_code}: {detail}")
             body = r.json()
-            cols = [f.get("name", "") for f in body.get("schema", [])]
-            rows = [tuple(row) for row in body.get("datarows", [])]
-            return cols, rows
+            names = [f.get("name", "") for f in body.get("schema", [])]
+            raw_rows = [tuple(row) for row in body.get("datarows", [])]
+            return self._reorder_ppl(names, raw_rows, ir)
         except EsError:
             raise
         except Exception as e:  # noqa: BLE001
             raise EsError(f"PPL 请求失败: {e}") from e
+
+    @staticmethod
+    def _reorder_ppl(names: list[str], raw_rows: list[tuple], ir) -> tuple[list[str], list[tuple]]:
+        """把 PPL 的列序重排成与 DSL 侧一致的 `[分组, 指标...]`。"""
+        group_by = getattr(ir, "group_by", None) if ir is not None else None
+        metric_names = [m.name for m in getattr(ir, "metrics", [])] if ir is not None else []
+
+        if group_by and group_by in names:
+            order = [group_by] + [n for n in metric_names if n in names]
+            if len(order) != len(names):          # 有 PPL 多返回的列 -> 追加到尾部，不丢数据
+                order += [n for n in names if n not in order]
+            idx = [names.index(n) for n in order]
+            return order, [tuple(r[i] for i in idx) for r in raw_rows]
+
+        if group_by and len(names) == 2:          # 兜底：列名对不上但确实是"分组+指标"两列 -> 换序
+            return [names[1], names[0]], [tuple(reversed(r)) for r in raw_rows]
+
+        if not group_by and metric_names and all(n in names for n in metric_names):
+            idx = [names.index(n) for n in metric_names]
+            return metric_names, [tuple(r[i] for i in idx) for r in raw_rows]
+
+        return names, raw_rows
 
     def close(self) -> None:
         try:
