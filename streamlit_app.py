@@ -333,6 +333,17 @@ def es_backend_info(settings, mode: str) -> str:
     return f"`{safe_host}` · 索引 `{index}`"
 
 
+def sql_target_info(settings) -> str:
+    """给侧边栏显示：SQL 档连的是哪台库、哪个库名、什么方言（不显示账号密码）。"""
+    dsn = getattr(getattr(settings, "db", None), "dsn", "") or ""
+    if not dsn:
+        return "(未配置 DB__DSN)"
+    tail = dsn.split("@")[-1].split("?")[0]      # user:pw@ 之后、查询参数之前
+    hostport, _, dbname = tail.partition("/")
+    dialect = getattr(settings.db, "dialect", "postgres")
+    return f"`{hostport}` · 库 `{dbname or '(未指定)'}` · 方言 `{dialect}`"
+
+
 def render_es_answer(out: dict, mode: str, elapsed_ms: float) -> None:
     """渲染 ES / PPL 结果：结论表 + 真实下发的查询语句 + 执行状态。"""
     if out.get("type") == "refused":
@@ -472,7 +483,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-26-per-engine-history"
+APP_BUILD = "2026-09-26-target-line"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -716,19 +727,19 @@ with st.sidebar:
     )
     ENGINE_MODE = ENGINE_OPTIONS[_engine_label]
 
-    if ENGINE_MODE != "sql":
-        from nl2sql.config import get_settings as _gs
+    from nl2sql.config import get_settings as _gs
 
-        _s = _gs()
-        if get_es_engine(ENGINE_MODE) is None:
-            st.error(
-                f"该引擎尚未配置：请在 Secrets / `.env` 里补\n"
-                f"`ES__ENABLED=true` + `ES__HOST`（DSL），"
-                f"以及 `ES__PPL_ENABLED=true` + `ES__PPL_HOST`（PPL）。"
-            )
-        else:
-            st.caption(f"目标：{es_backend_info(_s, ENGINE_MODE)}")
-        st.caption("🔁 支持多轮追问：如先问「华东区最近7天的ERROR告警数量」，再问「那华南区呢？」（只换区域，级别/时间沿用）；安全护栏同样生效。📂 对话历史按引擎隔离，切档只看到该引擎自己的记录。")
+    _s = _gs()
+    if ENGINE_MODE == "sql":
+        st.caption(f"目标：{sql_target_info(_s)}")
+    elif get_es_engine(ENGINE_MODE) is None:
+        st.error(
+            f"该引擎尚未配置：请在 Secrets / `.env` 里补\n"
+            f"`ES__ENABLED=true` + `ES__HOST`（DSL），"
+            f"以及 `ES__PPL_ENABLED=true` + `ES__PPL_HOST`（PPL）。"
+        )
+    else:
+        st.caption(f"目标：{es_backend_info(_s, ENGINE_MODE)}")
 
     st.divider()
     st.subheader("💡 示例问题")

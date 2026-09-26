@@ -146,3 +146,29 @@ def test_switching_engine_shows_only_its_own_history(monkeypatch):
         seen.append(label_turns)
 
     assert seen == ["ppl", "es"]
+
+
+def test_sql_target_info_shows_host_and_db_without_credentials(monkeypatch):
+    """SQL 档的「目标」行必须显示主机/库名，但绝不显示账号密码。"""
+    monkeypatch.setenv("DB__DSN", "postgresql://secretuser:secretpw@db.example:5432/appdb?sslmode=require")
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[0])
+
+    from nl2sql.config import get_settings
+
+    info = g["sql_target_info"](get_settings())
+    assert "db.example:5432" in info
+    assert "appdb" in info
+    assert "secretuser" not in info
+    assert "secretpw" not in info
+
+
+def test_sql_target_info_handles_missing_dsn(monkeypatch):
+    """未配 DSN 时给可读提示（直接构造假 settings，避免受 .env 兜底影响）。"""
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[0])
+    fake = types.SimpleNamespace(db=types.SimpleNamespace(dsn="", dialect="postgres"))
+
+    assert "未配置" in g["sql_target_info"](fake)
+
+    fake2 = types.SimpleNamespace(db=types.SimpleNamespace(dsn="postgresql://u:p@h/db", dialect="mysql"))
+    info = g["sql_target_info"](fake2)
+    assert "`h`" in info and "`db`" in info and "mysql" in info
