@@ -194,6 +194,20 @@ ENGINE_BADGE = {
     "ppl": "PPL（IR → _plugins/_ppl，真执行）",
 }
 
+# 对话历史按引擎隔离：三档各有独立的 turns 列表与多轮上下文，
+# 切档只看到该引擎自己的对话（否则 SQL 的追问语境会被 ES 档继承走，反之亦然）。
+TURNS_BY_ENGINE_KEY = "turns_by_engine"
+ALL_ENGINE_MODES = ("sql", "es", "ppl")
+
+
+def _engine_turns(mode: str) -> list:
+    store = st.session_state.get(TURNS_BY_ENGINE_KEY)
+    if not isinstance(store, dict):
+        store = {m: [] for m in ALL_ENGINE_MODES}
+        st.session_state[TURNS_BY_ENGINE_KEY] = store
+    return store.setdefault(mode, [])
+
+
 # ES / OpenSearch 域示例问题（与 examples/es_eval.py 的评估集同源，真跑过有结果）
 ES_EXAMPLES = [
     "各区域最近7天的ERROR告警数量",
@@ -458,7 +472,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-26-es-multiturn"
+APP_BUILD = "2026-09-26-per-engine-history"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -714,7 +728,7 @@ with st.sidebar:
             )
         else:
             st.caption(f"目标：{es_backend_info(_s, ENGINE_MODE)}")
-        st.caption("🔁 支持多轮追问：如先问「华东区最近7天的ERROR告警数量」，再问「那华南区呢？」（只换区域，级别/时间沿用）；安全护栏同样生效。")
+        st.caption("🔁 支持多轮追问：如先问「华东区最近7天的ERROR告警数量」，再问「那华南区呢？」（只换区域，级别/时间沿用）；安全护栏同样生效。📂 对话历史按引擎隔离，切档只看到该引擎自己的记录。")
 
     st.divider()
     st.subheader("💡 示例问题")
@@ -729,16 +743,16 @@ with st.sidebar:
                 st.session_state.pending = q
 
     st.divider()
-    if st.button("🧹 清空对话 / 重置多轮上下文"):
-        st.session_state.turns = []
-        if "engine" in st.session_state:
-            st.session_state.engine.reset_context()
-        # ES / PPL 引擎各自持有会话上下文，也要一起清（否则切档后追问会继承旧维度）
-        for _k in list(st.session_state.keys()):
-            if str(_k).startswith("es_engine_"):
-                _e = st.session_state.get(_k)
-                if _e is not None:
-                    _e.reset_context()
+    if st.button("🧹 清空当前引擎的对话 / 重置多轮上下文"):
+        # 只清当前引擎：历史按引擎隔离，各自的多轮上下文也各自重置
+        _engine_turns(ENGINE_MODE).clear()
+        if ENGINE_MODE == "sql":
+            if "engine" in st.session_state:
+                st.session_state.engine.reset_context()
+        else:
+            _e = st.session_state.get(f"es_engine_{ENGINE_MODE}")
+            if _e is not None:
+                _e.reset_context()
         st.rerun()
 
     st.divider()
@@ -754,16 +768,13 @@ with st.sidebar:
 
     st.caption("数据源：Neon PostgreSQL（需先用 setup_dev_db.py 建表灌数）")
 
-if "turns" not in st.session_state:
-    st.session_state.turns = []
-
-# 渲染历史（带引擎标记，切换引擎后历史仍按各自方式渲染）
-for t in st.session_state.turns:
+# 渲染历史：只渲染当前引擎自己的对话（历史按引擎隔离）
+for t in _engine_turns(ENGINE_MODE):
     with st.chat_message(t["role"], avatar=("🧑" if t["role"] == "user" else "📊")):
         if t["role"] == "user":
             st.write(t["content"])
         else:
-            render_by_engine(t["payload"], t.get("engine", "sql"), t.get("elapsed_ms", 0.0))
+            render_by_engine(t["payload"], t.get("engine", ENGINE_MODE), t.get("elapsed_ms", 0.0))
 
 # 取输入（支持侧边栏示例按钮注入）
 _PLACEHOLDER = {
@@ -776,7 +787,8 @@ if st.session_state.get("pending"):
     question = st.session_state.pop("pending")
 
 if question:
-    st.session_state.turns.append({"role": "user", "content": question})
+    _turns = _engine_turns(ENGINE_MODE)
+    _turns.append({"role": "user", "content": question})
     with st.chat_message("user", avatar="🧑"):
         st.write(question)
 
@@ -797,6 +809,6 @@ if question:
                 st.error(f"初始化或查询失败：{e}")
         if out is not None:
             render_by_engine(out, ENGINE_MODE, elapsed_ms)
-            st.session_state.turns.append(
+            _turns.append(
                 {"role": "assistant", "payload": out, "engine": ENGINE_MODE, "elapsed_ms": elapsed_ms}
             )

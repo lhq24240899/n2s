@@ -28,13 +28,24 @@ ROOT = Path(__file__).resolve().parents[1]
 ENTRY = ROOT / "streamlit_app.py"
 
 
-def _fake_streamlit(engine_label: str, calls: dict | None = None) -> types.ModuleType:
+class _SessionState(dict):
+    """最小可用的 session_state 替身：支持下标访问 + 属性访问（像真 Streamlit 一样）。"""
+
+    def __getattr__(self, name):
+        try:
+            return self[name]
+        except KeyError as e:  # 属性不存在时抛 AttributeError，而非 KeyError
+            raise AttributeError(name) from e
+
+    def __setattr__(self, name, value):
+        self[name] = value
+
+
+def _fake_streamlit(engine_label: str, calls: dict | None = None,
+                    session=None) -> types.ModuleType:
     st = types.ModuleType("streamlit")
     st.secrets = {"LLM__API_KEY": "sk-test", "DB__DSN": "postgresql://u:p@h/db"}
-    ss = MagicMock()
-    ss.get = lambda *a, **k: None
-    ss.pop = lambda *a, **k: False
-    st.session_state = ss
+    st.session_state = session if session is not None else _SessionState()
     st.radio = lambda *a, **k: engine_label
     st.chat_input = lambda *a, **k: None
     st.button = lambda *a, **k: False
@@ -50,13 +61,15 @@ def _fake_streamlit(engine_label: str, calls: dict | None = None) -> types.Modul
     return st
 
 
-def _run_entry(monkeypatch, engine_label: str) -> dict:
+def _run_entry(monkeypatch, engine_label: str, session=None) -> tuple[dict, dict, dict]:
+    """执行入口，返回 (widget 调用记录, session_state, 入口模块的全局命名空间)。"""
     calls: dict = {}
-    monkeypatch.setitem(sys.modules, "streamlit", _fake_streamlit(engine_label, calls))
+    session = session if session is not None else _SessionState()
+    monkeypatch.setitem(sys.modules, "streamlit", _fake_streamlit(engine_label, calls, session))
     src = ENTRY.read_text(encoding="utf-8")
-    exec(compile(src, str(ENTRY), "exec"),
-         {"__file__": str(ENTRY), "__name__": "__main__"})
-    return calls
+    g: dict = {"__file__": str(ENTRY), "__name__": "__main__"}
+    exec(compile(src, str(ENTRY), "exec"), g)
+    return calls, session, g
 
 
 def _engine_labels() -> list[str]:
@@ -83,7 +96,7 @@ def test_dsl_mode_without_config_reports_error_instead_of_crashing(monkeypatch):
     monkeypatch.setenv("ES__PPL_ENABLED", "false")
     monkeypatch.setenv("ES__PPL_HOST", "")
 
-    calls = _run_entry(monkeypatch, "🔎 DSL · Elasticsearch")
+    calls, _, _ = _run_entry(monkeypatch, "🔎 DSL · Elasticsearch")
     assert any("尚未配置" in e for e in calls.get("errors", [])), calls.get("errors")
 
 
@@ -93,3 +106,43 @@ def test_entry_exposes_three_engine_options():
     assert any("SQL" in x for x in labels)
     assert any("DSL" in x for x in labels)
     assert any("PPL" in x for x in labels)
+
+
+# ---------------- 对话历史按引擎隔离 ----------------
+
+def test_conversation_history_is_isolated_per_engine(monkeypatch):
+    """三档各有独立的 turns 列表：往 sql 里写不该出现在 es/ppl。"""
+    _, session, g = _run_entry(monkeypatch, "🔢 SQL · PostgreSQL")
+    assert g["ALL_ENGINE_MODES"] == ("sql", "es", "ppl")
+
+    sql_turns = g["_engine_turns"]("sql")
+    sql_turns.append({"role": "user", "content": "华东区准时率"})
+
+    assert [t["content"] for t in g["_engine_turns"]("sql")] == ["华东区准时率"]
+    assert g["_engine_turns"]("es") == []
+    assert g["_engine_turns"]("ppl") == []
+    store = session[g["TURNS_BY_ENGINE_KEY"]]
+    assert set(store) == {"sql", "es", "ppl"}
+
+
+def test_engine_turns_reinitializes_on_bad_state(monkeypatch):
+    """session 里存了非 dict（老版本遗留）时，应重建而不是崩掉。"""
+    session = _SessionState()
+    session["turns_by_engine"] = ["legacy"]
+    _, _, g = _run_entry(monkeypatch, "🔢 SQL · PostgreSQL", session=session)
+    assert g["_engine_turns"]("es") == []
+
+
+def test_switching_engine_shows_only_its_own_history(monkeypatch):
+    """切换档位后，渲染循环只遍历该档自己的历史。"""
+    seen: list[str] = []
+    session = _SessionState()
+
+    for label, label_turns in (("🧭 PPL · OpenSearch", "ppl"), ("🔎 DSL · Elasticsearch", "es")):
+        _, _, g = _run_entry(monkeypatch, label, session=session)
+        # 用同一个 session 连续跑两个档位：各自看到的列表必须互不干扰
+        g["_engine_turns"]("sql").append({"role": "user", "content": "只属于 SQL"})
+        assert g["_engine_turns"]("sql") != g["_engine_turns"](label_turns)
+        seen.append(label_turns)
+
+    assert seen == ["ppl", "es"]
