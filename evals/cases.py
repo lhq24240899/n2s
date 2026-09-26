@@ -185,8 +185,8 @@ CASES: list[dict] = [
                   "JOIN business_lines b ON r.business_line_id = b.id "
                   "WHERE l.region = '华东' GROUP BY b.name")),
 
-    # ============ G. 澄清 ============
-    _c("澄清", "G01", "那个做环境的实验室利用率怎么样", None, expect={"kind": "clarification"}),
+    # ============ K. 澄清（ID 用 K 前缀：G 已被「经营」占用，避免重复 ID） ============
+    _c("澄清", "K01", "那个做环境的实验室利用率怎么样", None, expect={"kind": "clarification"}),
 
     # ============ H. 文档问答（混合 RAG，带引用） ============
     _c("文档RAG", "H01", "EMC 是什么意思", None, expect={"kind": "rag"}),
