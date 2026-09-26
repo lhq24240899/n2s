@@ -91,17 +91,33 @@ _DATA_SIGNALS = (
 )
 _DATA_SIGNAL_RE = re.compile("|".join(re.escape(s) for s in _DATA_SIGNALS))
 
-# 简单算式（如 "1+1"）：无数据信号时视为无关
-_ARITHMETIC_RE = re.compile(r"\d+\s*[+\-*/]\s*\d+")
+# 纯算式问句（"1+1等于几" / "2*3 是多少"）：不是数据问题。
+# 注意必须锚定成"短表达式 + 求值语气"，否则会误伤业务问句里的斜杠与日期，
+# 例如「9/2-9/16 的报告数」「2026/09 是多少」——所以先排除日期写法，再要求整句匹配。
+_ARITHMETIC_RE = re.compile(
+    r"^\s*[\d\s()×÷]+[+\-*/×÷][\d\s()×÷]+"
+    r"\s*(=|等于几|等于多少|等于|是多少|多少|是几|几)\s*[?？。!！]?\s*$"
+)
+# 像日期的写法（2026/09、9/2-9/16、9月2日）不按算式处理
+_DATE_LIKE_RE = re.compile(r"\d{4}\s*[/\-年]\s*\d{1,2}|\d{1,2}\s*月\s*\d{1,2}|\d{1,2}\s*/\s*\d{1,2}\s*[日号至\-~]")
 
 # 越界话题词（中英文）：命中即判为无关，即便误带一个数据词也优先拒绝。
 # 这是 OUT_OF_SCOPE 的「强信号」——兜住用户最在意的「问无关的事」。
+# ⚠️ 这里只放"几乎不可能是业务问题"的词。早期把「代码」「程序」也放进来，
+# 结果把「实验室的代码是什么」「设备代码和实验室编号的关系」这类**正常业务问句**直接拒了
+# （而英文 code 的问法却放行 —— 中日/英文口径还不一致）。它们已改为下面的编程语境正则，
+# 并且即便没被这里拦到，也仍会被"无数据信号即越界"那一层兜住。
 _OFFTOPIC_HINTS = [
-    "天气", "气温", "下雨", "下雪", "诗歌", "诗", "散文", "小说", "代码", "编程",
-    "程序", "翻译", "笑话", "讲个", "你是谁", "你叫", "聊天", "闲聊",
+    "天气", "气温", "下雨", "下雪", "诗歌", "诗", "散文", "小说", "编程",
+    "翻译", "笑话", "讲个", "你是谁", "你叫", "聊天", "闲聊",
     "推荐(电影|歌|书)", "怎么学习", "学习方法", "数学题", "物理", "化学题",
     "写一篇", "写一首", "总结新闻", "新闻", "股票", "健身", "菜谱", "做饭", "烹饪",
     r"\b(weather|poem|joke|movie|song|translate|math|recipe|novel)\b",
+    # 编程类请求：要求出现"写/生成/调试…+代码/程序/脚本/函数"这类语境，
+    # 而不是见到「代码」两个字就拒（业务里的"设备代码""业务线 code"是正常问法）
+    r"(写|生成|编写|调试|运行|优化|重构|解释|给)(一[段个])?.{0,6}(代码|程序|脚本|函数)",
+    r"(代码|程序|脚本).{0,4}(怎么写|如何写|报错|调试|运行|优化)",
+    r"\b(python|java|javascript|typescript|golang|golang|html|css|c\+\+)\b.{0,6}(代码|程序|脚本|函数|怎么)",
 ]
 _OFFTOPIC_HINTS_RE = re.compile("|".join(_OFFTOPIC_HINTS), re.IGNORECASE)
 
@@ -183,6 +199,14 @@ class SafetyGuard:
                     "我是计量检测业务数据问答助手，只能回答与经营、实验室、设备、"
                     "检测报告等数据相关的问题。例如：「华东区上个月的检测服务收入是多少」。",
                 )
+            # 纯算式：即使带「多少」也不当作数据问题（否则"2*3是多少"会被放行）
+            if self._is_arithmetic_question(q):
+                return Refusal(
+                    RefusalCategory.OUT_OF_SCOPE,
+                    "纯算式问句，与业务数据无关",
+                    "我是计量检测业务数据问答助手，不做算术题。"
+                    "如需查询业务数据，请描述你的问题（例如「华东区上个月的检测服务收入是多少」）。",
+                )
             if not self._has_data_signal(q) and not self._is_benign_exempt(q):
                 return Refusal(
                     RefusalCategory.OUT_OF_SCOPE,
@@ -200,6 +224,17 @@ class SafetyGuard:
             if re.search(p, text, re.IGNORECASE):
                 return p
         return None
+
+    @staticmethod
+    def _is_arithmetic_question(text: str) -> bool:
+        """是不是"纯算式问句"。这类问题不该进业务链路（也不该被误当成数据问题）。
+
+        为什么需要单独判定：「2*3 是多少」里的「多少」命中数据域白名单，
+        会绕过"无数据信号即越界"那一层被放行（而「1+1等于几」却会被拦），同类输入判定不一致。
+        """
+        if _DATE_LIKE_RE.search(text):
+            return False
+        return bool(_ARITHMETIC_RE.match(text))
 
     @staticmethod
     def _has_data_signal(text: str) -> bool:

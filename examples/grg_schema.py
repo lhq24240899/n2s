@@ -186,12 +186,23 @@ def build_metrics() -> list[Metric]:
             name="检测服务收入",
             level=MetricLevel.GROUP,
             domain="通用",
-            definition="SUM(contracts.amount) WHERE reports.已出具 AND contracts.settled_status='已开票'",
+            # ⚠️ 口径自查修正（原写法会把合同金额按报告份数重复累加，实测放大 2~10 倍）：
+            #    一份合同经 trust_orders 关联到多份报告，直接 SUM(c.amount) 等于
+            #    "合同金额 × 该合同下的报告数"。真实业务上收入里一份合同只能算一次，
+            #    所以**先去重再求和**。评估集原先照抄了错法，所以跑分一直"自洽"、
+            #    发现不了（只有把真库数字与业务直觉对照才会露馅）。
+            definition=(
+                "SUM(contracts.amount) **按合同去重后**求和；单位：元。"
+                "口径：合同已开票（settled_status='已开票'），且该合同至少有一份报告已出具。"
+                "⚠️ 一份合同会关联多份报告/委托单，必须先按合同去重再 SUM，"
+                "否则合同金额会按报告份数被重复累加"
+            ),
             sql_hint=(
-                "SELECT SUM(c.amount) AS revenue FROM contracts c "
+                "SELECT SUM(x.amount) AS revenue FROM ("
+                "SELECT DISTINCT c.id, c.amount FROM contracts c "
                 "JOIN trust_orders o ON o.contract_id = c.id "
                 "JOIN reports r ON r.order_id = o.id "
-                "WHERE c.settled_status = '已开票' AND r.status = '已出具'"
+                "WHERE c.settled_status = '已开票' AND r.status = '已出具') x"
             ),
             source_tables=["contracts", "trust_orders", "reports"],
             dimensions=["区域", "实验室", "业务线", "时间"],
@@ -209,7 +220,9 @@ def build_metrics() -> list[Metric]:
             definition=(
                 "SUM(contracts.amount)，**合同口径**（可按 settled_status 过滤）。"
                 "与『检测服务收入』不同：后者只统计已开票且报告已出具的合同，两者数值不相等，"
-                "问『合同总金额』走本口径，不要用收入口径顶替"
+                "问『合同总金额』走本口径，不要用收入口径顶替。"
+                "⚠️ 只从 contracts 表汇总；**不要再 JOIN trust_orders / reports** —— "
+                "合同与委托单/报告是一对多，关联后同一份合同的金额会被按报告份数重复累加"
             ),
             # sql_hint 刻意**不带** settled_status 过滤：带了会被 LLM 照抄到
             # "每个客户的合同总金额"（不该过滤）上——评估集实测抓到过（C05）。
@@ -528,9 +541,11 @@ def build_examples() -> list[SQLExample]:
         SQLExample(
             id="ex_revenue_relia_east",
             question="华东区上个月可靠性试验的检测服务收入是多少",
+            # 注意 DISTINCT 去重：合同 → 委托单 → 报告 是一对多，
+            # 不去重会把合同金额按报告份数重复累加（口径自查发现的问题）
             sql=(
-                "SELECT SUM(c.amount) AS revenue "
-                "FROM contracts c "
+                "SELECT SUM(x.amount) AS revenue FROM ("
+                "SELECT DISTINCT c.id, c.amount FROM contracts c "
                 "JOIN trust_orders o ON o.contract_id = c.id "
                 "JOIN reports r ON r.order_id = o.id "
                 "JOIN labs l ON r.lab_id = l.id "
@@ -538,6 +553,7 @@ def build_examples() -> list[SQLExample]:
                 "WHERE c.settled_status = '已开票' AND r.status = '已出具' "
                 "AND l.region = '华东' AND b.code = 'reliability' "
                 "AND r.issued_at >= CURRENT_DATE - INTERVAL '1 month'"
+                ") x"
             ),
             domain=["可靠性", "reliability"],
             intent=["聚合"],

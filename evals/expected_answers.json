@@ -1,23 +1,23 @@
 {
   "A01": {
     "mode": "value",
-    "value": 0.8667
+    "value": 0.875
   },
   "A02": {
     "mode": "value",
-    "value": 0.9286
+    "value": 0.8571
   },
   "A03": {
     "mode": "value",
-    "value": 0.8182
+    "value": 0.8333
   },
   "A04": {
     "mode": "value",
-    "value": 0.875
+    "value": 0.8571
   },
   "A05": {
     "mode": "value",
-    "value": 0.8442
+    "value": 0.8
   },
   "A06": {
     "mode": "value",
@@ -33,23 +33,23 @@
   },
   "A09": {
     "mode": "value",
-    "value": 4900000.0
+    "value": 500000.0
   },
   "A10": {
     "mode": "value",
-    "value": 4720000.0
+    "value": 300000.0
   },
   "A11": {
     "mode": "value",
-    "value": 25900000.0
+    "value": 2260000.0
   },
   "A12": {
     "mode": "value",
-    "value": 13.725
+    "value": 65.0
   },
   "A13": {
     "mode": "value",
-    "value": 13.0
+    "value": 65.0
   },
   "B01": {
     "mode": "rows",
@@ -199,11 +199,11 @@
     "rows": [
       [
         "某汽车客户",
-        14440000.0
+        2540000.0
       ],
       [
         "某通信客户",
-        11460000.0
+        2910000.0
       ]
     ]
   },
@@ -257,11 +257,11 @@
   },
   "E01": {
     "mode": "value",
-    "value": 77.0
+    "value": 40.0
   },
   "E02": {
     "mode": "value",
-    "value": 24.0
+    "value": 13.0
   },
   "E03": {
     "mode": "value",
@@ -269,11 +269,11 @@
   },
   "E04": {
     "mode": "value",
-    "value": 2050000.0
+    "value": 4590000.0
   },
   "E05": {
     "mode": "value",
-    "value": 12.0
+    "value": 8.0
   },
   "E06": {
     "mode": "value",
@@ -281,23 +281,23 @@
   },
   "F01": {
     "mode": "value",
-    "value": 0.8667
+    "value": 0.875
   },
   "F02": {
     "mode": "value",
-    "value": 0.9286
+    "value": 0.8571
   },
   "F03": {
     "mode": "value",
-    "value": 0.8182
+    "value": 0.8333
   },
   "F04": {
     "mode": "value",
-    "value": 4900000.0
+    "value": 500000.0
   },
   "F05": {
     "mode": "value",
-    "value": 4720000.0
+    "value": 300000.0
   },
   "F06": {
     "mode": "value",
@@ -309,7 +309,7 @@
   },
   "F08": {
     "mode": "value",
-    "value": 0.8667
+    "value": 0.875
   },
   "F09": {
     "mode": "rows",
@@ -317,11 +317,11 @@
     "rows": [
       [
         "可靠性与环境试验",
-        0.8667
+        0.875
       ],
       [
         "集成电路测试与分析",
-        0.8889
+        0.8
       ]
     ]
   },

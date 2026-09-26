@@ -140,6 +140,15 @@ class Text2SQLPipeline:
                 # 因此要写回 at.sql / trace，保证"看到的 SQL"就是"真正执行的 SQL"。
                 sql, err = self.guard.post_sql(sql)
                 at.sql = sql
+                if err:
+                    # ⚠️ 列级权限拒绝时必须**清空对外 SQL**（只留在 attempt trace 里供审计）。
+                    # 此前只有回退路径做了 `sql = None`，主路径会把引用了敏感字段的 SQL
+                    # 一路带进结果 —— 网页的「生成的 SQL」和 API 响应都会回显它。
+                    # 那意味着"被拒的 SQL 不回显"这条不变量**只是靠回退路径偶然成立**：
+                    # 离线测试 test_graph_blocks_unauthorized_column 一直绿，直到语义层的
+                    # 示例 SQL 改写后才暴露（见本轮口径审计）。
+                    at.validation_error = err
+                    sql = None
             if err is None:
                 ok, exec_err = self.db.explain(sql)
                 if ok:

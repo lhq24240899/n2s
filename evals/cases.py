@@ -19,14 +19,22 @@ from __future__ import annotations
 # 标准 SQL 构造器（与语义层 Glossary 的口径一一对应）
 # ---------------------------------------------------------------------------
 
-def t_ontime(region: str | None = None, bl: str | None = None, days: int = 30) -> str:
+def t_ontime(region: str | None = None, bl: str | None = None, days: int | None = None) -> str:
+    """准时率标准口径。days 默认为 None = **不加时间窗口**。
+
+    ⚠️ 这里曾是 `days: int = 30`（无条件套"近 30 天"），而 A07「EMC 检测的准时率是多少」
+    这类问句**并没提时间** —— 标准答案却按上个月算。当初所有报告的出具时间都压在 30 天内，
+    两种口径数值相同，问题被掩盖；把时间跨度拉到 10~50 天后立刻暴露（4 条用例同时失败）。
+    现在：问句里出现"上个月/最近 N 天"才显式传 days。
+    """
     rc = f"AND l.region = '{region}'" if region else ""
     bc = f"AND b.code = '{bl}'" if bl else ""
+    w = f"AND r.issued_at >= CURRENT_DATE - INTERVAL '{days} days'" if days else ""
     return (
         "SELECT COUNT(*) FILTER (WHERE r.on_time = 1)::float / NULLIF(COUNT(*), 0) "
         "FROM reports r JOIN labs l ON r.lab_id = l.id "
         "JOIN business_lines b ON r.business_line_id = b.id "
-        f"WHERE 1=1 {rc} {bc} AND r.issued_at >= CURRENT_DATE - INTERVAL '{days} days'"
+        f"WHERE 1=1 {rc} {bc} {w}"
     )
 
 
@@ -34,13 +42,17 @@ def t_revenue(region: str | None = None, bl: str | None = None, days: int | None
     rc = f"AND l.region = '{region}'" if region else ""
     bc = f"AND b.code = '{bl}'" if bl else ""
     w = f"AND r.issued_at >= CURRENT_DATE - INTERVAL '{days} days'" if days else ""
+    # ⚠️ 必须按合同去重：合同 → 委托单 → 报告 是一对多，
+    #    直接 SUM(c.amount) 会把合同金额按报告份数重复累加（口径自查发现，原先标准答案放大约 2~10 倍）
     return (
-        "SELECT SUM(c.amount) FROM contracts c "
+        "SELECT SUM(x.amount) FROM ("
+        "SELECT DISTINCT c.id, c.amount FROM contracts c "
         "JOIN trust_orders o ON o.contract_id = c.id "
         "JOIN reports r ON r.order_id = o.id "
         "JOIN labs l ON r.lab_id = l.id "
         "JOIN business_lines b ON r.business_line_id = b.id "
         f"WHERE c.settled_status = '已开票' AND r.status = '已出具' {rc} {bc} {w}"
+        ") x"
     )
 
 
@@ -83,11 +95,11 @@ def _c(cat: str, qid: str, question: str, truth_sql: str | None = None, **kw) ->
 
 CASES: list[dict] = [
     # ============ A. 单指标 + 维度过滤（value） ============
-    _c("指标-准时率", "A01", "华东区上个月可靠性试验的准时完成率是多少", t_ontime("华东", "reliability")),
-    _c("指标-准时率", "A02", "华南区上个月可靠性试验的准时完成率是多少", t_ontime("华南", "reliability")),
-    _c("指标-准时率", "A03", "华北区上个月可靠性试验的准时完成率是多少", t_ontime("华北", "reliability")),
-    _c("指标-准时率", "A04", "上个月可靠性试验整体的准时完成率是多少", t_ontime(bl="reliability")),
-    _c("指标-准时率", "A05", "上个月全部报告的准时率是多少", t_ontime()),
+    _c("指标-准时率", "A01", "华东区上个月可靠性试验的准时完成率是多少", t_ontime("华东", "reliability", days=30)),
+    _c("指标-准时率", "A02", "华南区上个月可靠性试验的准时完成率是多少", t_ontime("华南", "reliability", days=30)),
+    _c("指标-准时率", "A03", "华北区上个月可靠性试验的准时完成率是多少", t_ontime("华北", "reliability", days=30)),
+    _c("指标-准时率", "A04", "上个月可靠性试验整体的准时完成率是多少", t_ontime(bl="reliability", days=30)),
+    _c("指标-准时率", "A05", "上个月全部报告的准时率是多少", t_ontime(days=30)),
     _c("指标-一次通过率", "A06", "集成电路测试的检测一次通过率是多少", t_firstpass("ic")),
     _c("指标-准时率", "A07", "EMC 检测的准时率是多少", t_ontime(bl="emc")),
     _c("指标-准时率", "A08", "数据科学分析与评价的准时率是多少", t_ontime(bl="data_science")),
@@ -123,11 +135,12 @@ CASES: list[dict] = [
        truth_sql=("SELECT b.name, COUNT(*) FROM reports r "
                   "JOIN business_lines b ON r.business_line_id = b.id GROUP BY b.name")),
     _c("分组", "C05", "每个客户的合同总金额是多少", compare="rows",
+       # 修正两处标准答案错误（口径自查发现，系统原本按字面回答反而被判错）：
+       #   ① 原写法经 委托单×报告 关联再求和 -> 合同金额被按报告份数重复累加（10 倍量级）；
+       #   ② 问题只问"合同总金额"，未提开票，标准却加了 settled_status='已开票'，与问题口径不符。
+       #   现按"合同表直接汇总"（一个客户一份合同只算一次）：
        truth_sql=("SELECT cu.name, SUM(ct.amount) FROM contracts ct "
                   "JOIN customers cu ON ct.customer_id = cu.id "
-                  "JOIN trust_orders o ON o.contract_id = ct.id "
-                  "JOIN reports r ON r.order_id = o.id "
-                  "WHERE ct.settled_status = '已开票' AND r.status = '已出具' "
                   "GROUP BY cu.name")),
     _c("分组", "C06", "各区域的设备平均利用率是多少", compare="rows",
        truth_sql=("SELECT l.region, AVG(e.utilization) FROM equipment e "
@@ -167,23 +180,26 @@ CASES: list[dict] = [
         "AND issued_at >= CURRENT_DATE - INTERVAL '7 days'")),
 
     # ============ F. 多轮上下文（同一 session 顺序执行） ============
-    _c("多轮", "F01", "华东区上个月可靠性试验的准时完成率是多少", t_ontime("华东", "reliability"),
+    _c("多轮", "F01", "华东区上个月可靠性试验的准时完成率是多少", t_ontime("华东", "reliability", days=30),
        session="m1"),
-    _c("多轮", "F02", "那华南区呢？", t_ontime("华南", "reliability"), session="m1"),
-    _c("多轮", "F03", "那华北呢？", t_ontime("华北", "reliability"), session="m1"),
+    _c("多轮", "F02", "那华南区呢？", t_ontime("华南", "reliability", days=30), session="m1"),
+    _c("多轮", "F03", "那华北呢？", t_ontime("华北", "reliability", days=30), session="m1"),
     _c("多轮", "F04", "华东区上个月可靠性试验的检测服务收入是多少", t_revenue("华东", "reliability", days=30),
        session="m2"),
     _c("多轮", "F05", "那华南区呢？", t_revenue("华南", "reliability", days=30), session="m2"),
     _c("多轮", "F06", "集成电路测试的检测一次通过率是多少", t_firstpass("ic"), session="m3"),
     _c("多轮", "F07", "那 EMC 的准时率呢？", t_ontime(bl="emc"), session="m3"),
     # BUG-04 回归：分组维度不得被继承成过滤条件（华东上下文 + 各业务线分组 -> 只保留 region）
-    _c("多轮", "F08", "华东区上个月可靠性试验的准时完成率是多少", t_ontime("华东", "reliability"),
+    _c("多轮", "F08", "华东区上个月可靠性试验的准时完成率是多少", t_ontime("华东", "reliability", days=30),
        session="m4"),
     _c("多轮", "F09", "各业务线的检测准时率是多少", compare="rows", session="m4",
+       # 追问两个维度都要继承：F08 的「华东 + 上个月」。原先只写了 region、漏了时间窗口
+       # （当时数据全在 30 天内，漏了也看不出来）。分组维度 business_line 不继承成过滤 —— 这正是本用例要守的点。
        truth_sql=("SELECT b.name, COUNT(*) FILTER (WHERE r.on_time = 1)::float / NULLIF(COUNT(*), 0) "
                   "FROM reports r JOIN labs l ON r.lab_id = l.id "
                   "JOIN business_lines b ON r.business_line_id = b.id "
-                  "WHERE l.region = '华东' GROUP BY b.name")),
+                  "WHERE l.region = '华东' AND r.issued_at >= CURRENT_DATE - INTERVAL '30 days' "
+                  "GROUP BY b.name")),
 
     # ============ K. 澄清（ID 用 K 前缀：G 已被「经营」占用，避免重复 ID） ============
     _c("澄清", "K01", "那个做环境的实验室利用率怎么样", None, expect={"kind": "clarification"}),

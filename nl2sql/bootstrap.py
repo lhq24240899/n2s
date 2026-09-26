@@ -208,6 +208,10 @@ def _make_engine(ctx: AppContext, pipeline: Text2SQLPipeline, guard: PolicyGuard
         doc_retriever=ctx.doc_retriever,
         doc_max_chars=settings.kb.doc_max_chars,
         guard=guard,
+        # 引擎层护栏：与 pipeline 层**重复装**是有意的（防御纵深）。
+        # 引擎这层知道"这是不是在回应上一轮的澄清"，能对澄清回复只做硬拦截，
+        # 因此拦得更准；pipeline 那层则是最后一道（graph 编排时尤其需要）。
+        safety=SafetyGuard(),
     )
 
 

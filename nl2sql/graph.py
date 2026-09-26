@@ -219,6 +219,14 @@ class Text2SQLGraph:
         if err is None and self.guard is not None:
             # 数据权限：列级拦截 + 行级过滤注入（与 pipeline 行为一致）
             sql, err = self.guard.post_sql(sql or "")
+            if err:
+                # ⚠️ 列级权限拒绝时**清空对外 SQL**（与 pipeline 主路径、图里的回退路径一致）：
+                # 否则含敏感字段的 SQL 会被带到最终结果、并在网页「生成的 SQL」里回显。
+                return self._merge(
+                    state,
+                    f"validate：拦截（{err[:60]}）",
+                    sql=None, error=err,
+                )
         return self._merge(
             state,
             "validate：通过" if err is None else f"validate：拦截（{err[:60]}）",
@@ -290,6 +298,19 @@ class Text2SQLGraph:
 
         # 回退路径同样必须过数据权限。否则"重试耗尽"会变成绕过权限的后门：
         # 实测就出现过模板 SQL 带着被禁字段被直接执行、把越权数据返回给用户的情况。
+        # ⚠️ 还必须先过 validator：模板 SQL 是我们自己维护的，写坏了（少个括号等）
+        #    会**因解析失败而让列级权限检查静默跳过**（见 policy._find_denied_column
+        #    的"解析失败不拦"约定），于是坏模板连语法带权限一起绕过。真机上就是这样
+        #    暴露的：示例 SQL 少写了一个 `) x`，回退执行成功、被禁字段直接返回。
+        if sql:
+            verr = self.validator.validate(sql, state.get("allowed_tables") or [])
+            if verr:
+                self._log.warning("回退路径模板未通过校验: %s", verr)
+                return self._merge(
+                    state,
+                    f"fallback：模板未通过校验（{source}）",
+                    sql=None, raw=raw, source=source, error=verr,
+                )
         if sql and self.guard is not None:
             sql, guard_err = self.guard.post_sql(sql)
             if guard_err:

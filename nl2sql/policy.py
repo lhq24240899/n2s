@@ -182,13 +182,20 @@ class PolicyGuard:
 
     def _find_denied_column(self, sql: str) -> Optional[str]:
         """AST 级列级权限检查：命中敏感字段即拒绝（宁可误拦，不可漏放）。"""
+        denied = self.policy.denied_columns
+        if not denied:
+            return None
         try:
             parsed = sqlglot.parse_one(sql, dialect=self.dialect)
-        except Exception:  # noqa: BLE001 - 解析失败交给 validator 报错，不在此处拦截
-            return None
+        except Exception as e:  # noqa: BLE001
+            # ⚠️ fail-closed：配了敏感字段但 SQL 解析不了时**保守拒绝**，不能放行。
+            #    早期实现是"解析失败就跳过列级检查、交给 validator 报错"，可回退路径
+            #    并不一定调用 validator（graph 的模板回退就漏了）—— 于是一条语法坏的 SQL
+            #    能连语法带权限一起绕过。真机上正是这样暴露的：示例 SQL 少写一个 `) x`，
+            #    解析失败 -> 列级检查静默跳过 -> 含被禁字段的 SQL 被直接执行并返回数据。
+            return f"<无法解析：{type(e).__name__}: {str(e)[:80]}>"
         if parsed is None:
-            return None
-        denied = self.policy.denied_columns
+            return "<无法解析：空语句>"
         for col in parsed.find_all(exp.Column):
             qualified = f"{col.table}.{col.name}" if col.table else col.name
             if qualified in denied or col.name.lower() in {d.lower() for d in denied}:

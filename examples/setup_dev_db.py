@@ -92,20 +92,28 @@ def _seed(cur: psycopg.Cursor) -> None:
         "INSERT INTO customers (id, name, industry) VALUES (%s,%s,%s)",
         [(1, "某汽车客户", "汽车"), (2, "某通信客户", "通信")],
     )
-    # 合同：金额有意差异化，且各业务线/区域挂到的合同**不能是同一个循环**
-    # （原来每块都用 (i%3)+1，导致"华东收入"和"华南收入"算出同一个数——
-    #   已开票的合同 1/2 在两个区域各出现 5 次；假数据一眼能被看出来）
+    # 合同：**每个（业务线 × 区域）块各挂 2 份自己的合同**（早期/晚期各一份），
+    # 这是"收入"类问题能有真实差异的前提，两轮踩坑记录：
+    #   ① 最初每块都用同一个 (i%3)+1 循环 → 华东/华南收入算出同一个数；
+    #   ② 改成"按块偏移"仍然不够 —— 6 份合同被所有块共用，一旦把重复累加修正为
+    #      **按合同去重**（一份合同只能计一次收入），各区域收入又全变成同一个数。
+    # 现在：合同池 14 份 = 7 个块 × (早期/晚期)，块之间不共用 -> 区域、业务线各不相同；
+    #       同一块内「早期合同」只被最近 30 天内的报告关联、「晚期合同」只在 30 天外，
+    #       于是时间窗口也能真正改变收入口径（近 30 天 vs 不限时间结果不同）。
+    CONTRACTS = [
+        # (客户, 签于 N 天前, 金额, 开票状态)  —— 1 份未开票/块附近，供"已开票"过滤体现差异
+        (1, 40, 500000, "已开票"), (1, 36, 240000, "已开票"),      # 块0 华东·可靠性
+        (2, 40, 300000, "已开票"), (2, 36, 410000, "未开票"),      # 块1 华南·可靠性
+        (1, 40, 620000, "已开票"), (2, 36, 180000, "已开票"),      # 块2 华北·可靠性
+        (2, 40, 280000, "已开票"), (1, 36, 330000, "已开票"),      # 块3 华南·计量服务
+        (1, 40, 350000, "已开票"), (2, 36, 760000, "已开票"),      # 块4 华北·EMC
+        (2, 40, 450000, "未开票"), (1, 36, 290000, "已开票"),      # 块5 华东·集成电路
+        (1, 40, 210000, "已开票"), (2, 36, 530000, "已开票"),      # 块6 华南·数据科学
+    ]
     cur.executemany(
         "INSERT INTO contracts (id, customer_id, signed_at, amount, settled_status) "
         "VALUES (%s,%s,%s,%s,%s)",
-        [
-            (1, 1, ago(40), 500000, "已开票"),   # 汽车
-            (2, 2, ago(38), 300000, "已开票"),   # 通信
-            (3, 1, ago(35), 450000, "未开票"),   # 未开票 -> 不计入收入口径
-            (4, 1, ago(33), 620000, "已开票"),   # 汽车（保证汽车客户仍是已开票金额最高）
-            (5, 2, ago(31), 280000, "已开票"),   # 通信
-            (6, 2, ago(29), 350000, "已开票"),   # 通信
-        ],
+        [(i + 1, c[0], ago(c[1]), c[2], c[3]) for i, c in enumerate(CONTRACTS)],
     )
 
     # 委托单 + 报告：按「业务线 × 区域」确定性构造，供准时率/收入/分组/排名类问题使用。
@@ -134,32 +142,45 @@ def _seed(cur: psycopg.Cursor) -> None:
     orders: list[tuple] = []
     reports: list[tuple] = []
     oid = rid = 1
-    contract_ids = (1, 2, 3, 4, 5, 6)
+    # 报告出具时间跨度：最早 10 天前、最晚 50 天前。
+    # 为什么不再全部压在 10~24 天：
+    #   ① 全部落在 30 天内 → 「上个月」与「不限时间」结果完全相同，时间维度在多轮演示里形同虚设；
+    #   ② 跨到 50 天后期，两个窗口的差异才真实可见；同时保持「最近 7 天」为空（E06 期望 0 的边界用例）。
+    SPAN_START, SPAN_END = 10, 50
+    IN_WINDOW_DAYS = 30       # 「上个月/近 30 天」窗口
     for block, (bl_id, lab_ids, cnt, late_idx) in enumerate(PLANS):
         for i in range(cnt):
             lab = lab_ids[i % len(lab_ids)]
-            # 按块给偏移：不同业务线/区域挂到的合同组合不同 ->
-            # 「各区域/各业务线收入」才是真实有差异的数（原先是同一个循环，数值会撞车）
-            cid = contract_ids[(i + block * 2) % len(contract_ids)]
-            orders.append((oid, lab, bl_id, 1 + (i % 2), cid))
-            # issued_at 落在 10~24 天前：既在「最近 30 天（上个月）」窗口内，
-            # 又在「最近 7 天」窗口外 —— 后者用于验证时间窗口边界（E06 期望 0）。
+            issued_offset = SPAN_START + round(i * (SPAN_END - SPAN_START) / max(cnt - 1, 1))
+            # 合同按块分配，且**用时间决定用块内哪一份**：
+            #   窗口内(<=30天)的报告 → 块内第 1 份("早期合同")；窗口外 → 第 2 份。
+            # 这样「近 30 天收入」只含早期合同、「不限时间收入」含两份 —— 时间维度对收入也真实生效。
+            slot = 0 if issued_offset <= IN_WINDOW_DAYS else 1
+            cid = block * 2 + slot + 1
+            late = i in late_idx
+            # ⚠️ promised_date 必须与 on_time **自洽**：指标定义写的是「按期 = 出具日 <= 承诺日」，
+            #    早期版本把 promised_date 一律写成 20 天前、on_time 却按 i 硬编码，
+            #    结果 53 行 on_time=1 的数据按定义算是逾期 —— 一旦 LLM 依定义用日期比较生成 SQL，
+            #    算出的准时率与用 on_time 列算的完全不同（自查发现，见 README 的口径审计）。
+            promised_offset = issued_offset - 4 if not late else issued_offset + 3
+            orders.append((oid, lab, bl_id, 1 + (i % 2), cid, 95, promised_offset))
             reports.append(
-                (rid, oid, lab, bl_id, ago(10 + i), 0 if i in late_idx else 1, 42000, "已出具")
+                (rid, oid, lab, bl_id, ago(issued_offset), 0 if late else 1, 42000, "已出具")
             )
             oid += 1
             rid += 1
 
     # 集成电路单独补一条委托单，供 test_records 关联（保持检测记录的外键关系）
     ic_order_id = oid
-    orders.append((oid, 4, 4, 1, 1))
+    orders.append((oid, 4, 4, 1, 12, 95, 20))
     oid += 1
 
     cur.executemany(
         "INSERT INTO trust_orders "
         "(id, lab_id, business_line_id, customer_id, contract_id, created_at, promised_date, status) "
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
-        [(o[0], o[1], o[2], o[3], o[4], ago(30), ago(20), "已完成") for o in orders],
+        # created_at 统一 95 天前：必须早于所有 promised_date（承诺日期不能早于委托创建）
+        [(o[0], o[1], o[2], o[3], o[4], ago(o[5]), ago(o[6]), "已完成") for o in orders],
     )
     cur.executemany(
         "INSERT INTO reports "

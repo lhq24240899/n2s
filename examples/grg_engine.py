@@ -32,6 +32,7 @@ from typing import Optional
 from nl2sql.context import QueryContext
 from nl2sql.kb import answer_with_docs, build_sql_doc_block
 from nl2sql.pipeline import Text2SQLPipeline
+from nl2sql.models import ResultSource
 from nl2sql.policy import PolicyViolation
 from nl2sql.safety import SafetyGuard
 from nl2sql.semantic import MappedQuery, SemanticLayer, SemanticMapper
@@ -245,6 +246,21 @@ class GRGQueryEngine:
                 "detail": getattr(e, "detail", ""),
                 "mapped": merged,
             }
+
+        # 护栏可能挂在 pipeline 而不是引擎上（API/MCP 由 QueryService 兜、graph 编排等）。
+        # 必须把「拒绝」如实透传成 refused，否则调用方只看到 sql=None 的"空结果"——
+        # 用户看到的是"无数据返回"而不是"我不能回答这个"，拦截语义被吞掉；
+        # 更糟的是装配里少一层护栏时，拦截会**悄悄变成静默的空结果**，无从发现。
+        if res.source is ResultSource.REFUSED:
+            # 这一层只拿得到"拒绝原因"，拿不到面向用户的措辞（它在 Refusal.safe_reply 里）。
+            # 所以原地再判一次，得到与网页/API 完全一致的回复文案；判不出来就退回通用文案。
+            ref = (self.safety or SafetyGuard()).screen(mapped.original)
+            payload = self._refuse(ref) if ref is not None else {
+                "type": "refused",
+                "answer": "该问题不在我的回答范围内。",
+                "reason": res.error,
+            }
+            return {**payload, "mapped": merged, "result": res}
 
         # 空结果回退：结果是空的、且本轮带入了"上一轮继承"的过滤维度时，
         # 忽略这些继承维度再查一次。只在**继承来的**维度上放宽，用户本轮明说的条件绝不动。

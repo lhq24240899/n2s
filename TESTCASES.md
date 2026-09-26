@@ -109,7 +109,7 @@
 | 用例ID | 操作 | 预期结果 | 实际结果 | 结论 |
 |---|---|---|---|---|
 | G-01 | 终端执行 `python examples/grg_demo.py` | 输出华东 **0.9167** vs 华南 **0.8889**，并附口径说明 | | |
-| G-02 | 终端执行 `pytest -q` | **120 passed**（离线，不花真钱、不碰真库） | | |
+| G-02 | 终端执行 `pytest -q` | **288 passed**（离线，不花真钱、不碰真库。新增：三档引擎、入口真实渲染 AppTest、资产体检见文末） | | |
 
 ---
 
@@ -262,3 +262,18 @@ SELECT l.name, AVG(e.utilization) AS util
 FROM equipment e JOIN labs l ON e.lab_id=l.id
 GROUP BY l.name ORDER BY util DESC;
 ```
+
+---
+
+## 附：9/26 新增能力对应的用例（原文档停在 9/25，此处做索引）
+
+| 能力 | 用例在哪 |
+|---|---|
+| **三档执行引擎 SQL / DSL / PPL 真执行**（同一份 IR 编译成两种方言） | `tests/test_dsl.py`（IR→ES DSL/PPL 编译 17 例）、`tests/test_es_engine.py`（执行/填槽/多轮）、`tests/test_es_backend_modes.py`（模式装配 10 例）、`examples/es_eval.py`（真机双份成绩单） |
+| **编译层消化字符集方言**（中文字面量→ASCII 编码字段） | `tests/test_dsl.py` 的"编译层：非 ASCII 字面量适配"6 例 |
+| **会话/对话历史按引擎隔离** + 对话区示例问题 | `tests/test_streamlit_entry.py`（隔离与示例展示）、`tests/test_streamlit_render.py`（官方 AppTest 真实渲染） |
+| **数据源自检随档位切换** | `tests/test_streamlit_entry.py::test_selfcheck_*`（7 例） |
+| **空结果回退**（继承维度把结果筛空时忽略继承维度重查） | `tests/test_grg.py::test_empty_result_relaxes_inherited_filters`、`tests/test_context.py`（inherit_filters 开关） |
+| **安全护栏**（密钥/注入/PII/越界 + 算式与业务词误杀修复） | `tests/test_adversarial.py`（45 例）、`examples/adversarial_probe.py`（离线探针 + `--live`） |
+| **列级权限 fail-closed 与模板校验** | `tests/test_assets.py`（示例/指标 SQL 可解析+可校验+无敏感字段）、`tests/test_policy.py`、`tests/test_graph.py` |
+| **口径审计**（合同金额去重、on_time 与承诺日自洽、时间窗口真实） | `tests/test_eval.py`、`examples/eval_run.py`；真机核对见 `EVAL_SET.md` |
