@@ -66,7 +66,10 @@ def _seed(cur: psycopg.Cursor) -> None:
     cur.executemany(
         "INSERT INTO labs (id, name, city, region) VALUES (%s,%s,%s,%s)",
         [
-            (1, "广州计量实验室", "广州", "华东"),
+            # 区域必须与真实基地一致（lab 1 广州 = 华南！）。
+            # 早期版本把 lab 1 写成华东，导致后续「华东可靠性报告」有半数挂到华南、
+            # 华东因此样本变少且一条逾期都没有 —— 算出「华东准时率 100%」的假数据。
+            (1, "广州计量实验室", "广州", "华南"),
             (2, "深圳可靠性实验室", "深圳", "华南"),
             (3, "北京电磁兼容实验室", "北京", "华北"),
             (4, "上海集成电路实验室", "上海", "华东"),
@@ -99,41 +102,48 @@ def _seed(cur: psycopg.Cursor) -> None:
         ],
     )
 
-    # 委托单：先造足量的「可靠性」委托单，分属 华东/华南/华北 实验室，
-    # 报告才能通过 r.order_id = o.id 正确关联（避免孤儿外键导致 JOIN 掉数据）。
-    orders = []
-    oid = 1
-    # 华东可靠性委托单（lab 1 / 5）
-    for i in range(15):
-        lab = 1 if i % 2 == 0 else 5
-        orders.append((oid, lab, 2, 1 if i % 2 == 0 else 2, (i % 3) + 1))
-        oid += 1
-    # 华南可靠性委托单（lab 2）
-    for i in range(9):
-        orders.append((oid, 2, 2, 1 if i % 2 == 0 else 2, (i % 3) + 1))
-        oid += 1
-    # 华北可靠性委托单（lab 3）
-    for i in range(10):
-        orders.append((oid, 3, 2, 1 if i % 2 == 0 else 2, (i % 3) + 1))
-        oid += 1
-    # 集成电路委托单（lab 4，供 test_records 关联）
+    # 委托单 + 报告：按「业务线 × 区域」确定性构造，供准时率/收入/分组/排名类问题使用。
+    #
+    # 两个刻意为之、别改回去的设计：
+    #  1) **实验室必须按 labs 表的真实区域挂**：
+    #     lab 1=广州(华南)、2=深圳(华南)、3=北京(华北)、4=上海(华东)、5=无锡(华东)。
+    #     早期版本把「华东」写成 lab 1/5，而 lab 1 实为广州(华南) →
+    #     华东的报告少了一半、且逾期样本全落到了华南，于是算出「华东准时率 100%」这种假数据。
+    #  2) **样本量要够、逾期要分散**：单区域只有几条报告时，1 条逾期就能让比率跳动 15+ 个百分点；
+    #     并且要保证**没有任何「业务线 × 区域」组合是 100%**（真实检测机构不可能零逾期）。
+    # 逾期位置用固定下标指定（确定性，不用随机），保证评估集标准答案可复现、可解释。
+    #  预期准时率：华东可靠性 13/15、华南可靠性 13/14、华北可靠性 9/11、
+    #             计量服务 8/10、EMC 9/12、集成电路 8/9、数据科学 5/6；整体 65/77 ≈ 84%。
+    PLANS = [
+        # (业务线 id, 实验室 id 列表, 报告数, 逾期下标)
+        (2, [4, 5], 15, {0, 9}),     # 可靠性与环境试验 —— 华东（上海/无锡）
+        (2, [1, 2], 14, {1}),        # 可靠性与环境试验 —— 华南（广州/深圳）
+        (2, [3],    11, {0, 6}),     # 可靠性与环境试验 —— 华北（北京）
+        (1, [1],    10, {0, 5}),     # 计量服务     —— 华南（广州）
+        (3, [3],    12, {0, 4, 9}),  # 电磁兼容检测 —— 华北（北京）
+        (4, [4],     9, {3}),        # 集成电路     —— 华东（上海）
+        (6, [1],     6, {1}),        # 数据科学     —— 华南（广州）
+    ]
+
+    orders: list[tuple] = []
+    reports: list[tuple] = []
+    oid = rid = 1
+    for bl_id, lab_ids, cnt, late_idx in PLANS:
+        for i in range(cnt):
+            lab = lab_ids[i % len(lab_ids)]
+            orders.append((oid, lab, bl_id, 1 + (i % 2), (i % 3) + 1))
+            # issued_at 落在 10~24 天前：既在「最近 30 天（上个月）」窗口内，
+            # 又在「最近 7 天」窗口外 —— 后者用于验证时间窗口边界（E06 期望 0）。
+            reports.append(
+                (rid, oid, lab, bl_id, ago(10 + i), 0 if i in late_idx else 1, 42000, "已出具")
+            )
+            oid += 1
+            rid += 1
+
+    # 集成电路单独补一条委托单，供 test_records 关联（保持检测记录的外键关系）
     ic_order_id = oid
     orders.append((oid, 4, 4, 1, 1))
     oid += 1
-
-    # 其他业务线的委托单：让「各业务线的检测准时率」这类分组问题能返回多行，
-    # 而不是只剩"可靠性"一条线。各线数量与逾期数不同，便于演示"每条线不一样"。
-    extra_start = len(orders)
-    other_lines = [
-        (1, 1, 8, 1),    # 计量服务     -> 广州计量实验室,      8 单 / 1 条逾期
-        (3, 3, 10, 2),   # 电磁兼容检测 -> 北京电磁兼容实验室, 10 单 / 2 条逾期
-        (4, 4, 6, 1),    # 集成电路     -> 上海集成电路实验室,  6 单 / 1 条逾期
-        (6, 1, 5, 1),    # 数据科学     -> 广州计量实验室,      5 单 / 1 条逾期
-    ]
-    for bl_id, lab_id, cnt, _late in other_lines:
-        for _ in range(cnt):
-            orders.append((oid, lab_id, bl_id, 1, 1))
-            oid += 1
 
     cur.executemany(
         "INSERT INTO trust_orders "
@@ -141,35 +151,6 @@ def _seed(cur: psycopg.Cursor) -> None:
         "VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
         [(o[0], o[1], o[2], o[3], o[4], ago(30), ago(20), "已完成") for o in orders],
     )
-
-    # 报告：每一条都挂在对应区域的可靠性委托单上；每个区域首批各留 1 条逾期(on_time=0)，
-    # 使「华东 vs 华南 vs 华北」准时率不同（演示多轮上下文与区域替换）。
-    # 华东 12 条(11 准时) / 华南 9 条(8 准时) / 华北 10 条(9 准时)
-    east = orders[0:15]
-    south = orders[15:24]
-    north = orders[24:34]
-    reports = []
-    rid = 1
-
-    def add_report(order, on_time, day_offset):
-        nonlocal rid
-        reports.append((rid, order[0], order[1], order[2], ago(day_offset), on_time, 42000, "已出具"))
-        rid += 1
-
-    for i, o in enumerate(east[:12]):
-        add_report(o, 0 if i == 0 else 1, 10 + i)
-    for i, o in enumerate(south[:9]):
-        add_report(o, 0 if i == 0 else 1, 10 + i)
-    for i, o in enumerate(north[:10]):
-        add_report(o, 0 if i == 0 else 1, 10 + i)
-
-    # 其他业务线的报告：每条线逾期数不同 -> 「各业务线准时率」结果彼此有差异
-    pos = extra_start
-    for _bl_id, _lab_id, cnt, late in other_lines:
-        for j in range(cnt):
-            add_report(orders[pos], 0 if j < late else 1, 10 + j)
-            pos += 1
-
     cur.executemany(
         "INSERT INTO reports "
         "(id, order_id, lab_id, business_line_id, issued_at, on_time, amount, status) "

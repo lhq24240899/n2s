@@ -304,7 +304,7 @@ def _known_failures() -> list[tuple[str, str, str]]:
     if not p.exists():
         return []
     rep = json.loads(p.read_text(encoding="utf-8"))
-    return [(r["id"], r.get("question", ""), "模型生成了多余的 JOIN（指标口径已治理，属模型服从性边界）")
+    return [(r["id"], r.get("question", ""), "模型自行加了额外过滤 / 多余 JOIN（指标口径已治理，属模型服从性边界）")
             for r in rep.get("records", []) if not r.get("ok")]
 
 
