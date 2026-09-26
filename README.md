@@ -52,7 +52,7 @@
 ```
 nl2sql/
 ├── pyproject.toml / requirements.txt / .env.example
-├── Streamlit.app.py            # ★Web UI 入口（Streamlit Cloud 的 Main file）
+├── streamlit_app.py            # ★Web UI 入口（Streamlit Cloud 的 Main file）
 ├── TESTCASES.md                # ★功能测试用例（含实测标准答案 + 执行记录表）
 ├── .streamlit/secrets.toml.example  # Streamlit secrets 模板（本地复制为 secrets.toml）
 ├── nl2sql/                     # 核心包
@@ -333,22 +333,22 @@ EXPLAIN 预检 + 审计日志），重点投入在语义层而非重复建设数
 
 ## 9. 部署到 Streamlit
 
-Web 入口是仓库根目录的 **`Streamlit.app.py`**（部署时的 **Main file**）。
+Web 入口是仓库根目录的 **`streamlit_app.py`**（部署时的 **Main file**）。
 
 ### 9.1 本地运行
 
 ```bash
 pip install -r requirements.txt
 cp .streamlit/secrets.toml.example .streamlit/secrets.toml   # 填入真实 LLM/DB 凭据
-streamlit run Streamlit.app.py
+streamlit run streamlit_app.py
 ```
 
-本地也可继续用 `.env`（`Streamlit.app.py` 会优先读 `st.secrets`，两者键名一致）。
+本地也可继续用 `.env`（`streamlit_app.py` 会优先读 `st.secrets`，两者键名一致）。
 
 ### 9.2 Streamlit Community Cloud
 
 1. 打开 https://share.streamlit.io → **New app** → 选仓库 `lhq24240899/n2s`、分支 `main`。
-2. **Main file path** 填：`Streamlit.app.py`
+2. **Main file path** 填：`streamlit_app.py`
 3. **Advanced settings → Secrets**，粘贴（键名同 `.env`，用 TOML）：
 
    ```toml
@@ -365,9 +365,9 @@ streamlit run Streamlit.app.py
 
 ### 9.3 架构说明（为什么这样接）
 
-- **机构名称可配置**：页面/标题上的机构名统一由 `Streamlit.app.py` 顶部的 `DISPLAY_NAME`
+- **机构名称可配置**：页面/标题上的机构名统一由 `streamlit_app.py` 顶部的 `DISPLAY_NAME`
   常量控制，想换名只改那一行（不涉及任何业务逻辑）。
-- Cloud 上**没有 `.env`**，密钥走 `st.secrets`；`Streamlit.app.py` 启动时把 secrets 展平后写入
+- Cloud 上**没有 `.env`**，密钥走 `st.secrets`；`streamlit_app.py` 启动时把 secrets 展平后写入
   环境变量（`LLM__BASE_URL` 等），`pydantic-settings` 便能像读 `.env` 一样读到——**核心引擎零改动**。
 - 每个浏览器会话**独立持有一个 `GRGQueryEngine`**（含独立 `QueryContext`），所以多轮上下文
   互不串台；侧边栏「清空对话」即 `reset_context()`。
@@ -495,7 +495,7 @@ python examples/api_server.py --orchestrator graph   # API 也可切到图编排
 ## 12. 智能体 API：FastAPI + MCP + 只读数据权限
 
 三个入口，一套内核：`bootstrap.py` 装配一次，`api.py`（HTTP）、`mcp_server.py`（MCP）、
-`Streamlit.app.py`（Web UI）共用同一个 `QueryService` 与引擎工厂
+`streamlit_app.py`（Web UI）共用同一个 `QueryService` 与引擎工厂
 ——避免"三个入口三套行为"这种最常见的腐化。
 
 ### 12.1 四道门（职责不重叠、也不留缺口）

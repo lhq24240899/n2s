@@ -1,29 +1,26 @@
-"""计量检测 · 智能问数系统 —— Streamlit 入口（部署时的 Main file：Streamlit.app.py）。
+"""计量检测 · 智能问数系统 —— Streamlit 入口（部署时的 Main file：streamlit_app.py）。
 
 页面显示名称统一由下方 `DISPLAY_NAME` 常量控制：改那一行即可整体换名。
 
 本地运行：
-    streamlit run Streamlit.app.py
+    streamlit run streamlit_app.py
 
-部署到 百度 AI Studio highcode（星河高代码应用）——官方流程：
-  1. 克隆 highcode 应用空间**自有仓库**（不是本 GitHub 仓库）：
-       git lfs install
-       git clone http://{access_token}@git.aistudio.baidu.com/20300719/n2s.git
-  2. 把本项目的以下文件/目录整体拷进克隆下来的仓库根目录
-     （覆盖其自带的占位 Streamlit.app.py）：
-       Streamlit.app.py   requirements.txt   nl2sql/   examples/
-  3. 在 highcode 控制台配置环境变量（见下），然后：
-       git add -A && git commit -m "deploy" && git push
-     highcode 会自动按 requirements.txt 装依赖并运行 Streamlit.app.py。
-  - 必填环境变量（走平台配置面板，**不要写进文件**）：
-       LLM__BASE_URL / LLM__API_KEY / LLM__MODEL / DB__DSN
-  - 端口：优先读取平台注入的 $PORT；未注入则交予平台 / Streamlit 处理，
-    不再强制固定端口，避免和平台 ingress 端口不一致导致页面打不开。
+部署到 Streamlit Community Cloud（推荐）：
+  1. 把本仓库推到 GitHub（公开或私有均可）。
+  2. share.streamlit.io → New app → 选仓库/分支（main）→
+     Main file path 填 `streamlit_app.py`。
+  3. App → Settings → Secrets 粘贴 TOML（键名与 .env 一致，**不要提交到仓库**）：
+       LLM__PROVIDER / LLM__BASE_URL / LLM__API_KEY / LLM__MODEL
+       DB__DIALECT / DB__DSN / DB__READONLY / DB__DRY_RUN
+     （顶层键会被 Streamlit 自动注入为环境变量；本文件也会再做一次兜底注入。）
+  4. 依赖由根目录 requirements.txt 安装（已精简为 Streamlit 运行时所需）。
+  - 端口/地址：Streamlit Cloud 自行管理，无需配置；本文件仅在平台注入 $PORT 时才跟随。
   - 输入安全护栏已内置（问 apikey / 注入 / PII 会被直接拒绝，见 nl2sql/safety.py）。
+  - 页面侧边栏「🩺 部署诊断」可自查：配置是否就绪、secrets 从哪读到、环境变量是否注入。
 
-部署到 Streamlit Community Cloud（备选）：
-  - Main file path：Streamlit.app.py
-  - App → Settings → Secrets（键名与 .env 一致，TOML）：LLM__* / DB__DSN
+（备选）百度 AI Studio highcode：
+  - 入口文件名需为 `Streamlit.app.py`，且推送到其应用空间自有仓库；
+    把本文件复制一份改名为 `Streamlit.app.py` 即可，其余文件整包拷入。
 """
 from __future__ import annotations
 
@@ -36,12 +33,87 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+
 # ---------------------------------------------------------------------------
-# 0) 云端部署端口绑定（必须在 import streamlit 之前设置）
-#    百度 AI Studio highcode 等平台一般会把监听端口写在 $PORT 环境变量里；
-#    仅当平台显式注入 $PORT 时才覆盖，否则交给 Streamlit / 平台启动命令决定，
-#    避免端口和平台 ingress 不一致导致页面打不开。
-#    绑定 0.0.0.0 + headless，保证平台能从外部访问到。
+# 0) 加载本地 .streamlit/secrets.toml 到环境变量（必须在 import streamlit 之前）
+#    某些平台（如百度 AI Studio highcode）启动 Streamlit 的工作目录可能不是仓库根目录，
+#    导致 Streamlit 原生 secrets 机制找不到文件。这里基于 __file__ 绝对路径手动解析，
+#    不依赖 CWD / st.secrets，兼容 Python 3.9+（优先 tomllib，回退简单行解析）。
+# ---------------------------------------------------------------------------
+def _load_local_secrets() -> None:
+    # 候选路径：入口文件所在目录、工作目录、以及常见的平台家目录，
+    # 防止 highcode 把仓库存到非预期目录、或用非根 CWD 启动导致找不到 .streamlit/secrets.toml。
+    candidates = []
+    try:
+        candidates.append(Path(__file__).resolve().parent / ".streamlit" / "secrets.toml")
+    except NameError:
+        pass
+    candidates.append(_ROOT / ".streamlit" / "secrets.toml")
+    candidates.append(Path.cwd() / ".streamlit" / "secrets.toml")
+    for home in ("/home/aistudio", "/home/jovyan", "/app", os.path.expanduser("~")):
+        if home:
+            candidates.append(Path(home) / ".streamlit" / "secrets.toml")
+    # 也允许仓库根直接放 secrets.toml（无 .streamlit 子目录）
+    candidates += [c.parent / "secrets.toml" for c in list(candidates)]
+
+    path = None
+    for c in candidates:
+        try:
+            if c and c.exists():
+                path = c
+                break
+        except OSError:
+            continue
+    if path is None:
+        return
+    raw = path.read_text(encoding="utf-8")
+    if not raw.strip():
+        return
+
+    # 优先用标准库 tomllib（Python >= 3.11）
+    def _setenv(k: str, v: str) -> None:
+        # 注意用「空值也覆盖」而不是 setdefault：平台可能注入了 LLM__API_KEY="" 这类空变量，
+        # setdefault 会保留空值导致 pydantic 读到空串，报"缺少配置"。
+        if not os.environ.get(k):
+            os.environ[k] = v
+
+    try:
+        import tomllib  # type: ignore
+        data = tomllib.loads(raw)
+        for k, v in data.items():
+            if v is None:
+                continue
+            if isinstance(v, (str, int, float, bool)):
+                _setenv(str(k).upper(), str(v))
+        return
+    except Exception:
+        pass
+
+    # 兼容旧版 Python 的简单行解析（只处理顶层 key = "value" / key = 123 / key = true）
+    import re
+    for line in raw.splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line or line.startswith("["):
+            continue
+        m = re.match(r'^([A-Za-z0-9_-]+)\s*=\s*(.+)$', line)
+        if not m:
+            continue
+        k, v = m.group(1), m.group(2).strip()
+        if (v.startswith('"') and v.endswith('"')) or (v.startswith("'") and v.endswith("'")):
+            v = v[1:-1]
+        elif v.lower() in ("true", "false"):
+            v = v.lower()
+        _setenv(k.upper(), v)
+
+
+_load_local_secrets()
+
+# ---------------------------------------------------------------------------
+# 0a) 云端部署端口绑定（必须在 import streamlit 之前设置）
+#     百度 AI Studio highcode 等平台一般会把监听端口写在 $PORT 环境变量里；
+#     仅当平台显式注入 $PORT 时才覆盖，否则交给 Streamlit / 平台启动命令决定，
+#     避免端口和平台 ingress 不一致导致页面打不开。
+#     绑定 0.0.0.0 + headless，保证平台能从外部访问到。
 # ---------------------------------------------------------------------------
 if os.environ.get("PORT"):
     os.environ["STREAMLIT_SERVER_PORT"] = os.environ["PORT"]
@@ -51,6 +123,17 @@ os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
 os.environ.setdefault("STREAMLIT_SERVER_ENABLE_CORS", "false")
 
 import streamlit as st
+
+# 再兜底一次：如果平台原生注入 st.secrets（或环境变量），确保 os.environ 里也有。
+# 顺序：环境变量 > .streamlit/secrets.toml > st.secrets（st.secrets 不覆盖已有值）。
+try:
+    for _k in ("LLM__BASE_URL", "LLM__API_KEY", "LLM__MODEL", "LLM__PROVIDER",
+               "DB__DSN", "DB__READONLY", "DB__DRY_RUN"):
+        _v = st.secrets.get(_k)
+        if _v and not os.environ.get(_k):
+            os.environ[_k] = str(_v)
+except Exception:
+    pass
 
 # ============================================================
 # 页面显示的机构名称（想换名只改这一行；不涉及任何业务逻辑）
@@ -204,6 +287,48 @@ def config_status() -> tuple[bool, str]:
     if missing:
         return False, "缺少配置：" + "、".join(missing)
     return True, "配置就绪"
+
+
+# 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
+APP_BUILD = "2026-09-26-cloud"
+
+# secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
+def _secrets_candidates():
+    cands = [Path(__file__).resolve().parent / ".streamlit" / "secrets.toml",
+             _ROOT / ".streamlit" / "secrets.toml",
+             Path.cwd() / ".streamlit" / "secrets.toml"]
+    for home in ("/home/aistudio", "/home/jovyan", "/app", os.path.expanduser("~")):
+        if home:
+            cands.append(Path(home) / ".streamlit" / "secrets.toml")
+    return cands
+
+
+def config_diag() -> str:
+    """返回部署环境诊断文本（不泄露密钥值，只显示是否存在/前几位）。"""
+    lines = []
+    try:
+        lines.append(f"APP_BUILD={APP_BUILD}")
+    except Exception:
+        pass
+    try:
+        lines.append(f"CWD={Path.cwd()}")
+    except Exception:
+        lines.append("CWD=<err>")
+    try:
+        lines.append(f"__file__={Path(__file__).resolve()}")
+    except Exception:
+        lines.append("__file__=<err>")
+    # secrets 文件探测
+    found = [str(p) for p in _secrets_candidates() if p.exists()]
+    lines.append(f"secrets.toml 命中: {found if found else '无'}")
+    # 环境变量状态（只显示是否存在 + 前 6 位，避免泄漏完整密钥）
+    for k in ("LLM__API_URL", "LLM__API_KEY", "LLM__BASE_URL", "LLM__MODEL", "DB__DSN"):
+        v = os.environ.get(k)
+        if v:
+            lines.append(f"env[{k}] = 已注入 (前6位: {v[:6]}…)")
+        else:
+            lines.append(f"env[{k}] = 缺失")
+    return "\n".join(lines)
 
 
 SELFCHECK_TABLES = [
@@ -361,6 +486,11 @@ ok, msg = config_status()
 with st.sidebar:
     st.subheader("⚙️ 状态")
     (st.success if ok else st.error)(msg)
+    st.caption(f"构建版本：`{APP_BUILD}`")
+
+    # 部署诊断：配置缺失时默认展开，帮助定位是"代码没更新 / secrets 没读到 / 环境变量没注入"
+    with st.expander("🩺 部署诊断", expanded=not ok):
+        st.code(config_diag(), language="text")
 
     st.divider()
     st.subheader("💡 示例问题")

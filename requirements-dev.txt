@@ -1,0 +1,18 @@
+# ============================================================
+# 开发 / 进阶能力依赖（不参与 Streamlit Cloud 部署，按需安装）
+#     pip install -r requirements.txt -r requirements-dev.txt
+# ============================================================
+
+# 编排框架：LangGraph 版编排（nl2sql/graph.py）——与手写 pipeline 形成对照
+langgraph>=0.2
+
+# 智能体 API（nl2sql/api.py）：FastAPI + 服务层
+fastapi>=0.110
+uvicorn>=0.27
+PyJWT>=2.8             # 鉴权：JWT 签发与校验
+
+# MCP server（nl2sql/mcp_server.py）：把问数能力暴露给 IDE / 其它智能体
+mcp>=1.0
+
+# 测试
+pytest>=8.0
