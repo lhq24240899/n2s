@@ -22,6 +22,50 @@ from typing import Any, Optional
 _NOW_REL = re.compile(r"^now-(\d+)([dhw])$")
 _UNIT_SECONDS = {"d": 86400, "h": 3600, "w": 604800}
 
+# ---------------------------------------------------------------------------
+# 编译层：非 ASCII 字面量的方言适配
+#
+# 真机踩坑（Aiven OpenSearch 3.6.0）：PPL 里**任何中文字面量**都会 500 ——
+#   {"details": "Failed to encode '华东' in character set 'ISO-8859-1'", "type": "CalciteException"}
+# 实测换了 U&'\+534E' 转义、双引号、like()、match()、显式 charset=utf-8 请求头，全部无效：
+# 这是 PPL 引擎（Calcite）用 ISO-8859-1 编码字面量的自身限制，不是查询写错了。
+#
+# 解法与 date math 的适配同一思路：**方言差异全部消化在编译层**，IR 与语义层保持干净。
+# 索引里为需要过滤的中文字段准备了 ASCII 伴生字段（见 examples/setup_es_demo.py 的 MAPPING），
+# PPL 编译时把中文过滤改写成对编码字段的过滤；DSL 编译不受影响（ES 的 JSON 走 UTF-8，无此问题）。
+# 若字面量不在映射表里，则保持原样并由执行器给出可操作报错（不静默改语义）。
+# ---------------------------------------------------------------------------
+ASCII_CODE_FIELDS: dict[str, tuple[str, dict[str, str]]] = {
+    "region": ("region_code", {
+        "华东": "east", "华南": "south", "华北": "north",
+        "华中": "central", "西北": "northwest", "西南": "southwest",
+    }),
+    "lab_name": ("lab_code", {
+        "上海集成电路实验室": "sh_ic", "深圳可靠性实验室": "sz_rel", "北京电磁兼容实验室": "bj_emc",
+    }),
+    "business_line": ("bl_code", {
+        "集成电路测试与分析": "ic", "可靠性与环境试验": "reliability",
+        "电磁兼容检测": "emc", "计量服务": "calibration", "数据科学分析与评价": "data_science",
+    }),
+    # value 是「包含」检索提取出的关键词，用「包含关系」双向匹配文档文案
+    "message": ("msg_code", {
+        "温度超限告警": "temp_high", "通信中断异常": "comm_lost",
+        "校准偏移提醒": "calib_drift", "散热风扇转速异常": "fan_speed",
+        "设备自检正常": "self_check_ok", "例行巡检完成": "patrol_done",
+    }),
+}
+
+
+def _lookup_code(mapping: dict[str, str], value: str) -> Optional[str]:
+    """在映射表里找编码：先精确，再双向包含（应对'温度超限' vs '温度超限告警'）。"""
+    if value in mapping:
+        return mapping[value]
+    for k, code in mapping.items():
+        if value in k or k in value:
+            return code
+    return None
+
+
 
 def _abs_since(value: str, now: Optional[datetime] = None) -> str:
     """把 now-7d 这类相对时间换算成 'YYYY-MM-DD HH:MM:SS'；不是相对时间则原样返回。"""
@@ -52,20 +96,42 @@ class IRFilter:
             return {"match": {self.field: self.value}}
         raise ValueError(f"未知过滤 op: {self.op}")
 
-    def to_ppl(self) -> str:
+    def to_ppl(self, ascii_safe: bool = True) -> str:
+        return self.to_ppl_with_note(ascii_safe=ascii_safe)[0]
+
+    def to_ppl_with_note(self, ascii_safe: bool = True) -> tuple[str, Optional[str]]:
+        """编译成 PPL 片段，返回 (语句, 适配说明或 None)。"""
+        field, value, note = self._ascii_adapt(ascii_safe)
+
         if self.op == "term":
-            v = f"'{self.value}'" if isinstance(self.value, str) else self.value
-            return f"{self.field} = {v}"
+            v = f"'{value}'" if isinstance(value, str) else value
+            return f"{field} = {v}", note
         if self.op == "terms":
-            vs = ", ".join(f"'{v}'" if isinstance(v, str) else str(v) for v in self.value)
-            return f"{self.field} in ({vs})"
+            vs = ", ".join(f"'{v}'" if isinstance(v, str) else str(v) for v in value)
+            return f"{field} in ({vs})", note
         if self.op in ("gte", "lte"):
             op = ">=" if self.op == "gte" else "<="
-            v = _abs_since(self.value) if self.op in ("gte", "lte") else self.value
-            return f"{self.field} {op} '{v}'"
+            v = _abs_since(value) if isinstance(value, str) else value
+            return f"{field} {op} '{v}'", note
         if self.op == "match":
-            return f"match({self.field}, '{self.value}')"
+            # 目标已改写成 keyword 编码字段时，全文匹配语义退化为精确匹配（等价且更快）
+            if note:
+                return f"{field} = '{value}'", note
+            return f"match({field}, '{value}')", None
         raise ValueError(f"未知过滤 op: {self.op}")
+
+    def _ascii_adapt(self, ascii_safe: bool):
+        """非 ASCII 字面量 -> 改写为对编码字段的过滤（详见 ASCII_CODE_FIELDS 的说明）。"""
+        if not ascii_safe or not isinstance(self.value, str) or self.value.isascii():
+            return self.field, self.value, None
+        spec = ASCII_CODE_FIELDS.get(self.field)
+        if not spec:
+            return self.field, self.value, None
+        code_field, mapping = spec
+        code = _lookup_code(mapping, self.value)
+        if code is None:
+            return self.field, self.value, None
+        return code_field, code, f"{self.field} → {code_field}（PPL 不支持中文字面量）"
 
 
 @dataclass
@@ -154,13 +220,13 @@ class QueryIR:
 
     # ---------------- 编译目标 2：OpenSearch PPL（仅编译，不执行） ----------------
 
-    def to_ppl(self) -> str:
+    def to_ppl(self, ascii_safe: bool = True) -> str:
         err = self.validate()
         if err:
             raise ValueError(f"IR 非法: {err}")
         parts = [f"source={self.index}"]
         if self.filters:
-            conds = " and ".join(f.to_ppl() for f in self.filters)
+            conds = " and ".join(f.to_ppl(ascii_safe=ascii_safe) for f in self.filters)
             parts.append(f"where {conds}")
         stat = ", ".join(m.to_ppl() for m in self.metrics) or "count() as cnt"
         if self.group_by:
@@ -172,6 +238,22 @@ class QueryIR:
             parts.append(f"sort {arrow} {self.order_by}")
         parts.append(f"head {self.limit}")
         return " | ".join(parts)
+
+    def ppl_adaptations(self, ascii_safe: bool = True) -> list[str]:
+        """本次 PPL 编译做了哪些方言适配（给用户看，避免"PPL 语句里的字段和问题对不上"的困惑）。"""
+        notes: list[str] = []
+        if not ascii_safe:
+            return notes
+        for f in self.filters:
+            _, note = f.to_ppl_with_note(ascii_safe=True)
+            if note:
+                notes.append(note)
+        for f in self.filters:
+            if f.op in ("gte", "lte") and isinstance(f.value, str):
+                if _NOW_REL.match(f.value):
+                    notes.append("相对时间 → 绝对时间（PPL 的 where 不支持 ES date math）")
+                    break
+        return notes
 
 
 def parse_es_response(body: dict, ir: QueryIR) -> tuple[list[str], list[tuple]]:

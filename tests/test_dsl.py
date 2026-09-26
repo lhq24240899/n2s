@@ -157,3 +157,53 @@ def test_parse_global_avg_uses_aggregation():
     resp = {"aggregations": {"avg_v": {"value": 3.5}}}
     cols, rows = parse_es_response(resp, ir)
     assert rows == [(3.5,)]
+
+
+# ---------------- 编译层：非 ASCII 字面量的方言适配 ----------------
+# 真机背景：OpenSearch 的 PPL 引擎（Calcite）按 ISO-8859-1 编码字面量，中文字面量一律 500
+#   Failed to encode '华东' in character set 'ISO-8859-1'
+# 因此 PPL 编译时把中文过滤改写成对 ASCII 编码字段的过滤；DSL 侧不受影响（JSON 走 UTF-8）。
+
+def test_ppl_rewrites_chinese_literal_to_code_field():
+    ir = _ir(filters=[IRFilter("region", "term", "华东")])
+    assert "region_code = 'east'" in ir.to_ppl()
+    assert "华东" not in ir.to_ppl()
+    # 同一份 IR 的 DSL 编译保持中文原文，不做任何改写
+    assert ir.to_es_dsl()["query"]["bool"]["filter"] == [{"term": {"region": "华东"}}]
+
+
+def test_ppl_keeps_ascii_literal_untouched():
+    ir = _ir(filters=[IRFilter("level", "term", "ERROR")])
+    assert "level = 'ERROR'" in ir.to_ppl()
+    assert ir.ppl_adaptations() == []
+
+
+def test_ppl_match_on_message_becomes_code_term():
+    """「包含温度超限」在 PPL 侧改写成 msg_code 的精确匹配（keyword 字段，语义等价且更快）。"""
+    ir = _ir(filters=[IRFilter("message", "match", "温度超限")])
+    ppl = ir.to_ppl()
+    assert "msg_code = 'temp_high'" in ppl
+    assert "match(" not in ppl
+    assert any("msg_code" in n for n in ir.ppl_adaptations())
+
+
+def test_ppl_adaptations_report_both_code_and_time():
+    ir = _ir(filters=[IRFilter("region", "term", "华南"), IRFilter("ts", "gte", "now-7d")])
+    notes = ir.ppl_adaptations()
+    assert any("region_code" in n for n in notes)
+    assert any("绝对时间" in n for n in notes)
+
+
+def test_ppl_ascii_safe_false_is_an_escape_hatch():
+    """连的若是能处理中文的 PPL 实现，可关掉适配保留原始字面量。"""
+    ir = _ir(filters=[IRFilter("region", "term", "华东")])
+    assert "region = '华东'" in ir.to_ppl(ascii_safe=False)
+    assert ir.ppl_adaptations(ascii_safe=False) == []
+
+
+def test_ppl_unknown_chinese_value_is_not_silently_rewritten():
+    """映射表里没有的值不得被"猜"成别的字段 —— 宁可保持原样让执行器明确报错。"""
+    ir = _ir(filters=[IRFilter("region", "term", "新疆")])
+    ppl = ir.to_ppl()
+    assert "region = '新疆'" in ppl
+    assert ir.ppl_adaptations() == []

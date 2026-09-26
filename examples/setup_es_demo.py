@@ -44,6 +44,12 @@ MSG = {
     "WARN": ["校准偏移提醒", "散热风扇转速异常"],
     "INFO": ["设备自检正常", "例行巡检完成"],
 }
+# 文案 -> ASCII 编码（PPL 里中文字面量会 500，见 nl2sql/dsl.py 的 ASCII_CODE_FIELDS 说明）
+MSG_CODE = {
+    "温度超限告警": "temp_high", "通信中断异常": "comm_lost",
+    "校准偏移提醒": "calib_drift", "散热风扇转速异常": "fan_speed",
+    "设备自检正常": "self_check_ok", "例行巡检完成": "patrol_done",
+}
 MAPPING = {
     "settings": {"number_of_shards": 1, "number_of_replicas": 0},
     "mappings": {
@@ -55,8 +61,23 @@ MAPPING = {
             "device_id": {"type": "keyword"},
             "message": {"type": "text"},
             "ts": {"type": "date"},
+            # ---- ASCII 伴生字段（只给编译层用）----
+            # 作用：OpenSearch 的 PPL 引擎按 ISO-8859-1 编码字面量，中文字面量一律 500
+            # （Failed to encode '华东' in character set 'ISO-8859-1'）。
+            # 编译器在 PPL 档把 `region = '华东'` 改写成 `region_code = 'east'` —— 方言差异消化在编译层。
+            # 中文字段原样保留，DSL 档仍按中文过滤（ES 的 JSON 走 UTF-8，无此限制）。
+            "region_code": {"type": "keyword"},
+            "lab_code": {"type": "keyword"},
+            "bl_code": {"type": "keyword"},
+            "msg_code": {"type": "keyword"},
         }
     },
+}
+
+# 与 nl2sql/dsl.py 的 ASCII_CODE_FIELDS 对应：这里定义"文档上写什么码"
+REGION_CODE = {"华东": "east", "华南": "south", "华北": "north"}
+LAB_CODE = {
+    "上海集成电路实验室": "sh_ic", "深圳可靠性实验室": "sz_rel", "北京电磁兼容实验室": "bj_emc",
 }
 
 
@@ -74,6 +95,7 @@ def generate() -> list[dict]:
             for level, n in table[region].items():
                 for i in range(n):
                     ts = now - timedelta(hours=base_hours + (i + li) % span_hours)
+                    msg = MSG[level][i % len(MSG[level])]
                     docs.append(
                         {
                             "lab_name": lab,
@@ -81,8 +103,13 @@ def generate() -> list[dict]:
                             "business_line": bl,
                             "level": level,
                             "device_id": f"DEV-{region[:1]}{li}-{i % 12:02d}",
-                            "message": MSG[level][i % len(MSG[level])],
+                            "message": msg,
                             "ts": ts.isoformat(),
+                            # ASCII 伴生字段：PPL 档靠它们过滤（中文字面量在 PPL 上不可用）
+                            "region_code": REGION_CODE[region],
+                            "lab_code": LAB_CODE[lab],
+                            "bl_code": bl,
+                            "msg_code": MSG_CODE[msg],
                         }
                     )
     return docs

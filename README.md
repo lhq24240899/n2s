@@ -382,6 +382,16 @@ python examples/setup_es_demo.py --target both   # 设备日志 1222 条，两�
 python examples/es_eval.py                       # 双份成绩单：ES DSL x/y + PPL m/n
 ```
 
+**编译层消化方言差异（含字符集）**：这份 IR 已经吸收了三种真实的方言差异——
+① 时间：ES 的 `now-7d` date math 在 PPL 里换算成绝对时间；
+② 字符集：PPL 引擎（Calcite）按 ISO-8859-1 编码字面量，**任何中文字面量都会 500**
+（`Failed to encode '华东' in character set 'ISO-8859-1'`，换 `U&'..'`/`like`/`match`/双引号都绕不过）。
+因此索引里为需要过滤的中文字段准备了 ASCII 伴生字段（`region_code`/`lab_code`/`bl_code`/`msg_code`，见
+`examples/setup_es_demo.py` 的 `MAPPING`），PPL 编译时自动改写：`region = '华东'` → `region_code = 'east'`。
+于是**同一份 IR 编译出两种方言，DSL 用中文原文、PPL 用编码字段**，两条链路都真执行、都 100% 通过；
+页面上会把做过的适配逐条列出来，避免"PPL 语句里的字段和问题对不上"的困惑。
+DSL 档不受影响（ES 的 JSON 走 UTF-8）。
+
 注意：DSL/PPL 档是**单轮查询**，不参与多轮上下文；越界软拦截不套用（其词表按计量检测业务建，
 套到事件日志域会误杀），但密钥提取/提示词注入/PII 的**硬拦截**照常生效。
 

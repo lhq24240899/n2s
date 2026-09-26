@@ -61,12 +61,15 @@ class EsQueryEngine:
 
         ppl = ir.to_ppl()  # 编译产物：同一份 IR 也能编译成 PPL
         # PPL 双路：连 OpenSearch 时真执行；普通 ES 上 _plugins/_ppl 不存在 -> 降级为"仅编译"
-        ppl_payload: dict = {"query": ppl, "status": "compiled-only"}
+        # adaptations：编译层做过的方言适配（中文字面量→ASCII 编码字段、相对时间→绝对时间）。
+        # 透出去是为了让用户看懂"为什么 PPL 语句里的字段名和问题里的不一样"。
+        adaptations = ir.ppl_adaptations()
+        ppl_payload: dict = {"query": ppl, "status": "compiled-only", "adaptations": adaptations}
         try:
             ppl_cols, ppl_rows = self.backend.execute_ppl(ppl, ir=ir)
             ppl_payload.update(status="executed", columns=ppl_cols, rows=ppl_rows)
         except Exception as e:  # noqa: BLE001 - PPL 不可用不影响主结果
-            ppl_payload["status_detail"] = str(e)[:120]
+            ppl_payload["status_detail"] = str(e)[:200]
 
         return {
             "type": "result",
@@ -78,7 +81,8 @@ class EsQueryEngine:
             "entities": {"index": ir.index, "filters": [(f.field, f.op, f.value) for f in ir.filters]},
             "reasons": [f"IR->ES DSL 编译（{len(ir.filters)} 个过滤, "
                         f"{'按 ' + ir.group_by + ' 分组' if ir.group_by else '全局聚合'})",
-                        f"PPL: {ppl_payload['status']}"],
+                        f"PPL: {ppl_payload['status']}"]
+                       + [f"PPL 适配：{a}" for a in adaptations],
             "row_count": len(rows),
             "empty": len(rows) == 0,
         }
