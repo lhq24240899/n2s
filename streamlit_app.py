@@ -66,7 +66,10 @@ def _load_local_secrets() -> None:
             continue
     if path is None:
         return
-    raw = path.read_text(encoding="utf-8")
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return
     if not raw.strip():
         return
 
@@ -106,7 +109,11 @@ def _load_local_secrets() -> None:
         _setenv(k.upper(), v)
 
 
-_load_local_secrets()
+try:
+    _load_local_secrets()
+except Exception:  # noqa: BLE001
+    # 本地 secrets 加载绝不能影响应用启动（Cloud 上密钥走 st.secrets / 平台注入）
+    pass
 
 # ---------------------------------------------------------------------------
 # 0a) 云端部署端口绑定（必须在 import streamlit 之前设置）
@@ -290,7 +297,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-26-cloud"
+APP_BUILD = "2026-09-26-cloud.2"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -301,6 +308,17 @@ def _secrets_candidates():
         if home:
             cands.append(Path(home) / ".streamlit" / "secrets.toml")
     return cands
+
+
+def _safe_exists(p) -> bool:
+    """安全的存在性判断：某些平台目录（如 /home/aistudio）无权 stat，
+    Path.exists() 会抛 PermissionError（OSError 子类），必须兜住，否则诊断面板本身就崩。"""
+    try:
+        return bool(p.exists())
+    except OSError:
+        return False
+    except Exception:
+        return False
 
 
 def config_diag() -> str:
@@ -318,16 +336,36 @@ def config_diag() -> str:
         lines.append(f"__file__={Path(__file__).resolve()}")
     except Exception:
         lines.append("__file__=<err>")
-    # secrets 文件探测
-    found = [str(p) for p in _secrets_candidates() if p.exists()]
+    # secrets 文件探测（逐个安全判断，任一目录无权访问都不影响整体）
+    found = []
+    for p in _secrets_candidates():
+        if _safe_exists(p):
+            found.append(str(p))
     lines.append(f"secrets.toml 命中: {found if found else '无'}")
+    # 平台是否原生注入了 st.secrets（Cloud 的密钥面板走这条路）
+    try:
+        keys = sorted(str(k) for k in dict(st.secrets).keys())
+        lines.append(f"st.secrets 键: {keys if keys else '空'}")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"st.secrets 读取失败: {type(e).__name__}")
     # 环境变量状态（只显示是否存在 + 前 6 位，避免泄漏完整密钥）
-    for k in ("LLM__API_URL", "LLM__API_KEY", "LLM__BASE_URL", "LLM__MODEL", "DB__DSN"):
+    for k in ("LLM__BASE_URL", "LLM__API_KEY", "LLM__MODEL", "DB__DSN", "DB__READONLY"):
         v = os.environ.get(k)
         if v:
             lines.append(f"env[{k}] = 已注入 (前6位: {v[:6]}…)")
         else:
             lines.append(f"env[{k}] = 缺失")
+    # 最终结论：pydantic 到底能不能读到
+    try:
+        from nl2sql.config import get_settings
+
+        s = get_settings()
+        lines.append(
+            f"解析结果: llm.api_key={'有' if s.llm.api_key else '空'}, "
+            f"llm.model={s.llm.model}, db.dsn={'有' if s.db.dsn else '空'}"
+        )
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"解析失败: {type(e).__name__}: {e}")
     return "\n".join(lines)
 
 
