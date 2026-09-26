@@ -134,6 +134,10 @@ class MappedQuery:
     reasons: list[str]
     # 触发澄清的歧义同义词；上层据此在用户确认后「回到原问题」重跑
     ambiguous_synonyms: list[Synonym] = field(default_factory=list)
+    # 本轮**从上一轮继承**来的维度键（region/time/business_line/metric）。
+    # 用途：结果为空时上层可以只在"继承来的"维度上放宽重查（用户本轮明说的条件绝不动），
+    # 也能在界面上如实区分"你这次说的"和"沿用上一轮的"。
+    inherited_dimensions: list[str] = field(default_factory=list)
 
 
 class SemanticLayer:

@@ -125,3 +125,35 @@ def test_switching_engine_shows_that_engines_own_history(fake_sql_engine):
 
     assert at.session_state["turns_by_engine"]["es"] == []
     assert len(_samples(at)) == 3, "ES 档是它自己的新对话，应展示示例"
+
+
+def test_context_fallback_is_disclosed_in_the_ui(monkeypatch):
+    """空结果回退必须在界面上讲清楚（否则用户会以为口径被悄悄改了）。"""
+    from examples.grg_engine import GRGQueryEngine
+
+    def fake_ask(self, question, *a, **kw):
+        return {
+            "type": "result",
+            "mapped": types.SimpleNamespace(
+                metric=None, reasons=["空结果回退: 不使用上一轮继承的过滤维度（区域/业务线/时间）"],
+                entities={"business_line": "emc"}, normalized=question,
+                inherited_dimensions=["metric"],
+            ),
+            "result": GenerationResult(sql="SELECT 0.75 AS on_time_rate", raw="s",
+                                       source=ResultSource.LLM),
+            "cols": ["on_time_rate"],
+            "rows": [(0.75,)],
+            "row_count": 1,
+            "empty": False,
+            "context_fallback": {"dropped": ["region", "time"], "normalized": question},
+        }
+
+    monkeypatch.setattr(GRGQueryEngine, "ask", fake_ask)
+    at = AppTest.from_file(str(ENTRY), default_timeout=120)
+    at.run()
+    at.button(key="sample_sql_0").click().run()
+
+    assert not at.exception, [e.value for e in at.exception]
+    warnings = " ".join(w.value for w in at.warning)
+    assert "已忽略这些继承维度重新查询" in warnings
+    assert "区域" in warnings and "时间" in warnings      # 维度用中文讲清楚，不暴露内部键名

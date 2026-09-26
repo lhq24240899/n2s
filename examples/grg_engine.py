@@ -27,6 +27,8 @@ LLM 与 DB 均为真实实现（由 build_llm / build_db 注入）：
 """
 from __future__ import annotations
 
+from typing import Optional
+
 from nl2sql.context import QueryContext
 from nl2sql.kb import answer_with_docs, build_sql_doc_block
 from nl2sql.pipeline import Text2SQLPipeline
@@ -244,6 +246,41 @@ class GRGQueryEngine:
                 "mapped": merged,
             }
 
+        # 空结果回退：结果是空的、且本轮带入了"上一轮继承"的过滤维度时，
+        # 忽略这些继承维度再查一次。只在**继承来的**维度上放宽，用户本轮明说的条件绝不动。
+        # 真机场景（用户报的 bug）：先问「华东区…准时率」，再问「EMC 检测的准时率是多少」——
+        # EMC 的报告全在北京（华北），被继承来的「区域=华东」一过滤就为空，
+        # 页面显示"无匹配数据"，用户以为系统算错了。
+        context_fallback: Optional[dict] = None
+        if self._is_empty_result(rows) and merged.inherited_dimensions:
+            relaxed = self.context.inherit(mapped, inherit_filters=False)
+            if relaxed.entities != merged.entities:
+                # ⚠️ 必须重建 Glossary：口径注入会把实体渲染成「必须使用 labs.region = '华东'」
+                # 这类**硬约束**塞进提示词。不重建的话，即使问题文本已经放宽，
+                # LLM 仍会照着上一轮的口径把区域过滤写回 SQL —— 重查照样为空，回退形同虚设
+                # （真机实测：第一版就踩了这个，回退静默失效）。
+                relaxed_glossary = self.layer.glossary_for(
+                    relaxed.metric.id if relaxed.metric else None, relaxed.entities
+                )
+                runner.glossary = relaxed_glossary
+                try:
+                    res2, cols2, rows2 = runner.query(relaxed.normalized)
+                except (PolicyViolation, PermissionError):
+                    runner.glossary = glossary     # 权限问题照旧上抛，不被回退吞掉
+                    raise
+                except Exception:  # noqa: BLE001 - 回退失败就保留原结果，不掩盖真实错误
+                    runner.glossary = glossary
+                else:
+                    if not self._is_empty_result(rows2):
+                        context_fallback = {
+                            "dropped": [d for d in merged.inherited_dimensions if d != "metric"],
+                            "normalized": relaxed.normalized,
+                        }
+                        res, cols, rows, merged = res2, cols2, rows2, relaxed
+                        glossary = relaxed_glossary      # 返回的口径说明也要与结果一致
+                    else:
+                        runner.glossary = glossary       # 放宽后仍为空：恢复原口径，保留原结果
+
         # 更新上下文，供下一轮继承
         self.context.update_from(merged)
 
@@ -255,4 +292,12 @@ class GRGQueryEngine:
             "rows": rows,
             "glossary": glossary,
             "docs": docs,
+            "context_fallback": context_fallback,
         }
+
+    @staticmethod
+    def _is_empty_result(rows) -> bool:
+        """空结果 = 没有行，或所有格子都是 NULL（单值查询取不到时是 [(None,)]）。"""
+        if not rows:
+            return True
+        return all(v is None for r in rows for v in r)

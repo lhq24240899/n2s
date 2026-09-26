@@ -29,8 +29,13 @@ class QueryContext:
     time: Optional[str] = None
     dimensions: list[str] = field(default_factory=list)
 
-    def inherit(self, mapped: MappedQuery) -> MappedQuery:
-        """把上一轮上下文回填到本轮缺失的实体，返回补全后的 MappedQuery。"""
+    def inherit(self, mapped: MappedQuery, *, inherit_filters: bool = True) -> MappedQuery:
+        """把上一轮上下文回填到本轮缺失的实体，返回补全后的 MappedQuery。
+
+        inherit_filters=False：**只继承指标**，不继承 region/business_line/time 这些过滤维度。
+        这是给「空结果回退」用的（见 GRGQueryEngine._answer）：若继承来的过滤条件把结果筛空了，
+        可以忽略它们重查一次——指标这类"问题类型"信息仍然沿用，语义不会跑偏。
+        """
         ents = dict(mapped.entities)
         metric = mapped.metric or self.metric
 
@@ -38,21 +43,22 @@ class QueryContext:
         # 例：上一轮问「华东区可靠性…」，本轮问「各业务线的准时率」，
         # 若沿用 business_line=reliability 就只剩一个数值（实测 bug）。
         group_by = ents.get("group_by")
-        skip = {group_by} if group_by else set()
+        skip = {group_by} if group_by else set() if inherit_filters else None
 
         inherited_keys: list[str] = []
         if self.metric is not None and "metric" not in ents:
             ents["metric"] = self.metric.id
             inherited_keys.append("metric")
-        if self.business_line is not None and "business_line" not in ents and "business_line" not in skip:
-            ents["business_line"] = self.business_line
-            inherited_keys.append("business_line")
-        if self.region is not None and "region" not in ents and "region" not in skip:
-            ents["region"] = self.region
-            inherited_keys.append("region")
-        if self.time is not None and "time" not in ents and "time" not in skip:
-            ents["time"] = self.time
-            inherited_keys.append("time")
+        if inherit_filters:
+            if self.business_line is not None and "business_line" not in ents and "business_line" not in skip:
+                ents["business_line"] = self.business_line
+                inherited_keys.append("business_line")
+            if self.region is not None and "region" not in ents and "region" not in skip:
+                ents["region"] = self.region
+                inherited_keys.append("region")
+            if self.time is not None and "time" not in ents and "time" not in skip:
+                ents["time"] = self.time
+                inherited_keys.append("time")
 
         # 重新拼出归一化问题，让继承的维度进入检索/生成
         extra: list[str] = []
@@ -65,7 +71,9 @@ class QueryContext:
             normalized = f"{normalized} {' '.join(extra)}"
 
         reasons = list(mapped.reasons)
-        if inherited_keys:
+        if not inherit_filters:
+            reasons.append("空结果回退: 不使用上一轮继承的过滤维度（区域/业务线/时间）")
+        elif inherited_keys:
             reasons.append(f"上下文继承: 补齐缺失维度 {inherited_keys}")
         if group_by:
             reasons.append(f"分组优先: 已忽略继承的「{group_by}」过滤（本轮要按它分组）")
@@ -79,6 +87,7 @@ class QueryContext:
             clarification=mapped.clarification,
             reasons=reasons,
             ambiguous_synonyms=mapped.ambiguous_synonyms,
+            inherited_dimensions=inherited_keys,
         )
 
     def update_from(self, mapped: MappedQuery) -> None:

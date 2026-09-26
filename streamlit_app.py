@@ -505,7 +505,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-26-inline-samples"
+APP_BUILD = "2026-09-26-empty-fallback"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -716,6 +716,18 @@ def render_doc_sources(docs: list) -> None:
                 st.caption("　检索依据：" + d.reasons[0])
 
 
+# 维度中文名：用于把"继承了哪些上一轮条件"讲清楚
+DIM_LABEL = {"region": "区域", "time": "时间", "business_line": "业务线", "metric": "指标",
+             "group_by": "分组"}
+
+
+def entities_text(entities: dict) -> str:
+    """把本轮实际生效的过滤维度渲染成人话（指标/意图类不进这个列表）。"""
+    parts = [f"{DIM_LABEL.get(k, k)}={v}" for k, v in (entities or {}).items()
+             if k not in ("metric", "count", "topn", "group_by")]
+    return "、".join(parts) or "（无）"
+
+
 def render_answer(out: dict) -> None:
     # 安全护栏拒绝：明确告知，不进入任何生成 / 检索
     if out.get("type") == "refused":
@@ -738,6 +750,15 @@ def render_answer(out: dict) -> None:
 
     st.caption(SOURCE_LABEL.get(res.source.value, res.source.value))
 
+    # 空结果回退提示：上一轮继承的过滤条件把结果筛空了，已忽略它们重查
+    _fb = out.get("context_fallback")
+    if _fb:
+        _dims = "、".join(DIM_LABEL.get(d, d) for d in _fb.get("dropped", [])) or "（无）"
+        st.warning(
+            f"⚠️ 按上一轮继承的「{_dims}」查不到数据，**已忽略这些继承维度重新查询**"
+            f"（你本轮明确说出的条件仍然生效）。下方是放宽后的结果。"
+        )
+
     # 空结果判定：无行 或 全部为 NULL
     is_empty = (not rows) or all(v is None for r in rows for v in r)
 
@@ -745,10 +766,18 @@ def render_answer(out: dict) -> None:
     if rows and len(rows) == 1 and len(rows[0]) == 1:
         label = mapped.metric.name if mapped.metric else (cols[0] if cols else "结果")
         if rows[0][0] is None:
-            st.warning(
-                "查询已执行成功，但**无匹配数据**：过滤条件与库内取值可能不一致"
-                "（如区域/业务线的写法）。可换个说法，或确认维度取值后重试。"
-            )
+            _ents = getattr(mapped, "entities", {}) or {}
+            _inherited = list(getattr(mapped, "inherited_dimensions", []) or [])
+            _msg = f"查询已执行成功，但**无匹配数据**。本轮过滤条件：{entities_text(_ents)}。"
+            _inh_filters = [d for d in _inherited if d != "metric"]
+            if _inh_filters:
+                _names = "、".join(DIM_LABEL.get(d, d) for d in _inh_filters)
+                _msg += (f"\n\n其中「{_names}」来自上一轮对话（多轮继承）。"
+                         "若这几个条件把结果筛空了，可点侧边栏「🧹 清空当前引擎的对话」后重新提问，"
+                         "或直接在问题里说明口径（例如「不限区域」）。")
+            else:
+                _msg += "\n\n可能是维度取值写法不一致（如区域/业务线的叫法），可换个说法重试。"
+            st.warning(_msg)
         else:
             st.metric(label=label, value=_fmt(rows[0][0]))
     elif rows:
