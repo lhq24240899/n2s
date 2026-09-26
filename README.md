@@ -359,6 +359,10 @@ streamlit run streamlit_app.py
 三档**共用同一套 IR/语义层与安全护栏**——换引擎不换安全等级（ES 路径同样先过 `SafetyGuard` 硬拦截）。
 页面会把**实际下发的 DSL 与 PPL 两条语句**都列出来对照，方便看清楚"同一份中间表示如何编译成两种方言"。
 
+侧边栏「🔌 数据源自检」也**随档位切换**（`datasource_selfcheck(mode)`）：SQL 档给库/方言 + 核心表行数，
+DSL/PPL 档给集群版本 + 索引文档数 + level/region 分布；PPL 档再多一条「PPL 真执行」——
+它真跑一条 `stats count()`，用来区分"OpenSearch 端点可用"和"回退到普通 ES 的仅编译降级"。
+
 配置（`.env` 或 Streamlit Secrets，键名一致）：
 
 ```bash

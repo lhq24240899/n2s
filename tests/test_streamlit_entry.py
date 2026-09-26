@@ -172,3 +172,143 @@ def test_sql_target_info_handles_missing_dsn(monkeypatch):
     fake2 = types.SimpleNamespace(db=types.SimpleNamespace(dsn="postgresql://u:p@h/db", dialect="mysql"))
     info = g["sql_target_info"](fake2)
     assert "`h`" in info and "`db`" in info and "mysql" in info
+
+
+# ---------------- 数据源自检随档位切换 ----------------
+# 三档连的是三套不同的数据源，自检必须跟着走：SQL 查表行数、DSL 查 ES 集群+索引、
+# PPL 再额外真跑一条 PPL（这条才能区分"端点可用"和"仅编译降级"）。
+
+class _FakeEsBackend:
+    """假 ES/OpenSearch 后端：只实现自检用到的只读方法。"""
+
+    def __init__(self, version="9.3.2", total=1222, ppl_ok=True, ping_ok=True):
+        self.version, self.total, self.ppl_ok, self.ping_ok = version, total, ppl_ok, ping_ok
+        self.host = "es.example:9200"
+        self.searched: list = []
+        self.ppl_queries: list = []
+
+    def ping(self):
+        return (True, self.version) if self.ping_ok else (False, "connection refused")
+
+    def search(self, index, body):
+        self.searched.append((index, body))
+        return {
+            "hits": {"total": {"value": self.total}},
+            "aggregations": {
+                "level": {"buckets": [{"key": "ERROR", "doc_count": 137}]},
+                "region": {"buckets": [{"key": "华东", "doc_count": 510}]},
+            },
+        }
+
+    def execute_ppl(self, query, ir=None):
+        self.ppl_queries.append(query)
+        if not self.ppl_ok:
+            raise RuntimeError("OpenSearch PPL not available")
+        return ["cnt"], [(self.total,)]
+
+
+def _fake_settings(index="device_events", ppl_index=""):
+    es = types.SimpleNamespace(enabled=True, host="http://es.example:9200", user="elastic",
+                               password="pw", index=index, timeout=15.0,
+                               ppl_enabled=True, ppl_host="https://os.example:26380",
+                               ppl_user="admin", ppl_password="pw", ppl_index=ppl_index,
+                               ppl_timeout=30.0)
+    # llm/db 也要给全：入口顶部的 config_status()/config_diag() 会读它们
+    return types.SimpleNamespace(
+        es=es,
+        db=types.SimpleNamespace(dsn="postgresql://u:p@db.example:5432/appdb", dialect="postgres"),
+        llm=types.SimpleNamespace(api_key="sk-test", model="gpt-4o-mini"),
+    )
+
+
+def _patch_es(monkeypatch, backend):
+    monkeypatch.setattr("nl2sql.config.get_settings", lambda: _fake_settings())
+    monkeypatch.setattr("nl2sql.es_backend.build_es_backend",
+                        lambda settings, mode="es": backend)
+
+
+def test_selfcheck_sql_mode_lists_table_row_counts(monkeypatch):
+    """SQL 档：给出库信息 + 关键表行数。"""
+    monkeypatch.setenv("DB__DSN", "postgresql://u:p@db.example:5432/appdb")
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[0])
+    g["get_engine"] = lambda: types.SimpleNamespace(
+        pipeline=types.SimpleNamespace(db=types.SimpleNamespace(
+            execute=lambda sql: ([], [(7,)]))))
+
+    target, items = g["datasource_selfcheck"]("sql")
+    assert "db.example:5432" in target and "appdb" in target
+    assert set(items) == set(g["SELFCHECK_TABLES"])
+    assert all(v == 7 for v in items.values())
+
+
+def test_selfcheck_es_mode_checks_cluster_index_and_distribution(monkeypatch):
+    """DSL 档：集群版本 + 文档数 + 字段分布，且不跑 PPL。"""
+    backend = _FakeEsBackend(version="9.3.2")
+    _patch_es(monkeypatch, backend)
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[1])
+
+    target, items = g["datasource_selfcheck"]("es")
+    assert "es.example:9200" in target and "device_events" in target
+    assert "9.3.2" in items["集群连通"]
+    assert items["索引 device_events 文档数"] == 1222
+    assert "ERROR 137" in items["级别分布"]
+    assert "华东 510" in items["区域分布"]
+    # DSL 档不做 PPL 探测
+    assert backend.ppl_queries == []
+    assert "PPL 真执行" not in items
+
+
+def test_selfcheck_ppl_mode_actually_runs_a_ppl_query(monkeypatch):
+    """PPL 档：比 DSL 档多一条「PPL 真执行」——这才是真能执行的证据。"""
+    backend = _FakeEsBackend(version="3.6.0")
+    _patch_es(monkeypatch, backend)
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[2])
+
+    _, items = g["datasource_selfcheck"]("ppl")
+    assert "3.6.0" in items["集群连通"]
+    assert items["PPL 真执行"].startswith("✅")
+    assert "1222" in items["PPL 真执行"]
+    assert backend.ppl_queries == ["source=device_events | stats count() as cnt"]
+
+
+def test_selfcheck_ppl_mode_degrades_when_ppl_endpoint_missing(monkeypatch):
+    """回退到普通 ES（无 _plugins/_ppl）时：PPL 标为不可用，但集群/索引信息照常给出。"""
+    backend = _FakeEsBackend(ppl_ok=False)
+    _patch_es(monkeypatch, backend)
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[2])
+
+    _, items = g["datasource_selfcheck"]("ppl")
+    assert items["PPL 真执行"].startswith("❌")
+    assert items["索引 device_events 文档数"] == 1222   # 其余检查不受影响
+
+
+def test_selfcheck_es_mode_without_config_reports_instead_of_raising(monkeypatch):
+    """未配置 ES 时自检要给出可读原因，而不是抛异常。"""
+    monkeypatch.setattr("nl2sql.config.get_settings", lambda: _fake_settings())
+    monkeypatch.setattr("nl2sql.es_backend.build_es_backend",
+                        lambda settings, mode="es": None)
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[1])
+
+    _, items = g["datasource_selfcheck"]("es")
+    assert "未启用" in items["配置"]
+
+
+def test_selfcheck_es_mode_stops_after_ping_failure(monkeypatch):
+    """集群连不上时：只报连通性，不再继续查索引（避免二次超时/噪音报错）。"""
+    backend = _FakeEsBackend(ping_ok=False)
+    _patch_es(monkeypatch, backend)
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[1])
+
+    _, items = g["datasource_selfcheck"]("es")
+    assert items["集群连通"].startswith("❌")
+    assert len(items) == 1
+    assert backend.searched == []
+
+
+def test_datasource_caption_exists_for_every_engine_mode(monkeypatch):
+    """侧边栏底部的「数据源」说明必须覆盖每一档（否则切档就 KeyError）。"""
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[0])
+    assert set(g["DATASOURCE_CAPTION"]) == set(g["ALL_ENGINE_MODES"])
+    assert "PostgreSQL" in g["DATASOURCE_CAPTION"]["sql"]
+    assert "Elasticsearch" in g["DATASOURCE_CAPTION"]["es"]
+    assert "OpenSearch" in g["DATASOURCE_CAPTION"]["ppl"]

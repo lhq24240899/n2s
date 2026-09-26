@@ -484,7 +484,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-26-clean-examples"
+APP_BUILD = "2026-09-26-selfcheck-per-engine"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -565,24 +565,98 @@ SELFCHECK_TABLES = [
     "test_records",
 ]
 
+# ES / PPL 档的字段分布：对应 SQL 档的「关键表行数」，
+# 用来回答"App 连的到底是哪个索引、里面有没有数据、数据长什么样"。
+SELFCHECK_ES_FIELDS = [("level", "级别"), ("region", "区域")]
 
-def datasource_selfcheck() -> tuple[str, dict]:
-    """自检：当前 App 实际连的是哪台库、关键表有没有数据。
+# 侧边栏底部"数据源"说明：随档位切换（三档连的是三套不同的数据源）
+DATASOURCE_CAPTION = {
+    "sql": "数据源：Neon PostgreSQL（需先用 setup_dev_db.py 建表灌数）",
+    "es": "数据源：Elasticsearch 索引 device_events（用 setup_es_demo.py --target es 灌数）",
+    "ppl": "数据源：OpenSearch 索引 device_events（用 setup_es_demo.py --target ppl 灌数）",
+}
+
+
+def _selfcheck_sql() -> tuple[str, dict]:
+    """SQL 档自检：App 实连的是哪台库、关键表有没有数据。
 
     很多「查不到数据」其实是 App 连到了另一个空库，或种子数据没灌进去。
     """
+    from nl2sql.config import get_settings
+
     engine = get_engine()
     db = engine.pipeline.db
-    dsn = getattr(db, "dsn", "") or ""
-    host = dsn.split("@")[-1].split("/")[0] if "@" in dsn else "(未知)"
-    counts: dict = {}
+    items: dict = {}
     for t in SELFCHECK_TABLES:
         try:
             _, rows = db.execute(f"SELECT COUNT(*) FROM {t}")
-            counts[t] = rows[0][0]
+            items[t] = rows[0][0]
         except Exception as e:  # noqa: BLE001
-            counts[t] = f"ERROR: {e}"
-    return host, counts
+            items[t] = f"ERROR: {e}"
+    try:
+        target = sql_target_info(get_settings())
+    except Exception as e:  # noqa: BLE001
+        target = f"(目标解析失败：{type(e).__name__})"
+    return target, items
+
+
+def _selfcheck_es(mode: str) -> tuple[str, dict]:
+    """DSL / PPL 档自检：集群连通 → 索引文档数 → 字段分布（PPL 档再真跑一条 PPL）。
+
+    和 SQL 档一样是"先证明数据源对、且里面有数据"，只是换成了 ES/OpenSearch 的说法：
+    集群版本、索引存在与否、文档总数、level/region 分布。
+    PPL 档额外真跑一条 `stats count()` —— 这条能直接区分"端点可用"与"仅编译降级"。
+    """
+    from nl2sql.config import get_settings
+    from nl2sql.es_backend import build_es_backend, resolve_index
+
+    settings = get_settings()
+    target = es_backend_info(settings, mode)
+    backend = build_es_backend(settings, mode=mode)
+    if backend is None:
+        return target, {"配置": "未启用（缺 ES__ENABLED / ES__HOST / ES__PPL_HOST）"}
+
+    index = resolve_index(settings, mode)
+    items: dict = {}
+    ok, info = backend.ping()
+    if not ok:
+        items["集群连通"] = f"❌ 失败：{info}"
+        return target, items
+    items["集群连通"] = f"✅ 正常（版本 {info}）"
+
+    try:
+        body: dict = {"size": 0, "track_total_hits": True,
+                      "aggs": {f: {"terms": {"field": f, "size": 10}} for f, _ in SELFCHECK_ES_FIELDS}}
+        resp = backend.search(index, body)
+        total = (resp.get("hits") or {}).get("total")
+        items[f"索引 {index} 文档数"] = total.get("value") if isinstance(total, dict) else total
+        aggs = resp.get("aggregations") or {}
+        for field, label in SELFCHECK_ES_FIELDS:
+            buckets = (aggs.get(field) or {}).get("buckets") or []
+            items[f"{label}分布"] = "；".join(f"{b['key']} {b['doc_count']}" for b in buckets) or "（空）"
+    except Exception as e:  # noqa: BLE001
+        items["索引统计"] = f"ERROR: {str(e)[:150]}"
+
+    if mode == "ppl":
+        # 真跑一条 PPL：这一步才是"PPL 档真的能执行"的证据（否则只是编译产物）
+        try:
+            _, rows = backend.execute_ppl(f"source={index} | stats count() as cnt")
+            items["PPL 真执行"] = f"✅ 可用（stats count() = {rows[0][0] if rows and rows[0] else '?'}）"
+        except Exception as e:  # noqa: BLE001
+            items["PPL 真执行"] = f"❌ 不可用：{str(e)[:150]}"
+    return target, items
+
+
+def datasource_selfcheck(mode: str = "sql") -> tuple[str, dict]:
+    """自检当前档位真正连的数据源（随 SQL / DSL / PPL 切换而变）。
+
+    - sql：PostgreSQL —— 库/方言 + 关键表行数
+    - es ：Elasticsearch —— 集群版本 + 索引文档数 + 字段分布
+    - ppl：OpenSearch —— 同上，并真跑一条 PPL 验证执行链路
+    """
+    if mode == "sql":
+        return _selfcheck_sql()
+    return _selfcheck_es(mode)
 
 
 # ---------------------------------------------------------------------------
@@ -678,7 +752,7 @@ def render_answer(out: dict) -> None:
         st.code(res.sql, language="sql")
         st.caption(f"本轮识别实体：`{mapped.entities}`")
         try:
-            _host, counts = datasource_selfcheck()
+            _host, counts = datasource_selfcheck("sql")
             st.caption(
                 "当前库核心表行数：" + " · ".join(f"{k} {v}" for k, v in counts.items())
             )
@@ -768,17 +842,18 @@ with st.sidebar:
         st.rerun()
 
     st.divider()
-    if st.button("🔌 数据源自检"):
+    # 自检随当前档位走：查的是该引擎真正连的数据源（库 / ES 集群 / OpenSearch 集群）
+    if st.button(f"🔌 数据源自检（{ENGINE_MODE.upper()} 档）"):
         st.session_state.do_selfcheck = True
     if st.session_state.pop("do_selfcheck", False):
         try:
-            host, counts = datasource_selfcheck()
-            st.caption(f"当前连接：`{host}`")
-            st.dataframe({"表": list(counts), "行数": [str(v) for v in counts.values()]})
+            target, items = datasource_selfcheck(ENGINE_MODE)
+            st.caption(f"当前连接：{target}")
+            st.dataframe({"检查项": list(items), "结果": [str(v) for v in items.values()]})
         except Exception as e:  # noqa: BLE001
             st.error(f"自检失败：{e}")
 
-    st.caption("数据源：Neon PostgreSQL（需先用 setup_dev_db.py 建表灌数）")
+    st.caption(DATASOURCE_CAPTION[ENGINE_MODE])
 
 # 渲染历史：只渲染当前引擎自己的对话（历史按引擎隔离）
 for t in _engine_turns(ENGINE_MODE):
