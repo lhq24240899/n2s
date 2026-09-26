@@ -165,6 +165,8 @@ class QueryIR:
     order_by: Optional[str] = None            # 指标名或分组字段
     order_dir: str = "desc"
     limit: int = 20
+    # 多轮继承等编译层说明（只用于展示/审计，不参与编译结果）
+    context_notes: list[str] = field(default_factory=list)
 
     # ---------------- 校验（IR 层自检，编译前拦截） ----------------
 

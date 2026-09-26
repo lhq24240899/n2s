@@ -369,6 +369,9 @@ def render_es_answer(out: dict, mode: str, elapsed_ms: float) -> None:
     if out.get("entities"):
         ent = out["entities"]
         st.caption(f"IR 解析：索引 `{ent.get('index')}`，过滤条件 {ent.get('filters')}")
+    # 编译/多轮说明（上下文继承、维度替换、PPL 方言适配等）
+    for r in out.get("reasons") or []:
+        st.caption(f"· {r}")
 
 
 # ---------------------------------------------------------------------------
@@ -455,7 +458,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-26-ppl-ascii-adapt.2"
+APP_BUILD = "2026-09-26-es-multiturn"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -715,7 +718,7 @@ with st.sidebar:
             )
         else:
             st.caption(f"目标：{es_backend_info(_s, ENGINE_MODE)}")
-        st.caption("⚠️ 该模式为单轮查询，不参与多轮上下文；安全护栏同样生效。")
+        st.caption("🔁 支持多轮追问：如先问「华东区最近7天的ERROR告警数量」，再问「那华南区呢？」（只换区域，级别/时间沿用）；安全护栏同样生效。")
 
     st.divider()
     st.subheader("💡 示例问题")
@@ -734,6 +737,12 @@ with st.sidebar:
         st.session_state.turns = []
         if "engine" in st.session_state:
             st.session_state.engine.reset_context()
+        # ES / PPL 引擎各自持有会话上下文，也要一起清（否则切档后追问会继承旧维度）
+        for _k in list(st.session_state.keys()):
+            if str(_k).startswith("es_engine_"):
+                _e = st.session_state.get(_k)
+                if _e is not None:
+                    _e.reset_context()
         st.rerun()
 
     st.divider()

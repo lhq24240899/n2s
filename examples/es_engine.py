@@ -34,6 +34,94 @@ TIME_PATTERNS = [
     (re.compile(r"(最近|近)30 ?天|上个月|上月"), "now-30d"),
 ]
 
+# 追问信号：只有这类问句才继承上一轮的维度。
+# 为什么不像 SQL 路径那样"每轮都继承"？ES 域的问句短且自成一体
+# （「各区域最近7天的ERROR告警数量」），而网页上用户会随手点侧边栏示例问题——
+# 若无条件继承，刚问完「华东区…」再点「最近7天各级别有多少条日志」就会莫名带上 region=华东。
+_FOLLOWUP_RE = re.compile(
+    r"(^|[，,。！!\s])(那|那么|还有|再|另外|换(成|个)?|改(成|为))|呢[？?]?\s*$"
+)
+
+# 极短且只提到一个维度的问句（如「华南区」「最近30天」）也视为追问
+_DIM_WORDS = tuple(REGIONS) + tuple(LEVEL_WORDS) + ("天", "周", "月", "区域", "实验室", "级别")
+
+
+def is_follow_up(question: str) -> bool:
+    """判断是否属于「追问」（决定要不要继承上一轮维度）。"""
+    q = (question or "").strip()
+    if not q:
+        return False
+    if _FOLLOWUP_RE.search(q):
+        return True
+    # 去掉标点后很短、且只含有维度词 -> 例如「华南区」「那华北呢」「最近30天」
+    core = re.sub(r"[，,。！!？?\s]", "", q)
+    return len(core) <= 6 and any(w in core for w in _DIM_WORDS)
+
+
+class EsContext:
+    """ES/PPL 路径的多轮上下文（与 SQL 路径的 nl2sql/context.py::QueryContext 同构）。
+
+    规则（和 SQL 侧保持一致，别自创一套）：
+      - **本轮显式说了的维度覆盖上一轮** —— 所以「那华南区呢」= 只换区域，级别/时间沿用；
+      - 本轮没说、上一轮说过的维度**补齐**；
+      - **本轮要分组的维度不作为过滤条件继承** —— 例：上一轮「华东区最近7天…」，
+        本轮「各区域最近7天…」，若仍继承 region=华东 就只剩一行（SQL 侧实测踩过同一个坑）；
+      - scope_filters（行级权限）**不进入上下文**：它是每轮都要重新施加的安全约束，
+        不能当作用户说过的维度被继承下去。
+    """
+
+    LABELS = {
+        "level": "级别", "region": "区域", "ts": "时间窗口", "message": "关键词",
+        "lab_name": "实验室", "business_line": "业务线", "device_id": "设备",
+    }
+
+    def __init__(self) -> None:
+        self.dims: dict[str, tuple[str, Any]] = {}   # field -> (op, value)
+        self.group_by: Optional[str] = None
+
+    # ---- 内部 ----
+
+    @staticmethod
+    def _index(filters: list[IRFilter]) -> dict[str, tuple[str, Any]]:
+        return {f.field: (f.op, f.value) for f in filters}
+
+    def _label(self, field: str) -> str:
+        return self.LABELS.get(field, field)
+
+    # ---- 对外 ----
+
+    def inherit(
+        self, filters: list[IRFilter], group_by: Optional[str]
+    ) -> tuple[list[IRFilter], Optional[str], list[str]]:
+        """补齐本轮缺失的维度，返回 (合并后的过滤, 分组, 说明)。"""
+        prev = dict(self.dims)
+        present = self._index(filters)
+        notes: list[str] = []
+
+        for field, (_, value) in present.items():
+            if field in prev and prev[field][1] != value:
+                notes.append(f"维度替换：{self._label(field)} {prev[field][1]} → {value}")
+
+        merged = dict(prev)
+        merged.update(present)          # 本轮显式值覆盖上一轮
+        if group_by:
+            merged.pop(group_by, None)  # 分组优先：本轮按它分组，就不再当过滤条件继承
+
+        inherited = [f for f in merged if f not in present]
+        if inherited:
+            notes.append(f"上下文继承：补齐缺失维度 {[self._label(f) for f in inherited]}")
+
+        return [IRFilter(f, op, v) for f, (op, v) in merged.items()], group_by, notes
+
+    def remember(self, filters: list[IRFilter], group_by: Optional[str]) -> None:
+        """记录本轮最终维度，供下一轮继承（链式追问：华东 → 那华南呢 → 那最近30天呢）。"""
+        self.dims = self._index(filters)
+        self.group_by = group_by
+
+    def reset(self) -> None:
+        self.dims = {}
+        self.group_by = None
+
 
 class EsQueryEngine:
     """事件流水问数引擎（ES 后端）。ask() 返回与 SQL 引擎同构的 payload。"""
@@ -41,6 +129,8 @@ class EsQueryEngine:
     def __init__(self, backend, index: str = "device_events"):
         self.backend = backend
         self.index = index
+        # 多轮上下文：与 SQL 路径的 QueryContext 同构（见 EsContext 的说明）
+        self._ctx = EsContext()
 
     # ---------------- 对外 ----------------
 
@@ -48,8 +138,20 @@ class EsQueryEngine:
         """scope_filters：数据权限注入点（与 SQL 路径的 PolicyGuard 同源）。
 
         换执行引擎不能换安全等级——行级权限在 ES 路径同样以过滤条件生效。
+        多轮：只有「追问」才继承上一轮维度（见 `is_follow_up`），
+        全新问题不继承，避免点几个示例问题就串味。
         """
-        ir = self.build_ir(question, scope_filters=scope_filters)
+        parsed, group_by, order_by, order_dir, limit = self._parse(question)
+        notes: list[str] = []
+        if is_follow_up(question):
+            parsed, group_by, notes = self._ctx.inherit(parsed, group_by)
+        elif self._ctx.dims:
+            notes = ["新问题：不继承上一轮的维度上下文"]
+        # 无论是否继承，都用「本轮最终的维度」覆盖上下文，保证链式追问（华东→那华南呢→那最近30天呢）
+        self._ctx.remember(parsed, group_by)
+
+        ir = self._assemble(parsed, group_by, order_by, order_dir, limit,
+                            scope_filters=scope_filters, notes=notes)
         err = ir.validate()
         if err:
             return {"type": "clarification", "message": f"未能理解该日志类问题：{err}", "engine": "es"}
@@ -82,10 +184,15 @@ class EsQueryEngine:
             "reasons": [f"IR->ES DSL 编译（{len(ir.filters)} 个过滤, "
                         f"{'按 ' + ir.group_by + ' 分组' if ir.group_by else '全局聚合'})",
                         f"PPL: {ppl_payload['status']}"]
-                       + [f"PPL 适配：{a}" for a in adaptations],
+                       + [f"PPL 适配：{a}" for a in adaptations]
+                       + [f"多轮：{n}" for n in ir.context_notes],
             "row_count": len(rows),
             "empty": len(rows) == 0,
         }
+
+    def reset_context(self) -> None:
+        """清空多轮上下文（与 SQL 引擎同名方法，供"清空对话"按钮统一调用）。"""
+        self._ctx.reset()
 
     def is_es_domain(self, question: str) -> bool:
         """是否属于事件流水域（决定路由到 ES 还是 SQL）。"""
@@ -93,13 +200,9 @@ class EsQueryEngine:
 
     # ---------------- 问题 -> IR（确定性规则，不靠 LLM） ----------------
 
-    def build_ir(
-        self,
-        question: str,
-        scope_filters: Optional[list[IRFilter]] = None,
-    ) -> QueryIR:
-        # 行级权限过滤放最前：它是安全约束，不能被后续规则挤掉
-        filters: list[IRFilter] = list(scope_filters or [])
+    def _parse(self, question: str) -> tuple[list[IRFilter], Optional[str], Optional[str], str, int]:
+        """问题 -> (过滤条件, 分组字段, 排序字段, 排序方向, 条数)。纯函数，不碰上下文。"""
+        filters: list[IRFilter] = []
 
         # 1) 级别：告警/异常 -> ERROR；警告 -> WARN（未提及则不过滤）
         for word, level in LEVEL_WORDS.items():
@@ -132,7 +235,6 @@ class EsQueryEngine:
                 break
 
         # 6) 指标：日志域默认计数
-        metrics = [IRMetric("cnt", "count")]
         if group_by is None and any(w in question for w in ("次数", "数量", "多少", "总数")):
             group_by = "level"   # 问"多少条日志"又不指定分组 -> 按级别给分布，更有信息量
 
@@ -145,15 +247,35 @@ class EsQueryEngine:
         elif re.search(r"三个|3个|前3|前三", question):
             order_by, limit = "cnt", 3
 
+        return filters, group_by, order_by, order_dir, limit
+
+    def _assemble(
+        self,
+        parsed: list[IRFilter],
+        group_by: Optional[str],
+        order_by: Optional[str],
+        order_dir: str,
+        limit: int,
+        scope_filters: Optional[list[IRFilter]] = None,
+        notes: Optional[list[str]] = None,
+    ) -> QueryIR:
+        """装配 IR。行级权限过滤放最前：它是安全约束，不能被后续规则挤掉。"""
         return QueryIR(
             index=self.index,
-            filters=filters,
+            filters=list(scope_filters or []) + list(parsed),
             group_by=group_by,
-            metrics=metrics,
+            metrics=[IRMetric("cnt", "count")],
             order_by=order_by if group_by else None,
             order_dir=order_dir,
             limit=limit,
+            context_notes=list(notes or []),
         )
+
+    def build_ir(self, question: str, scope_filters: Optional[list[IRFilter]] = None) -> QueryIR:
+        """单轮解析（不涉及上下文）——评估脚本与单测用这个，行为与历史版本一致。"""
+        parsed, group_by, order_by, order_dir, limit = self._parse(question)
+        return self._assemble(parsed, group_by, order_by, order_dir, limit,
+                              scope_filters=scope_filters)
 
 
 # SQL 行级权限（policy.RowFilter）-> ES 文档字段。

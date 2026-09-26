@@ -242,3 +242,97 @@ def test_router_without_es_goes_all_sql():
     router = HybridRouter(sql, None)
     router.ask("最近7天告警")
     assert sql.asked == ["最近7天告警"]
+
+
+# ---------------- 多轮上下文（与 SQL 路径的 QueryContext 同构） ----------------
+# 规则：本轮显式说了的维度覆盖上一轮；没说、上轮说过的补齐；本轮要分组的维度不作过滤条件继承。
+
+def _filters(out: dict) -> dict:
+    return {f: (op, v) for f, op, v in out["entities"]["filters"]}
+
+
+def test_follow_up_marker_classification():
+    from examples.es_engine import is_follow_up
+
+    assert is_follow_up("那华南区呢？")
+    assert is_follow_up("那最近30天呢")
+    assert is_follow_up("华南区")
+    assert is_follow_up("换成最近30天")
+    assert is_follow_up("还有华北吗")
+    # 全新问题不应被当成追问
+    assert not is_follow_up("各区域最近7天的ERROR告警数量")
+    assert not is_follow_up("最近7天各级别有多少条日志")
+    assert not is_follow_up("告警最多的区域是哪个")
+    assert not is_follow_up("")
+
+
+def test_multi_turn_replaces_only_the_named_dimension():
+    """「那华南区呢」= 只换区域，级别与时间窗口沿用上一轮。"""
+    eng, _ = _engine()
+    first = eng.ask("华东区最近7天的ERROR告警有多少条")
+    assert _filters(first)["region"] == ("term", "华东")
+
+    second = eng.ask("那华南区呢？")
+    got = _filters(second)
+    assert got["region"] == ("term", "华南")       # 替换
+    assert got["level"] == ("term", "ERROR")       # 继承
+    assert got["ts"] == ("gte", "now-7d")          # 继承
+    assert any("维度替换" in r for r in second["reasons"])
+
+
+def test_follow_up_chain_keeps_both_dimensions():
+    """链式追问：华东 → 那华南呢 → 那最近30天呢，最终应是 华南 + 30天。"""
+    eng, _ = _engine()
+    eng.ask("华东区最近7天的ERROR告警有多少条")
+    eng.ask("那华南区呢？")
+    third = eng.ask("那最近30天呢？")
+    got = _filters(third)
+    assert got["region"] == ("term", "华南")
+    assert got["ts"] == ("gte", "now-30d")
+    assert got["level"] == ("term", "ERROR")
+
+
+def test_grouping_dimension_is_not_inherited_as_filter():
+    """本轮要按区域分组时，不得继承上一轮的 region 过滤（否则只剩一行）。"""
+    eng, _ = _engine()
+    eng.ask("华东区最近7天的ERROR告警有多少条")
+    out = eng.ask("各区域最近7天的ERROR告警数量")
+    assert "region" not in _filters(out)
+
+
+def test_new_question_does_not_inherit_previous_dimensions():
+    """全新问题不继承，避免"点几个示例问题就串味"。"""
+    eng, _ = _engine()
+    eng.ask("华东区最近7天的ERROR告警有多少条")
+    out = eng.ask("最近7天各级别有多少条日志")
+    got = _filters(out)
+    assert "region" not in got and "level" not in got
+    assert any("不继承" in r for r in out["reasons"])
+
+
+def test_reset_context_clears_inheritance():
+    eng, _ = _engine()
+    eng.ask("华东区最近7天的ERROR告警有多少条")
+    eng.reset_context()
+    out = eng.ask("那华南区呢？")
+    # 上下文已清空：追问只带上本轮显式提到的区域
+    assert _filters(out) == {"region": ("term", "华南")}
+
+
+def test_scope_filters_survive_multi_turn_and_are_not_replaced():
+    """行级权限是每轮重新施加的安全约束：不得被多轮继承"覆盖掉"。
+
+    当权限过滤与用户问题过滤**同一字段**时，二者会同时在 DSL 里（AND 语义）→
+    受限于华东的用户问华南会拿到空结果，但**不会越权**（fail-closed）。
+    这不是 bug：宁可返回空，也不能把权限条件悄悄改写或丢弃。
+    """
+    eng, _ = _engine()
+    scope = [IRFilter("region", "term", "华东")]
+    eng.ask("华东区最近7天的ERROR告警有多少条", scope_filters=scope)
+    out = eng.ask("那华南区呢？", scope_filters=scope)
+
+    pairs = [(f, op, v) for f, op, v in out["entities"]["filters"]]
+    assert ("region", "term", "华东") in pairs      # 权限过滤仍在（每轮由调用方传入）
+    assert ("region", "term", "华南") in pairs      # 用户本轮显式说的维度也在
+    # 两个 term 同时存在于 DSL -> 交集为空，是预期的 fail-closed 行为
+    assert out["es_dsl"]["query"]["bool"]["filter"].count({"term": {"region": "华东"}}) == 1
