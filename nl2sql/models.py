@@ -16,6 +16,7 @@ class ResultSource(str, Enum):
     FALLBACK_GENERIC = "fallback_generic"   # 检索无命中，走通用提示词兜底
     FALLBACK_TEMPLATE = "fallback_template" # 重试耗尽，回退到最相关示例 SQL
     CACHED = "cached"                 # 命中缓存（扩展位，暂未实现）
+    REFUSED = "refused"               # 输入护栏拦截（越界 / 注入 / 密钥提取 / PII）
 
 
 @dataclass

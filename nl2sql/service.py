@@ -31,6 +31,7 @@ from typing import Any, Callable, Optional
 
 from .auth import Principal
 from .policy import DataPolicy
+from .safety import SafetyGuard
 
 _log = logging.getLogger("nl2sql.service")
 
@@ -303,6 +304,9 @@ class QueryService:
             float(getattr(api, "queue_timeout", 20.0)),
         )
         self.audit = AuditLog(int(getattr(api, "audit_buffer", 500)))
+        # 输入安全护栏：service 入口统一拦截越界/注入/密钥/PII，覆盖所有编排方式
+        # （pipeline 与 graph 两种 runner 都经此入口），并把拒绝计入审计。
+        self.safety = SafetyGuard()
 
     # ---------------- 主入口 ----------------
 
@@ -320,6 +324,22 @@ class QueryService:
                 question=question, outcome="rate_limited",
             )
             raise RateLimited("请求过于频繁，请稍后重试", retry_after=retry_after)
+
+        # 输入安全护栏：越界 / 提示词注入 / 密钥提取 / PII —— 入口即拦，不进引擎。
+        ref = self.safety.screen(question)
+        if ref is not None:
+            self.audit.record(
+                request_id=request_id, sub=principal.sub, role=principal.role.value,
+                question=question, outcome="refused", denied=ref.category.value,
+            )
+            return {
+                "request_id": request_id,
+                "type": "refused",
+                "category": ref.category.value,
+                "answer": ref.safe_reply,
+                "reason": ref.reason,
+                "latency_ms": 0,
+            }
 
         sid = session_id or f"{principal.sub}:default"
         started = time.perf_counter()

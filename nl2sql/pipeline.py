@@ -28,6 +28,7 @@ from .models import (
 )
 from .prompt import SYSTEM_PROMPT, PromptBuilder
 from .retrieval import RetrievalService
+from .safety import SafetyGuard
 from .validation import SQLValidator
 
 
@@ -49,6 +50,7 @@ class Text2SQLPipeline:
         min_score: float = 1.0,
         max_retry: int = 1,
         retry_on_empty: bool = True,
+        safety: Optional[SafetyGuard] = None,
     ):
         self.registry = registry
         self.store = store
@@ -67,6 +69,10 @@ class Text2SQLPipeline:
         # 空结果自愈：SQL 能执行但匹配 0 行 / 全 NULL 时，带反馈重生成一次
         # （这类失败静态校验与 EXPLAIN 都发现不了，只有执行后才知道）
         self.retry_on_empty = retry_on_empty
+        # 输入安全护栏（safety.SafetyGuard）：链路最前端的越界/注入/密钥拦截。
+        # 默认 None（不拦截），由装配层（bootstrap）或测试显式开启；这样不破坏
+        # 既有「无护栏」的离线测试，又能在生产入口统一开启。
+        self.safety = safety
         # 企业知识库摘录（混合检索结果），由上层每轮注入；用于补充业务口径与已知坑
         self.doc_context: Optional[str] = None
         # 数据权限守卫（policy.PolicyGuard），由上层每轮注入。
@@ -78,6 +84,18 @@ class Text2SQLPipeline:
 
     def run(self, question: str, pre_feedback: Optional[str] = None) -> GenerationResult:
         trace = PipelineTrace(question=question)
+
+        # 0) 输入安全护栏（最前端拦截）：越界 / 提示词注入 / 密钥提取 / PII。
+        #    命中即返回 REFUSED，绝不进入检索/LLM/DB，成本最低、最干净。
+        if self.safety is not None:
+            ref = self.safety.screen(question)
+            if ref is not None:
+                self._log.info(
+                    "输入护栏拦截: category=%s | %s", ref.category.value, ref.reason
+                )
+                return self._finish(
+                    ResultSource.REFUSED, None, "", trace, ref.reason
+                )
 
         # 1) 检索
         hits = self.retriever.retrieve(question, top_k=self.top_k)
@@ -211,7 +229,10 @@ class Text2SQLPipeline:
     def _execute(self, res: GenerationResult) -> tuple[list[str], list[tuple]]:
         cols: list[str] = []
         rows: list[tuple] = []
-        if res.sql:
+        # 关键：只有「通过校验、无错误」的 SQL 才允许下发执行。
+        # 否则回退路径若返回了一条未通过校验的 SQL（如被注入诱导吐出的 DROP），
+        # 这里会直接把它丢给数据库——这是对抗性场景下的真实隐患，必须挡住。
+        if res.sql and res.error is None:
             try:
                 cols, rows = self.db.execute(res.sql)
             except Exception as e:  # noqa: BLE001

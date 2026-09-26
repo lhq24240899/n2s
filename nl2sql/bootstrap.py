@@ -23,6 +23,7 @@ from .kb import build_doc_retriever
 from .llm import build_llm
 from .pipeline import Text2SQLPipeline
 from .policy import DataPolicy, PolicyGuard
+from .safety import SafetyGuard
 
 _log = logging.getLogger("nl2sql.bootstrap")
 _LAST_SCHEMA_FINGERPRINT: str = ""   # 进程内记录上次结构指纹，用于变更告警
@@ -191,6 +192,7 @@ def _make_pipeline(ctx: AppContext, guard: PolicyGuard) -> Text2SQLPipeline:
         top_k=settings.retrieval.top_k,
         min_score=settings.retrieval.min_score,
         max_retry=settings.pipeline.max_retry,
+        safety=SafetyGuard(),   # 生产入口统一开启输入护栏（越界/注入/密钥/PII）
     )
     pipeline.guard = guard
     return pipeline
