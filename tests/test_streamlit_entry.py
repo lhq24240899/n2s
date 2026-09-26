@@ -48,12 +48,19 @@ def _fake_streamlit(engine_label: str, calls: dict | None = None,
     st.session_state = session if session is not None else _SessionState()
     st.radio = lambda *a, **k: engine_label
     st.chat_input = lambda *a, **k: None
-    st.button = lambda *a, **k: False
     st.sidebar = MagicMock()
     st.set_page_config = lambda *a, **k: None
     st.expander = lambda *a, **k: MagicMock()
     st.chat_message = lambda *a, **k: MagicMock()
     log = calls if calls is not None else {}
+
+    def _button(label=None, *a, **k):
+        # 记录按钮文案：用来断言"哪些示例问题被渲染了"（一律不点，避免真去查库）
+        log.setdefault("buttons", []).append(label)
+        return False
+
+    st.button = _button
+    st.columns = lambda n, **k: [MagicMock() for _ in range(n if isinstance(n, int) else len(n))]
     for name in ("title", "caption", "subheader", "divider", "write", "success", "code",
                  "dataframe", "rerun", "metric", "info", "warning", "markdown", "spinner"):
         setattr(st, name, lambda *a, **k: None)
@@ -312,3 +319,80 @@ def test_datasource_caption_exists_for_every_engine_mode(monkeypatch):
     assert "PostgreSQL" in g["DATASOURCE_CAPTION"]["sql"]
     assert "Elasticsearch" in g["DATASOURCE_CAPTION"]["es"]
     assert "OpenSearch" in g["DATASOURCE_CAPTION"]["ppl"]
+
+
+# ---------------- 对话区示例问题（原侧边栏，已迁移） ----------------
+# 规则：每档 3 条、只在"该档还没有任何对话"时出现；第一轮问完即隐藏；清空对话后重新出现。
+
+def test_samples_are_no_longer_rendered_in_sidebar():
+    """侧边栏区块里不应再出现示例问题（已迁到对话区）。"""
+    src = ENTRY.read_text(encoding="utf-8")
+    # 侧边栏块的边界 = 「with st.sidebar:」到主区第一段（新对话引导）之间
+    sidebar = src.split("with st.sidebar:", 1)[1].split("# 新对话引导", 1)[0]
+    assert sidebar, "侧边栏块没找到"      # 边界标记若被改名，这里会先失败，避免空切片蒙混过关
+
+    assert "SAMPLES_BY_ENGINE" not in sidebar
+    assert "示例问题" not in sidebar
+    assert "st.session_state.pending" not in sidebar
+
+
+def test_samples_cover_every_engine_with_three_self_contained_questions(monkeypatch):
+    """每档恰好 3 条，且不能是「那华南区呢？」这类依赖上下文的追问。"""
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[0])
+    samples = g["SAMPLES_BY_ENGINE"]
+
+    assert set(samples) == set(g["ALL_ENGINE_MODES"])
+    for mode, qs in samples.items():
+        assert len(qs) == 3, (mode, qs)
+        assert len(set(qs)) == 3, f"{mode} 有重复问题"
+        for q in qs:
+            assert not q.strip().startswith(("那", "还有", "换成")), f"{mode}: 首轮不该出现追问 {q}"
+
+
+def test_samples_are_carved_from_the_full_pools(monkeypatch):
+    """对话区精选必须来自全量问题池 —— 防止改了池子忘了改精选（或反之）。"""
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[0])
+
+    assert set(g["SAMPLES_BY_ENGINE"]["sql"]).issubset(set(g["EXAMPLES"]))
+    assert set(g["SAMPLES_BY_ENGINE"]["es"]).issubset(set(g["ES_EXAMPLES"]))
+    assert set(g["SAMPLES_BY_ENGINE"]["ppl"]).issubset(set(g["ES_EXAMPLES"]))
+
+
+@pytest.mark.parametrize("idx,mode", [(0, "sql"), (1, "es"), (2, "ppl")])
+def test_samples_shown_on_new_conversation_and_hidden_after_first_turn(monkeypatch, idx, mode):
+    """新对话（该档历史为空）渲染 3 条示例；产生一轮对话后不再渲染。"""
+    label = _engine_labels()[idx]
+    calls, _, g = _run_entry(monkeypatch, label)
+    expected = set(g["SAMPLES_BY_ENGINE"][mode])
+
+    shown = [b for b in calls.get("buttons", []) if b in expected]
+    assert len(shown) == 3, f"{mode} 档新对话应展示 3 条示例，实际 {shown}"
+
+    # 该档写入一轮对话后，用同一个 session 再渲染（模拟 Streamlit 的重跑）
+    _, session, g0 = _run_entry(monkeypatch, label)
+    g0["_engine_turns"](mode).append({"role": "user", "content": "华东区上个月准时率"})
+
+    calls2, _, g1 = _run_entry(monkeypatch, label, session=session)
+    assert g1["_engine_turns"](mode), "前置条件：该档已有对话"
+    assert [b for b in calls2.get("buttons", []) if b in expected] == []
+
+
+def test_samples_reappear_after_clearing_the_conversation(monkeypatch):
+    """清空当前档对话后（等价于"新对话"），示例重新出现。"""
+    label = _engine_labels()[0]
+    _, session, g = _run_entry(monkeypatch, label)
+    g["_engine_turns"]("sql").append({"role": "user", "content": "x"})
+
+    calls_hidden, _, _ = _run_entry(monkeypatch, label, session=session)
+    assert [b for b in calls_hidden.get("buttons", []) if b in set(g["SAMPLES_BY_ENGINE"]["sql"])] == []
+
+    session[g["TURNS_BY_ENGINE_KEY"]]["sql"].clear()     # 相当于点了「清空当前引擎的对话」
+    calls_again, _, _ = _run_entry(monkeypatch, label, session=session)
+    assert len([b for b in calls_again.get("buttons", [])
+                if b in set(g["SAMPLES_BY_ENGINE"]["sql"])]) == 3
+
+
+def test_es_and_ppl_share_the_same_sample_set(monkeypatch):
+    """DSL / PPL 同属日志域，示例问题应一致（避免同一份数据两套问法）。"""
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[0])
+    assert g["SAMPLES_BY_ENGINE"]["es"] == g["SAMPLES_BY_ENGINE"]["ppl"]

@@ -163,8 +163,9 @@ SOURCE_LABEL = {
     "fallback_generic": "🟠 检索无命中 · 通用兜底生成",
 }
 
-# 侧边栏推荐问题：均为「真跑过、确认有返回数据」的问题，保证演示不冷场。
-# 前 6 条走结构化问数（SQL），后 2 条走知识库问答（RAG）——两条分支都能演示。
+# 全量推荐问题池（SQL 域）：均为「真跑过、确认有返回数据」的问题，保证演示不冷场。
+# ⚠️ 这是**池子**，同时被 `examples/dump_expected_answers.py` 用来生成网页验证清单，
+#    所以不要删减；真正在对话区展示的是下面 `SAMPLES_BY_ENGINE["sql"]`（3 条精选）。
 EXAMPLES = [
     "华东区上个月可靠性试验的准时完成率是多少",
     "那华南区呢？",
@@ -201,6 +202,25 @@ TURNS_BY_ENGINE_KEY = "turns_by_engine"
 ALL_ENGINE_MODES = ("sql", "es", "ppl")
 
 
+# 对话区展示的示例问题（每档 3 条）：**只在该档还没有任何对话时出现**，
+# 第一轮问完即隐藏，点「清空当前引擎的对话」后重新出现。
+# 选取标准：三条覆盖不同能力，且**自包含**（脱离上下文也能答出）——
+# 像「那华南区呢？」这种追问放在新对话里没有意义，所以不进这个列表。
+SAMPLES_BY_ENGINE = {
+    "sql": [
+        "华东区上个月可靠性试验的准时完成率是多少",   # 单指标取值（语义层）
+        "各业务线的检测准时率是多少",                 # 分组多行
+        "ISO/IEC 17025 和 GB/T 27025 有什么区别",      # 企业知识库（RAG 分支）
+    ],
+    "es": [
+        "各区域最近7天的ERROR告警数量",                # 分组统计
+        "告警最多的区域是哪个",                        # TopN 排名
+        "包含「温度超限」的告警最近7天有多少条",        # 全文检索
+    ],
+}
+SAMPLES_BY_ENGINE["ppl"] = list(SAMPLES_BY_ENGINE["es"])   # 同为日志域，问题集一致
+
+
 def _engine_turns(mode: str) -> list:
     store = st.session_state.get(TURNS_BY_ENGINE_KEY)
     if not isinstance(store, dict):
@@ -209,7 +229,8 @@ def _engine_turns(mode: str) -> list:
     return store.setdefault(mode, [])
 
 
-# ES / OpenSearch 域示例问题（与 examples/es_eval.py 的评估集同源，真跑过有结果）
+# 全量推荐问题池（ES / OpenSearch 域，与 examples/es_eval.py 的评估集同源，真跑过有结果）。
+# 对话区实际展示的是 `SAMPLES_BY_ENGINE["es"/"ppl"]`（3 条精选）。
 ES_EXAMPLES = [
     "各区域最近7天的ERROR告警数量",
     "各区域最近30天的ERROR告警数量",
@@ -484,7 +505,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-26-selfcheck-per-engine"
+APP_BUILD = "2026-09-26-inline-samples"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -817,18 +838,6 @@ with st.sidebar:
         st.caption(f"目标：{es_backend_info(_s, ENGINE_MODE)}")
 
     st.divider()
-    st.subheader("💡 示例问题")
-    if ENGINE_MODE == "sql":
-        for i, q in enumerate(EXAMPLES):
-            if st.button(q, key=f"ex_{i}"):
-                st.session_state.pending = q
-    else:
-        # ES / PPL 域的问题（与 examples/es_eval.py 评估集同源）
-        for i, q in enumerate(ES_EXAMPLES):
-            if st.button(q, key=f"esex_{i}"):
-                st.session_state.pending = q
-
-    st.divider()
     if st.button("🧹 清空当前引擎的对话 / 重置多轮上下文"):
         # 只清当前引擎：历史按引擎隔离，各自的多轮上下文也各自重置
         _engine_turns(ENGINE_MODE).clear()
@@ -869,8 +878,22 @@ _PLACEHOLDER = {
     "es": "问事件日志类问题，例如：各区域最近7天的ERROR告警数量",
     "ppl": "问事件日志类问题，例如：各实验室最近7天的ERROR告警数量",
 }
+# 新对话引导：当前档还没有任何对话时，在对话区给出 3 条"点一下就问"的示例问题。
+# 位置必须在 chat_input 之前 —— 按钮的返回值只有在创建它时才知道，放到后面就会变成
+# "点了没反应，要再点一次/再操作一次才提问"。问完后的隐藏由处理段末尾的 st.rerun() 负责。
+if not _engine_turns(ENGINE_MODE):
+    st.caption("💡 示例问题（点一下直接提问；开始对话后自动隐藏）")
+    _sample_cols = st.columns(len(SAMPLES_BY_ENGINE[ENGINE_MODE]))
+    for _i, _q in enumerate(SAMPLES_BY_ENGINE[ENGINE_MODE]):
+        with _sample_cols[_i]:
+            # use_container_width 在 1.64 文档里已标注 deprecated（改叫 width="stretch"），
+            # 但 requirements 允许 >=1.36，而 width 参数是后来才加的 —— 为兼容老版本沿用它。
+            if st.button(_q, key=f"sample_{ENGINE_MODE}_{_i}", use_container_width=True):
+                st.session_state.pending = _q
+
 question = st.chat_input(_PLACEHOLDER.get(ENGINE_MODE, _PLACEHOLDER["sql"]))
-if st.session_state.get("pending"):
+_from_sample = bool(st.session_state.get("pending"))   # 来自示例按钮？（决定问完是否重跑）
+if _from_sample:
     question = st.session_state.pop("pending")
 
 if question:
@@ -899,3 +922,8 @@ if question:
             _turns.append(
                 {"role": "assistant", "payload": out, "engine": ENGINE_MODE, "elapsed_ms": elapsed_ms}
             )
+    if _from_sample:
+        # 示例问题已答完：重跑一次让"示例区"立刻消失。
+        # 不重跑的话，本轮开始时 turns 还是空的，示例会与刚问出的答案同屏出现（实测如此）。
+        # 这里只是重新渲染，问题已经从 session 里取走，不会重复提问。
+        st.rerun()
