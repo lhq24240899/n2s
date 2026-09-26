@@ -24,8 +24,10 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
+import time
 from pathlib import Path
 
 # 保证 `nl2sql` / `examples` 可被导入（Streamlit 从仓库根启动，通常已满足）
@@ -135,7 +137,11 @@ import streamlit as st
 # 顺序：环境变量 > .streamlit/secrets.toml > st.secrets（st.secrets 不覆盖已有值）。
 try:
     for _k in ("LLM__BASE_URL", "LLM__API_KEY", "LLM__MODEL", "LLM__PROVIDER",
-               "DB__DSN", "DB__READONLY", "DB__DRY_RUN"):
+               "DB__DSN", "DB__READONLY", "DB__DRY_RUN",
+               # 第二/第三执行引擎（ES DSL 真执行 / OpenSearch PPL 真执行）
+               "ES__ENABLED", "ES__HOST", "ES__USER", "ES__PASSWORD", "ES__INDEX",
+               "ES__PPL_ENABLED", "ES__PPL_HOST", "ES__PPL_USER", "ES__PPL_PASSWORD",
+               "ES__PPL_INDEX"):
         _v = st.secrets.get(_k)
         if _v and not os.environ.get(_k):
             os.environ[_k] = str(_v)
@@ -168,6 +174,35 @@ EXAMPLES = [
     "可靠性业务的报告出具周期是多少天",
     "为什么问华南区查不到数据",
     "EMC 是什么意思",
+]
+
+# ---------------------------------------------------------------------------
+# 执行引擎切换：同一个问题，可以分别交给三种真实引擎跑
+#   sql  -> Text2SQL（PostgreSQL，语义层 + RAG）
+#   es   -> Elasticsearch DSL（QueryIR 编译成 _search 请求体，真执行）
+#   ppl  -> OpenSearch PPL（同一份 IR 编译成 PPL，走 _plugins/_ppl 真执行）
+# 设计：三种模式共用同一套 IR/语义层与安全护栏——**换引擎不换安全等级**。
+# ---------------------------------------------------------------------------
+ENGINE_OPTIONS = {
+    "🔢 SQL 结构化问数（PostgreSQL）": "sql",
+    "🔎 DSL · Elasticsearch": "es",
+    "🧭 PPL · OpenSearch": "ppl",
+}
+ENGINE_BADGE = {
+    "sql": "SQL（Text2SQL → PostgreSQL）",
+    "es": "ES DSL（IR → _search，真执行）",
+    "ppl": "PPL（IR → _plugins/_ppl，真执行）",
+}
+
+# ES / OpenSearch 域示例问题（与 examples/es_eval.py 的评估集同源，真跑过有结果）
+ES_EXAMPLES = [
+    "各区域最近7天的ERROR告警数量",
+    "各区域最近30天的ERROR告警数量",
+    "最近30天共有多少条ERROR告警",
+    "包含「温度超限」的告警最近7天有多少条",
+    "各实验室最近7天的ERROR告警数量",
+    "告警最多的区域是哪个",
+    "最近7天各级别有多少条日志",
 ]
 
 
@@ -245,6 +280,125 @@ def get_engine():
     return st.session_state.engine
 
 
+# ---------------------------------------------------------------------------
+# 2b) 第二/第三执行引擎：ES DSL 与 OpenSearch PPL
+#     两者共用 EsQueryEngine（确定性规则填槽 → QueryIR → 编译 → REST 真执行），
+#     区别只在「指向哪个端点、执行哪种语言」：
+#       mode="es"  -> ES__HOST，执行 _search（DSL）；同时把 PPL 作为编译产物一并展示
+#       mode="ppl" -> ES__PPL_HOST（回退 ES__HOST），执行 _plugins/_ppl（PPL）
+# ---------------------------------------------------------------------------
+def get_es_engine(mode: str):
+    key = f"es_engine_{mode}"
+    if key in st.session_state:
+        return st.session_state[key]
+
+    from examples.es_engine import EsQueryEngine
+    from nl2sql.config import get_settings
+    from nl2sql.es_backend import build_es_backend, resolve_index
+
+    settings = get_settings()
+    backend = build_es_backend(settings, mode=mode)
+    if backend is None:
+        st.session_state[key] = None
+        return None
+    engine = EsQueryEngine(backend, index=resolve_index(settings, mode))
+    st.session_state[key] = engine
+    return engine
+
+
+def es_backend_info(settings, mode: str) -> str:
+    """给侧边栏显示：当前模式连的是哪台集群、哪个索引（不显示凭据）。"""
+    if mode == "es":
+        host, index = settings.es.host, resolve_index(settings, "es")
+    else:
+        host = settings.es.ppl_host or settings.es.host
+        index = resolve_index(settings, "ppl")
+    safe_host = host.split("://")[-1].split("@")[-1] if host else "(未配置)"
+    return f"`{safe_host}` · 索引 `{index}`"
+
+
+def render_es_answer(out: dict, mode: str, elapsed_ms: float) -> None:
+    """渲染 ES / PPL 结果：结论表 + 真实下发的查询语句 + 执行状态。"""
+    if out.get("type") == "refused":
+        st.warning(f"🚫 {out.get('answer', '该问题不在我的回答范围内。')}")
+        return
+    if out.get("type") == "clarification":
+        st.warning(f"❓ 需要澄清：{out.get('message')}")
+        return
+    if out.get("type") == "error":
+        st.error(f"查询失败：{out.get('message')}")
+        return
+
+    cols, rows = out.get("columns") or [], out.get("rows") or []
+    ppl = out.get("ppl") or {}
+    st.caption(f"🔧 {ENGINE_BADGE[mode]} · 耗时 {elapsed_ms:.0f} ms · "
+               f"{out.get('row_count', len(rows))} 行")
+
+    # 结果区：单值给大数字，多行给表格
+    if rows and len(rows) == 1 and len(rows[0]) == 1:
+        st.metric(label=cols[0] if cols else "结果", value=_fmt(rows[0][0]))
+    elif rows:
+        st.dataframe([dict(zip(cols, r)) for r in rows])
+    else:
+        st.info("查询执行完成，但无数据返回。")
+
+    # 语句区：DSL 与 PPL 都展示 —— 同一份 IR 的两种编译产物，便于对照
+    with st.expander("🔍 实际下发的查询语句（可对照 DSL / PPL 两种方言）", expanded=True):
+        if out.get("es_dsl"):
+            st.markdown("**Elasticsearch DSL**" + ("（本次真执行）" if mode == "es" else ""))
+            st.code(json.dumps(out["es_dsl"], ensure_ascii=False, indent=2), language="json")
+        if ppl.get("query"):
+            status = ppl.get("status")
+            label = {"executed": "（本次真执行）", "compiled-only": "（仅编译，未执行）"}.get(status, "")
+            st.markdown(f"**PPL** {label}")
+            st.code(ppl["query"], language="sql")
+            if mode == "ppl" and status != "executed":
+                st.info(
+                    "当前 PPL 未真执行，已降级为「仅编译」。常见原因：\n"
+                    "1. 该集群是普通 Elasticsearch，没有 `_plugins/_ppl` 端点（PPL 是 OpenSearch 的语言）；\n"
+                    "2. 未配置 `ES__PPL_HOST`（PPL 专用的 OpenSearch 端点）；\n"
+                    "3. 端点或鉴权问题，详见下方返回。"
+                )
+            if ppl.get("status_detail"):
+                st.caption(f"PPL 端点返回：{ppl['status_detail']}")
+
+    if out.get("entities"):
+        ent = out["entities"]
+        st.caption(f"IR 解析：索引 `{ent.get('index')}`，过滤条件 {ent.get('filters')}")
+
+
+# ---------------------------------------------------------------------------
+# 2c) 统一的「按引擎分发」入口
+# ---------------------------------------------------------------------------
+def run_es_query(question: str, mode: str) -> tuple[dict, float]:
+    """ES / PPL 路径：先过安全护栏，再交给 EsQueryEngine 真执行。
+
+    护栏只做**硬拦截**（密钥提取 / 提示词注入 / PII）：
+    越界软拦截的词表是按"计量检测业务"建的，套到事件日志域会误杀
+    （例如「各区域 ERROR 告警」这类问句）。换引擎不换安全等级，但档位要跟域匹配。
+    """
+    from nl2sql.safety import SafetyGuard
+
+    ref = SafetyGuard().screen(question, hard_only=True)
+    if ref is not None:
+        return {"type": "refused", "answer": ref.safe_reply}, 0.0
+
+    engine = get_es_engine(mode)
+    if engine is None:
+        return {"type": "error", "message": "该引擎未配置（缺 ES__* / ES__PPL_* 配置）"}, 0.0
+
+    t0 = time.time()
+    out = engine.ask(question)
+    return out, (time.time() - t0) * 1000
+
+
+def render_by_engine(payload: dict, mode: str, elapsed_ms: float = 0.0) -> None:
+    if mode == "sql":
+        render_answer(payload)
+    else:
+        render_es_answer(payload, mode, elapsed_ms)
+
+
 def _build_embedder(settings):
     """向量化器；构建失败返回 None（上层自动降级为纯标签检索/纯 SQL 问数）。"""
     try:
@@ -297,7 +451,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-26-cloud.2"
+APP_BUILD = "2026-09-26-engine-switch"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -531,10 +685,43 @@ with st.sidebar:
         st.code(config_diag(), language="text")
 
     st.divider()
+    st.subheader("🔀 执行引擎")
+    _engine_label = st.radio(
+        "同一个问题，换不同引擎真跑",
+        list(ENGINE_OPTIONS.keys()),
+        index=0,
+        key="engine_label",
+        help="SQL 走 PostgreSQL；DSL 走 Elasticsearch 的 _search；PPL 走 OpenSearch 的 _plugins/_ppl。"
+             "三者共用同一份 IR/语义层与安全护栏。",
+    )
+    ENGINE_MODE = ENGINE_OPTIONS[_engine_label]
+
+    if ENGINE_MODE != "sql":
+        from nl2sql.config import get_settings as _gs
+        from nl2sql.es_backend import resolve_index as _ri  # noqa: F401
+
+        _s = _gs()
+        if get_es_engine(ENGINE_MODE) is None:
+            st.error(
+                f"该引擎尚未配置：请在 Secrets / `.env` 里补\n"
+                f"`ES__ENABLED=true` + `ES__HOST`（DSL），"
+                f"以及 `ES__PPL_ENABLED=true` + `ES__PPL_HOST`（PPL）。"
+            )
+        else:
+            st.caption(f"目标：{es_backend_info(_s, ENGINE_MODE)}")
+        st.caption("⚠️ 该模式为单轮查询，不参与多轮上下文；安全护栏同样生效。")
+
+    st.divider()
     st.subheader("💡 示例问题")
-    for i, q in enumerate(EXAMPLES):
-        if st.button(q, key=f"ex_{i}"):
-            st.session_state.pending = q
+    if ENGINE_MODE == "sql":
+        for i, q in enumerate(EXAMPLES):
+            if st.button(q, key=f"ex_{i}"):
+                st.session_state.pending = q
+    else:
+        # ES / PPL 域的问题（与 examples/es_eval.py 评估集同源）
+        for i, q in enumerate(ES_EXAMPLES):
+            if st.button(q, key=f"esex_{i}"):
+                st.session_state.pending = q
 
     st.divider()
     if st.button("🧹 清空对话 / 重置多轮上下文"):
@@ -559,16 +746,21 @@ with st.sidebar:
 if "turns" not in st.session_state:
     st.session_state.turns = []
 
-# 渲染历史
+# 渲染历史（带引擎标记，切换引擎后历史仍按各自方式渲染）
 for t in st.session_state.turns:
     with st.chat_message(t["role"], avatar=("🧑" if t["role"] == "user" else "📊")):
         if t["role"] == "user":
             st.write(t["content"])
         else:
-            render_answer(t["payload"])
+            render_by_engine(t["payload"], t.get("engine", "sql"), t.get("elapsed_ms", 0.0))
 
 # 取输入（支持侧边栏示例按钮注入）
-question = st.chat_input("用一句话提问，例如：华东区上个月可靠性试验的准时完成率是多少")
+_PLACEHOLDER = {
+    "sql": "用一句话提问，例如：华东区上个月可靠性试验的准时完成率是多少",
+    "es": "问事件日志类问题，例如：各区域最近7天的ERROR告警数量",
+    "ppl": "问事件日志类问题，例如：各实验室最近7天的ERROR告警数量",
+}
+question = st.chat_input(_PLACEHOLDER.get(ENGINE_MODE, _PLACEHOLDER["sql"]))
 if st.session_state.get("pending"):
     question = st.session_state.pop("pending")
 
@@ -578,12 +770,22 @@ if question:
         st.write(question)
 
     with st.chat_message("assistant", avatar="📊"):
-        out = None
-        with st.spinner("语义映射 → 检索 → 生成 → 校验 → 预检 → 执行 ..."):
+        out, elapsed_ms = None, 0.0
+        _spin = {
+            "sql": "语义映射 → 检索 → 生成 → 校验 → 预检 → 执行 ...",
+            "es": "规则填槽 → QueryIR → 编译 ES DSL → _search 真执行 ...",
+            "ppl": "规则填槽 → QueryIR → 编译 PPL → _plugins/_ppl 真执行 ...",
+        }[ENGINE_MODE]
+        with st.spinner(_spin):
             try:
-                out = get_engine().ask(question)
+                if ENGINE_MODE == "sql":
+                    out = get_engine().ask(question)
+                else:
+                    out, elapsed_ms = run_es_query(question, ENGINE_MODE)
             except Exception as e:  # noqa: BLE001
                 st.error(f"初始化或查询失败：{e}")
         if out is not None:
-            render_answer(out)
-            st.session_state.turns.append({"role": "assistant", "payload": out})
+            render_by_engine(out, ENGINE_MODE, elapsed_ms)
+            st.session_state.turns.append(
+                {"role": "assistant", "payload": out, "engine": ENGINE_MODE, "elapsed_ms": elapsed_ms}
+            )

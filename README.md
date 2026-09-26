@@ -345,6 +345,46 @@ streamlit run streamlit_app.py
 
 本地也可继续用 `.env`（`streamlit_app.py` 会优先读 `st.secrets`，两者键名一致）。
 
+### 9.1.1 三档执行引擎切换（SQL / DSL / PPL）
+
+侧边栏「🔀 执行引擎」可以在**同一个问题**上切换真跑的引擎——这是「自然语言转 SQL/PPL/DSL」
+里 DSL/PPL 那一半的可交互落点：
+
+| 档位 | 真实落点 | 说明 |
+|---|---|---|
+| 🔢 SQL | PostgreSQL（`Text2SQLPipeline`） | 语义层 + 混合 RAG + sqlglot 校验 + EXPLAIN 预检 |
+| 🔎 DSL | Elasticsearch `_search` | 问题 → 确定性规则填槽 → `QueryIR` → 编译 DSL → 真执行 |
+| 🧭 PPL | OpenSearch `_plugins/_ppl` | 同一份 `QueryIR` 编译成 PPL → 真执行（OpenSearch 专有） |
+
+三档**共用同一套 IR/语义层与安全护栏**——换引擎不换安全等级（ES 路径同样先过 `SafetyGuard` 硬拦截）。
+页面会把**实际下发的 DSL 与 PPL 两条语句**都列出来对照，方便看清楚"同一份中间表示如何编译成两种方言"。
+
+配置（`.env` 或 Streamlit Secrets，键名一致）：
+
+```bash
+ES__ENABLED=true
+ES__HOST=http://es-cn-xxx.public.elasticsearch.aliyuncs.com:9200   # 阿里云公网入口是 http 明文
+ES__USER=elastic
+ES__PASSWORD=...
+ES__INDEX=device_events
+
+# 可选：PPL 专用 OpenSearch 端点（不配则 PPL 回退 ES__HOST 并降级为「仅编译」）
+ES__PPL_ENABLED=true
+ES__PPL_HOST=https://<project>-<svc>.b.aivencloud.com:26380
+ES__PPL_USER=avnadmin
+ES__PPL_PASSWORD=...
+```
+
+灌数据与验证：
+
+```bash
+python examples/setup_es_demo.py --target both   # 设备日志 1222 条，两个集群都灌（按构造可复现）
+python examples/es_eval.py                       # 双份成绩单：ES DSL x/y + PPL m/n
+```
+
+注意：DSL/PPL 档是**单轮查询**，不参与多轮上下文；越界软拦截不套用（其词表按计量检测业务建，
+套到事件日志域会误杀），但密钥提取/提示词注入/PII 的**硬拦截**照常生效。
+
 ### 9.2 Streamlit Community Cloud
 
 1. 打开 https://share.streamlit.io → **New app** → 选仓库 `lhq24240899/n2s`、分支 `main`。

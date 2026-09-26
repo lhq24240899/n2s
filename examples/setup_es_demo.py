@@ -105,8 +105,12 @@ def expected() -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="灌 ES 设备日志演示数据")
+    parser = argparse.ArgumentParser(description="灌 ES/OpenSearch 设备日志演示数据")
     parser.add_argument("--only-print", action="store_true", help="只打印标准答案")
+    parser.add_argument(
+        "--target", choices=["es", "ppl", "both"], default="es",
+        help="灌到哪个集群：es=Elasticsearch(ES__HOST)、ppl=OpenSearch(ES__PPL_HOST)、both=两个都灌",
+    )
     args = parser.parse_args(argv)
 
     docs = generate()
@@ -116,23 +120,35 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     from nl2sql.config import get_settings
-    from nl2sql.es_backend import build_es_backend
+    from nl2sql.es_backend import build_es_backend, resolve_index
 
     settings = get_settings()
-    backend = build_es_backend(settings)
+    modes = ["es", "ppl"] if args.target == "both" else [args.target]
+
+    rc = 0
+    for mode in modes:
+        rc |= _seed_one(settings, mode, docs, resolve_index(settings, mode), build_es_backend)
+    return rc
+
+
+def _seed_one(settings, mode: str, docs: list[dict], index: str, build_es_backend) -> int:
+    """把演示数据灌进指定集群（重建索引，幂等）。"""
+    label = "Elasticsearch (DSL)" if mode == "es" else "OpenSearch (PPL)"
+    backend = build_es_backend(settings, mode=mode)
     if backend is None:
-        print("未启用 ES（ES__ENABLED/ES__HOST）")
+        hint = "ES__ENABLED/ES__HOST" if mode == "es" else "ES__PPL_ENABLED/ES__PPL_HOST"
+        print(f"\n[{label}] 未配置（{hint}），跳过")
         return 2
     ok, info = backend.ping()
     if not ok:
-        print(f"ES 连接失败: {info}\n检查：控制台『安全配置 -> 公网访问白名单』是否放行了本机出口 IP")
+        print(f"\n[{label}] 连接失败: {info}")
+        print("  检查：① 控制台『安全配置 → 公网访问白名单』是否放行本机出口 IP；"
+              "② 阿里云 ES 公网入口是 http 明文，写 https 会 TLS 握手失败")
         return 1
-    print(f"ES 已连接，版本 {info}")
+    print(f"\n[{label}] 已连接，版本 {info}，索引 {index}")
 
-    index = settings.es.index
     # 重建索引（演示数据，幂等）
-    del_resp = backend._client.delete(f"/{index}", headers=backend._headers())
-    _ = del_resp  # 404 也无所谓
+    backend._client.delete(f"/{index}", headers=backend._headers())  # 404 也无所谓
     r = backend._client.put(f"/{index}", json=MAPPING, headers=backend._headers())
     r.raise_for_status()
 
@@ -142,13 +158,14 @@ def main(argv: list[str] | None = None) -> int:
         lines.append(json.dumps({"index": {"_index": index}}))
         lines.append(json.dumps(d, ensure_ascii=False))
     body = "\n".join(lines) + "\n"
-    resp = backend._client.post("/_bulk", content=body, headers={"Content-Type": "application/x-ndjson"})
+    resp = backend._client.post("/_bulk", content=body,
+                                headers={"Content-Type": "application/x-ndjson"})
     resp.raise_for_status()
     if resp.json().get("errors"):
-        print("部分文档写入失败，请检查响应")
+        print(f"[{label}] 部分文档写入失败，请检查响应")
         return 1
     backend._client.post(f"/{index}/_refresh", headers=backend._headers())
-    print(f"已写入 {len(docs)} 条到索引 {index}")
+    print(f"[{label}] 已写入 {len(docs)} 条到索引 {index}")
     return 0
 
 

@@ -135,6 +135,17 @@ class EsSettings(BaseModel):
     index: str = "device_events"   # 设备日志演示索引
     timeout: float = 15.0
 
+    # ---- OpenSearch / PPL 专用端点（可选）----
+    # 同时配好两套集群，就能在网页里现场切换「ES DSL 真执行」与「OpenSearch PPL 真执行」。
+    # 留空则复用上面的 host：普通 Elasticsearch 上没有 _plugins/_ppl 端点，
+    # 此时 PPL 自动降级为「仅编译」（语法正确性仍由编译器保证），不会报错。
+    ppl_enabled: bool = False
+    ppl_host: str = ""             # 如 https://<project>-<svc>.b.aivencloud.com:26380
+    ppl_user: str = ""
+    ppl_password: str = ""
+    ppl_index: str = ""            # 留空则复用 index
+    ppl_timeout: float = 30.0      # PPL 首查较慢（OpenSearch 端需预热），给更宽的超时
+
 
 class LogSettings(BaseModel):
     level: str = "INFO"

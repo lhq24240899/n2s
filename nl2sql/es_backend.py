@@ -114,12 +114,41 @@ class ElasticsearchBackend:
             pass
 
 
-def build_es_backend(settings) -> Optional[ElasticsearchBackend]:
-    """按配置装配；未启用/缺配置返回 None（上层优雅降级为纯 SQL）。"""
+def resolve_index(settings, mode: str = "es") -> str:
+    """按模式解析要查询的索引名（PPL 模式可用 ES__PPL_INDEX 单独指定，留空复用 ES__INDEX）。"""
     es = getattr(settings, "es", None)
-    if not es or not getattr(es, "enabled", False) or not es.host:
+    default_index = getattr(es, "index", "") or "device_events"
+    if mode == "ppl":
+        return getattr(es, "ppl_index", "") or default_index
+    return default_index
+
+
+def build_es_backend(settings, mode: str = "es") -> Optional[ElasticsearchBackend]:
+    """按配置装配；未启用/缺配置返回 None（上层优雅降级为纯 SQL）。
+
+    mode="es"  -> 用 ES__HOST（Elasticsearch，**ES DSL 真执行**）
+    mode="ppl" -> 优先用 ES__PPL_HOST（OpenSearch，**PPL 真执行**）；未配置则回退 ES__HOST，
+                  此时若集群不是 OpenSearch（没有 _plugins/_ppl 端点），PPL 会自动降级为
+                  「仅编译」——语法正确性仍由编译器保证，只是不真跑。
+
+    设计意图：把「换引擎」做成配置项而不是分支代码 —— 网页上的 SQL/DSL/PPL 切换，
+    底层就是同一个 `ElasticsearchBackend`（REST 直连、只暴露只读方法）指向不同端点。
+    """
+    es = getattr(settings, "es", None)
+    if not es:
+        return None
+    if mode == "ppl":
+        host = getattr(es, "ppl_host", "") or es.host
+        user = getattr(es, "ppl_user", "") or es.user
+        password = getattr(es, "ppl_password", "") or es.password
+        timeout = getattr(es, "ppl_timeout", None) or es.timeout
+        enabled = bool(getattr(es, "enabled", False) or getattr(es, "ppl_enabled", False))
+    else:
+        host, user, password, timeout = es.host, es.user, es.password, es.timeout
+        enabled = bool(getattr(es, "enabled", False))
+    if not enabled or not host:
         return None
     return ElasticsearchBackend(
-        host=es.host, user=es.user, password=es.password,
-        timeout=es.timeout,
+        host=host, user=user, password=password, timeout=timeout,
     )
+

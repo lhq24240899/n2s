@@ -71,6 +71,35 @@ DB__DRY_RUN = "true"
 - 键名与 `.env` / `.env.example` 完全一致，本地开发无缝切换；
 - 这里填的密钥只存在 Streamlit 的密钥管理里，**不会**写进仓库。
 
+### 1.4 可选：开启 DSL / PPL 两档真实引擎
+
+网页侧边栏有「🔀 执行引擎」三档：**SQL / DSL / PPL**。SQL 档开箱可用；DSL、PPL 需要额外配集群：
+
+```toml
+# DSL 档 → Elasticsearch 的 _search（注意阿里云公网入口是 http 明文）
+ES__ENABLED = "true"
+ES__HOST = "http://es-cn-xxx.public.elasticsearch.aliyuncs.com:9200"
+ES__USER = "elastic"
+ES__PASSWORD = "你的密码"
+ES__INDEX = "device_events"
+
+# PPL 档 → OpenSearch 的 _plugins/_ppl
+ES__PPL_ENABLED = "true"
+ES__PPL_HOST = "https://<project>-<svc>.b.aivencloud.com:26380"
+ES__PPL_USER = "avnadmin"
+ES__PPL_PASSWORD = "你的密码"
+```
+
+然后本地灌演示数据（设备日志 1222 条，按构造生成，标准答案可复现）：
+
+```bash
+python examples/setup_es_demo.py --target both   # 两个集群都灌（或 es / ppl）
+python examples/es_eval.py                       # 双份成绩单：ES DSL x/y + PPL m/n
+```
+
+> 不配 PPL 端点时，PPL 档会回退到 `ES__HOST`：普通 Elasticsearch 没有 `_plugins/_ppl` 端点，
+> 此时 PPL 自动降级为「仅编译」（页面会明确标注），语法正确性仍由编译器保证，不会报错。
+
 ### 1.4 后续更新
 
 改完代码 `git push origin main`，Streamlit Cloud 会**自动重新部署**（无需手动操作），
