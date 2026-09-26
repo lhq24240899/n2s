@@ -151,10 +151,10 @@ except Exception:
 # ============================================================
 # 页面显示的机构名称（想换名只改这一行；不涉及任何业务逻辑）
 # ============================================================
-DISPLAY_NAME = "广电计量 · 智能问数"
+DISPLAY_NAME = "智能问数"
 
 st.set_page_config(
-    page_title=f"{DISPLAY_NAME} · 智能问数", page_icon="📊", layout="wide"
+    page_title=DISPLAY_NAME, page_icon="📊", layout="wide"
 )
 
 SOURCE_LABEL = {
@@ -674,11 +674,7 @@ def render_answer(out: dict) -> None:
 # ---------------------------------------------------------------------------
 # 4) 页面
 # ---------------------------------------------------------------------------
-st.title(f"📊 {DISPLAY_NAME} · 自然问数系统")
-st.caption(
-    "语义层驱动的 NL2SQL ⊕ 企业知识库混合 RAG：可解释检索 · Schema Linking · "
-    "sqlglot 校验 · EXPLAIN 预检 · 多轮上下文 · 失败回退"
-)
+st.title(f"📊 {DISPLAY_NAME}")
 
 ok, msg = config_status()
 
