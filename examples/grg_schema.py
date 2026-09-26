@@ -273,11 +273,19 @@ def build_metrics() -> list[Metric]:
             name="毛利率",
             level=MetricLevel.GROUP,
             domain="经营",
-            definition="business_segment_revenue.gross_margin，单位 %",
+            # 口径治理（评估集实测过一次失败）：问「某板块毛利率是多少」时，
+            # 模型把板块过滤只写进了 report_date 的子查询，外层没有条件 -> 返回全部板块的多行。
+            # 因此把**过滤位置**写进口径，并把参考 SQL 改成"单板块取值"的正确形状
+            # （排名/分组问句不会下发这个标量模板，见 semantic.build 的 shaped 逻辑）。
+            definition=(
+                "business_segment_revenue.gross_margin，单位 %，按季末 report_date 披露。"
+                "问具体板块时，**板块过滤要写在主查询 WHERE 里、与 report_date 条件同级**；"
+                "只把板块条件放进 report_date 的子查询，会让主查询返回所有板块的多行结果"
+            ),
             sql_hint=(
-                "SELECT business_segment, gross_margin FROM business_segment_revenue "
-                "WHERE report_date = (SELECT MAX(report_date) FROM business_segment_revenue) "
-                "ORDER BY gross_margin DESC LIMIT 1"
+                "SELECT gross_margin FROM business_segment_revenue "
+                "WHERE business_segment = '集成电路测试与分析' "
+                "AND report_date = (SELECT MAX(report_date) FROM business_segment_revenue)"
             ),
             source_tables=["business_segment_revenue"],
             dimensions=["业务板块", "时间"],
@@ -316,7 +324,15 @@ def build_metrics() -> list[Metric]:
             name="设备利用率",
             level=MetricLevel.OPERATION,
             domain="通用",
-            definition="AVG(equipment.utilization)，取值 0~1",
+            # 口径治理（评估集反复实测到，D04 与 C06 同源）：模型爱自作主张加
+            # `WHERE online_status = 1`，把离线设备的利用率从均值里剔掉，算出的均值偏高。
+            # 利用率的口径是 equipment 表**全部记录**的平均；online_status 只用于回答
+            # 「在线设备有多少台」这类问题，不是利用率的分母条件。
+            definition=(
+                "AVG(equipment.utilization)，取值 0~1；口径为 equipment 表**全部记录**的平均"
+                "（含离线设备，**不要**加 online_status 过滤）。"
+                "online_status 只用于「在线设备数量」类问题，不是利用率的分母条件"
+            ),
             sql_hint="SELECT AVG(e.utilization) AS utilization FROM equipment e",
             source_tables=["equipment", "labs"],
             dimensions=["区域", "实验室"],

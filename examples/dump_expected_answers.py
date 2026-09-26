@@ -191,7 +191,7 @@ def main(argv: list[str] | None = None) -> int:
     w("> ② 部分指标**同名不同源**（如设备台数、收入 vs 合同金额），务必看「口径说明」列。\n")
     w("---\n")
 
-    w("## 〇、先跑这 8 条热身题（侧边栏预置，确认环境通不通）\n")
+    w(f"## 〇、先跑这 {len(examples)} 条热身题（侧边栏预置，确认环境通不通）\n")
     w("| 问句 | 标准答案 |")
     w("|---|---|")
     for q in examples:
@@ -321,7 +321,13 @@ def _answer_of(case: dict, expected: dict) -> str:
 
 def _answer_for_example(q: str, cases: list, expected: dict) -> str:
     if q.strip() == "那华南区呢？":
-        return "取决于上一轮问的指标（准时率 → 0.8667；收入 → 4000000）"
+        # 追问答案取决于上一轮问的指标：从多轮用例里取代表值，避免硬编码随数据漂移
+        parts: list[str] = []
+        for cid, label in (("F02", "准时率"), ("F05", "收入")):
+            ex = expected.get(cid)
+            if ex and ex.get("mode") == "value":
+                parts.append(f"{label} → {_fmt_value(ex['value'])}")
+        return "取决于上一轮问的指标（" + "；".join(parts) + "）" if parts else "取决于上一轮问的指标"
     for c in cases:
         if c["question"] == q:
             return _answer_of(c, expected)

@@ -92,13 +92,19 @@ def _seed(cur: psycopg.Cursor) -> None:
         "INSERT INTO customers (id, name, industry) VALUES (%s,%s,%s)",
         [(1, "某汽车客户", "汽车"), (2, "某通信客户", "通信")],
     )
+    # 合同：金额有意差异化，且各业务线/区域挂到的合同**不能是同一个循环**
+    # （原来每块都用 (i%3)+1，导致"华东收入"和"华南收入"算出同一个数——
+    #   已开票的合同 1/2 在两个区域各出现 5 次；假数据一眼能被看出来）
     cur.executemany(
         "INSERT INTO contracts (id, customer_id, signed_at, amount, settled_status) "
         "VALUES (%s,%s,%s,%s,%s)",
         [
-            (1, 1, ago(40), 500000, "已开票"),
-            (2, 2, ago(38), 300000, "已开票"),
-            (3, 1, ago(35), 450000, "未开票"),
+            (1, 1, ago(40), 500000, "已开票"),   # 汽车
+            (2, 2, ago(38), 300000, "已开票"),   # 通信
+            (3, 1, ago(35), 450000, "未开票"),   # 未开票 -> 不计入收入口径
+            (4, 1, ago(33), 620000, "已开票"),   # 汽车（保证汽车客户仍是已开票金额最高）
+            (5, 2, ago(31), 280000, "已开票"),   # 通信
+            (6, 2, ago(29), 350000, "已开票"),   # 通信
         ],
     )
 
@@ -128,10 +134,14 @@ def _seed(cur: psycopg.Cursor) -> None:
     orders: list[tuple] = []
     reports: list[tuple] = []
     oid = rid = 1
-    for bl_id, lab_ids, cnt, late_idx in PLANS:
+    contract_ids = (1, 2, 3, 4, 5, 6)
+    for block, (bl_id, lab_ids, cnt, late_idx) in enumerate(PLANS):
         for i in range(cnt):
             lab = lab_ids[i % len(lab_ids)]
-            orders.append((oid, lab, bl_id, 1 + (i % 2), (i % 3) + 1))
+            # 按块给偏移：不同业务线/区域挂到的合同组合不同 ->
+            # 「各区域/各业务线收入」才是真实有差异的数（原先是同一个循环，数值会撞车）
+            cid = contract_ids[(i + block * 2) % len(contract_ids)]
+            orders.append((oid, lab, bl_id, 1 + (i % 2), cid))
             # issued_at 落在 10~24 天前：既在「最近 30 天（上个月）」窗口内，
             # 又在「最近 7 天」窗口外 —— 后者用于验证时间窗口边界（E06 期望 0）。
             reports.append(
