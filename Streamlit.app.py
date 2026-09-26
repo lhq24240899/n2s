@@ -1,29 +1,29 @@
-"""计量检测 · 智能问数系统 —— Streamlit 入口（部署时的 Main file）。
+"""计量检测 · 智能问数系统 —— Streamlit 入口（部署时的 Main file：Streamlit.app.py）。
 
 页面显示名称统一由下方 `DISPLAY_NAME` 常量控制：改那一行即可整体换名。
 
-部署到 Streamlit Community Cloud：
-  1. 仓库：https://github.com/lhq24240899/n2s
-  2. Main file path：streamlit_app.py
-  3. App → Settings → Secrets 填入（键名与 .env 一致，用 TOML）：
-        LLM__BASE_URL = "https://api.ephone.ai/v1"
-        LLM__API_KEY  = "sk-..."
-        LLM__MODEL    = "gpt-4o-mini"
-        DB__DSN       = "postgresql://user:pass@host/db?sslmode=require"
-     （详见 .streamlit/secrets.toml.example）
-  4. 数据库需先建表灌数：本地跑一次 `python examples/setup_dev_db.py`
-     （数据写入 Neon，云端直接复用，无需在 Cloud 上再建）
+本地运行：
+    streamlit run Streamlit.app.py
 
-部署到 百度 AI Studio highcode（星河高代码应用）：
-  - 用 Dockerfile 部署，或在「启动命令」里填：
-      streamlit run streamlit_app.py --server.address=0.0.0.0 --server.port=8080 --server.headless=true
-  - 端口：优先读取平台注入的 $PORT，否则默认 8081（见文件顶部环境变量设置）。
-  - 密钥一律走平台「环境变量 / 密钥」配置，**不要写进 .env 提交**。必填：
-      LLM__BASE_URL / LLM__API_KEY / LLM__MODEL / DB__DSN
+部署到 百度 AI Studio highcode（星河高代码应用）——官方流程：
+  1. 克隆 highcode 应用空间**自有仓库**（不是本 GitHub 仓库）：
+       git lfs install
+       git clone http://{access_token}@git.aistudio.baidu.com/20300719/n2s.git
+  2. 把本项目的以下文件/目录整体拷进克隆下来的仓库根目录
+     （覆盖其自带的占位 Streamlit.app.py）：
+       Streamlit.app.py   requirements.txt   nl2sql/   examples/
+  3. 在 highcode 控制台配置环境变量（见下），然后：
+       git add -A && git commit -m "deploy" && git push
+     highcode 会自动按 requirements.txt 装依赖并运行 Streamlit.app.py。
+  - 必填环境变量（走平台配置面板，**不要写进文件**）：
+       LLM__BASE_URL / LLM__API_KEY / LLM__MODEL / DB__DSN
+  - 端口：优先读取平台注入的 $PORT；未注入则交予平台 / Streamlit 处理，
+    不再强制固定端口，避免和平台 ingress 端口不一致导致页面打不开。
   - 输入安全护栏已内置（问 apikey / 注入 / PII 会被直接拒绝，见 nl2sql/safety.py）。
 
-本地运行：
-    streamlit run streamlit_app.py
+部署到 Streamlit Community Cloud（备选）：
+  - Main file path：Streamlit.app.py
+  - App → Settings → Secrets（键名与 .env 一致，TOML）：LLM__* / DB__DSN
 """
 from __future__ import annotations
 
@@ -38,13 +38,14 @@ if str(_ROOT) not in sys.path:
 
 # ---------------------------------------------------------------------------
 # 0) 云端部署端口绑定（必须在 import streamlit 之前设置）
-#    百度 AI Studio highcode 等平台会把监听端口写在 $PORT 环境变量里；
-#    没给时默认 8081（避开本地常用的 8501，也避开 AI Studio 服务部署惯用的 8080）。
+#    百度 AI Studio highcode 等平台一般会把监听端口写在 $PORT 环境变量里；
+#    仅当平台显式注入 $PORT 时才覆盖，否则交给 Streamlit / 平台启动命令决定，
+#    避免端口和平台 ingress 不一致导致页面打不开。
 #    绑定 0.0.0.0 + headless，保证平台能从外部访问到。
 # ---------------------------------------------------------------------------
-_PORT = os.environ.get("PORT", "8081")
+if os.environ.get("PORT"):
+    os.environ["STREAMLIT_SERVER_PORT"] = os.environ["PORT"]
 os.environ.setdefault("STREAMLIT_SERVER_ADDRESS", "0.0.0.0")
-os.environ["STREAMLIT_SERVER_PORT"] = _PORT
 os.environ.setdefault("STREAMLIT_SERVER_HEADLESS", "true")
 os.environ.setdefault("STREAMLIT_BROWSER_GATHER_USAGE_STATS", "false")
 os.environ.setdefault("STREAMLIT_SERVER_ENABLE_CORS", "false")
@@ -54,7 +55,7 @@ import streamlit as st
 # ============================================================
 # 页面显示的机构名称（想换名只改这一行；不涉及任何业务逻辑）
 # ============================================================
-DISPLAY_NAME = "test"
+DISPLAY_NAME = "广电计量 · 智能问数"
 
 st.set_page_config(
     page_title=f"{DISPLAY_NAME} · 智能问数", page_icon="📊", layout="wide"

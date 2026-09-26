@@ -8,7 +8,7 @@ httpx>=0.27            # 显式依赖：直接用它构造"绕开环境代理"�
 # 真实 PostgreSQL 预检与执行（生产必装；Neon 已支持 pgvector / pg_trgm 扩展）
 psycopg[binary]>=3.1
 
-# Web UI（Streamlit Cloud 部署入口：streamlit_app.py）
+# Web UI（Streamlit Cloud 部署入口：Streamlit.app.py）
 streamlit>=1.36
 
 # 编排框架：LangGraph 版编排（nl2sql/graph.py）——与手写 pipeline 形成对照

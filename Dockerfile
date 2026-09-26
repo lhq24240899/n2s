@@ -1,5 +1,5 @@
 # 计量检测智能问数系统 —— 部署镜像（百度 AI Studio highcode / 任意容器平台）
-# 入口为 Streamlit Web UI（streamlit_app.py）。
+# 入口为 Streamlit Web UI（Streamlit.app.py）。
 FROM python:3.11-slim
 
 WORKDIR /app
@@ -25,4 +25,4 @@ ENV STREAMLIT_SERVER_ADDRESS=0.0.0.0 \
 
 # 端口：优先用平台注入的 $PORT，否则 8081
 EXPOSE 8081
-CMD streamlit run streamlit_app.py --server.address=0.0.0.0 --server.port=${PORT:-8081} --server.headless=true
+CMD streamlit run Streamlit.app.py --server.address=0.0.0.0 --server.port=${PORT:-8081} --server.headless=true
