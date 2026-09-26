@@ -184,7 +184,7 @@ EXAMPLES = [
 # 设计：三种模式共用同一套 IR/语义层与安全护栏——**换引擎不换安全等级**。
 # ---------------------------------------------------------------------------
 ENGINE_OPTIONS = {
-    "🔢 SQL 结构化问数（PostgreSQL）": "sql",
+    "SQL·PostgreSQL": "sql",
     "🔎 DSL · Elasticsearch": "es",
     "🧭 PPL · OpenSearch": "ppl",
 }
@@ -308,6 +308,8 @@ def get_es_engine(mode: str):
 
 def es_backend_info(settings, mode: str) -> str:
     """给侧边栏显示：当前模式连的是哪台集群、哪个索引（不显示凭据）。"""
+    from nl2sql.es_backend import resolve_index
+
     if mode == "es":
         host, index = settings.es.host, resolve_index(settings, "es")
     else:
@@ -453,7 +455,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-26-ppl-ascii-adapt"
+APP_BUILD = "2026-09-26-ppl-ascii-adapt.2"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -689,10 +691,13 @@ with st.sidebar:
     st.divider()
     st.subheader("🔀 执行引擎")
     _engine_label = st.radio(
-        "同一个问题，换不同引擎真跑",
+        "执行引擎",
         list(ENGINE_OPTIONS.keys()),
         index=0,
-        key="engine_label",
+        # key 带版本后缀：改过选项文案后，老浏览器 session 里存着的旧选项值不在新列表里，
+        # Streamlit 会直接抛 StreamlitAPIException；换 key 可让旧值自然失效（避免线上白屏）。
+        key="engine_label_v2",
+        label_visibility="collapsed",
         help="SQL 走 PostgreSQL；DSL 走 Elasticsearch 的 _search；PPL 走 OpenSearch 的 _plugins/_ppl。"
              "三者共用同一份 IR/语义层与安全护栏。",
     )
@@ -700,7 +705,6 @@ with st.sidebar:
 
     if ENGINE_MODE != "sql":
         from nl2sql.config import get_settings as _gs
-        from nl2sql.es_backend import resolve_index as _ri  # noqa: F401
 
         _s = _gs()
         if get_es_engine(ENGINE_MODE) is None:
