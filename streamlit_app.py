@@ -533,7 +533,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-sql-intent-selfcheck"
+APP_BUILD = "2026-09-27-answer-review"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -730,12 +730,31 @@ def _render_doc_snippet(d) -> None:
 
 
 def render_rag(out: dict) -> None:
-    """文档问答（混合 RAG）：只依据知识库资料作答，并列出引用来源。"""
-    st.caption("📚 知识库问答 · 结构化问数不适用时走文档检索（三路召回 + RRF 融合）")
-    st.markdown(out.get("answer") or "（未生成回答）")
+    """文档问答（混合 RAG）：只依据知识库资料作答，并列出引用来源。
+
+    `out["review"]` 是答案评审的结论（见 nl2sql/review.py）。判定"没答上"时
+    要把姿态讲清楚——**不能把它包装成一次正常的知识库问答**：原先那句
+    「知识库命中 4 篇」会让人以为系统听懂了、只是资料没覆盖，实际那几篇只是
+    "没被召回门槛拦住"。所以这里换措辞 + 用警示色展示引导文案。
+    """
+    review = out.get("review") or {}
+    missed = review.get("verdict") == "no_answer"
+
+    if missed:
+        st.caption("📚 知识库问答 · 没能从知识库里找到能回答这个问题的资料")
+        st.warning(out.get("answer") or "（未生成回答）")
+    else:
+        st.caption("📚 知识库问答 · 结构化问数不适用时走文档检索（三路召回 + RRF 融合）")
+        st.markdown(out.get("answer") or "（未生成回答）")
+
     docs = out.get("docs") or []
     if docs:
-        with st.expander(f"📚 参考来源（知识库命中 {len(docs)} 篇）"):
+        label = (
+            f"📚 检索到的资料（{len(docs)} 篇，但都答不上这个问题）"
+            if missed
+            else f"📚 参考来源（知识库命中 {len(docs)} 篇）"
+        )
+        with st.expander(label):
             for i, d in enumerate(docs, start=1):
                 src = f" — {d.source}" if getattr(d, "source", "") else ""
                 st.write(f"**[{i}] {d.title}**{src}")

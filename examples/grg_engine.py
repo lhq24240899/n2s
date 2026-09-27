@@ -34,6 +34,7 @@ from nl2sql.kb import answer_with_docs, build_sql_doc_block
 from nl2sql.pipeline import Text2SQLPipeline
 from nl2sql.models import ResultSource
 from nl2sql.policy import PolicyViolation
+from nl2sql.review import guidance, review_answer
 from nl2sql.safety import SafetyGuard
 from nl2sql.semantic import MappedQuery, SemanticLayer, SemanticMapper
 
@@ -91,7 +92,7 @@ class GRGQueryEngine:
             # 打断多轮澄清闭环）；交给原澄清逻辑回到上一轮问题重跑。
             if self.pending is not None and self._is_clarification_reply(question):
                 pending, self.pending = self.pending, None
-                return self._resume(pending, question)
+                return review_answer(self._resume(pending, question))
             # 全新问题：完整拦截（含越界软拦截）。
             ref = self.safety.screen(question, hard_only=False)
             if ref is not None:
@@ -101,10 +102,14 @@ class GRGQueryEngine:
             if self.pending is not None:
                 pending, self.pending = self.pending, None
                 if self._is_clarification_reply(question):
-                    return self._resume(pending, question)
+                    return review_answer(self._resume(pending, question))
                 # 否则视为新问题，正常往下走（不污染上下文）
 
-        return self._answer(self.mapper.map(question))
+        # 出口过一道答案评审：把"其实没答上"的回答（如 RAG 的「资料中未涉及」）
+        # 降级为引导。放在**引擎出口**而不是编排层，一处即覆盖三个入口
+        # （Streamlit / FastAPI / MCP）与两条编排（pipeline / graph）。
+        # 详见 nl2sql/review.py。
+        return review_answer(self._answer(self.mapper.map(question)))
 
     @staticmethod
     def _refuse(ref) -> dict:
@@ -244,9 +249,8 @@ class GRGQueryEngine:
             # 知识库给不出资料时**如实说不懂**，不再落到 SQL（否则会生成一张无意义的表，原因见 ②）。
             return {
                 "type": "clarification",
-                "message": (
+                "message": guidance(
                     "这看起来是个概念 / 定义类问题，但知识库里没有检索到相关资料，我无法回答。"
-                    "可以换个说法，或改问具体指标（例如「华东区上个月的检测准时率是多少」）。"
                 ),
                 "mapped": merged,
             }
@@ -265,9 +269,8 @@ class GRGQueryEngine:
                 return _rag_answer()
             return {
                 "type": "clarification",
-                "message": (
-                    "没听出你想查什么。请补充指标（如检测准时率 / 设备利用率 / 报告数量）、"
-                    "维度（区域 / 业务线 / 实验室）或时间范围后再问。"
+                "message": guidance(
+                    "没听出你想查什么——请补充指标、维度或时间范围，或换个问法。"
                 ),
                 "mapped": merged,
             }

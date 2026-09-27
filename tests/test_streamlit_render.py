@@ -403,3 +403,44 @@ def test_sql_query_expander_is_labelled_query_statement(fake_sql_engine):
     labels = [ex.label for ex in at.expander]
     assert "🔍 生成的查询语句" in labels, f"应有查询语句下拉框: {labels}"
     assert "🔍 生成的 SQL" not in labels, f"旧标签「生成的 SQL」应已改名: {labels}"
+
+
+def test_rag_no_answer_is_presented_as_guidance_not_as_a_normal_answer(monkeypatch):
+    """RAG 没答上时，界面要讲清楚并给引导，且参考资料措辞要诚实。
+
+    真机一幕：问「全部数据」-> RAG 答「资料中未涉及。」-> 界面照常显示
+    「📚 知识库问答 · 三路召回 + RRF 融合」+「参考来源（知识库命中 4 篇）」，
+    让人以为系统听懂了、只是资料没覆盖。实际那几篇只是"没被召回门槛拦住"。
+    """
+    from types import SimpleNamespace
+
+    from examples.grg_engine import GRGQueryEngine
+    from nl2sql.review import guidance
+
+    def fake_ask(self, question, *a, **kw):
+        return {
+            "type": "rag",
+            "mapped": SimpleNamespace(metric=None, reasons=[], entities={}, normalized=question),
+            "answer": guidance("知识库里没有能回答这个问题的资料。"),
+            "docs": [
+                SimpleNamespace(id="k1", title="业务线清单与 code 对照", content="正文",
+                                source="《指标口径手册》", reasons=["RRF 融合得分 0.05"]),
+            ],
+            "review": {"verdict": "no_answer", "reason": "命中兜底话术"},
+        }
+
+    monkeypatch.setattr(GRGQueryEngine, "ask", fake_ask)
+
+    at = AppTest.from_file(str(ENTRY), default_timeout=120)
+    at.run()
+    at.button(key="sample_sql_0").click().run()
+
+    assert not at.exception, [e.value for e in at.exception]
+
+    # 引导必须出现在警示里（不是普通 markdown）
+    warnings = " ".join(w.value for w in at.warning)
+    assert "可以这样问" in warnings, f"没答上时应给出引导: {warnings}"
+
+    labels = [ex.label for ex in at.expander]
+    assert any("都答不上这个问题" in x for x in labels), f"参考资料措辞要诚实: {labels}"
+    assert not any("知识库命中" in x for x in labels), "没答上时不该说'命中'"

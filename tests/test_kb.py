@@ -8,7 +8,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from nl2sql.config import Settings
 from nl2sql.kb import build_sql_doc_block, rrf_fuse, tokenize_cn
+from nl2sql.llm import LLMClient
 from nl2sql.pipeline import Text2SQLPipeline
+from nl2sql.review import NO_ANSWER_MARK
 from nl2sql.vectorstore import DocHit
 
 from examples.grg_engine import GRGQueryEngine
@@ -218,3 +220,37 @@ def test_knowledge_question_is_not_polluted_by_inherited_filters():
     assert "华东" not in q, f"上一轮继承的区域污染了文档检索: {q}"
     assert "上个月" not in q, f"上一轮继承的时间污染了文档检索: {q}"
     assert "reliability" not in q, f"上一轮继承的业务线污染了文档检索: {q}"
+
+
+# ---------------- 答案评审（档 1：引擎出口的零成本复核） ----------------
+# 真机一幕：问「全部数据」-> 走 RAG -> 答「资料中未涉及。」-> 界面把它当正常回答展示，
+# 还写着「知识库命中 4 篇」。答案本身没错（提示词就这么要求的），但它说明**没答上**。
+
+class _NoAnswerLLM(LLMClient):
+    """LLM 替身：按提示词的兜底要求作答「资料中未涉及」。"""
+
+    def generate(self, prompt: str, system: str | None = None) -> str:
+        return f"{NO_ANSWER_MARK}。"
+
+
+def test_rag_no_answer_is_downgraded_to_guidance():
+    """RAG 答兜底话术 -> 引擎出口的评审把它换成引导，而不是当正常回答返回。"""
+    engine = _engine(_FakeRetriever(DOCS))
+    engine.pipeline.llm = _NoAnswerLLM()   # 让 RAG 走兜底话术
+
+    out = engine.ask("EMC 是什么意思")
+
+    assert out["type"] == "rag", "类型不变：类型说明走通了哪条路，不是结论对不对"
+    assert out["review"]["verdict"] == "no_answer"
+    assert NO_ANSWER_MARK not in out["answer"], "不该把兜底话术原样给用户看"
+    assert "可以这样问" in out["answer"], "应给出引导"
+    assert out["docs"] == DOCS, "检索到的资料仍要如实展示"
+
+
+def test_rag_real_answer_is_not_downgraded():
+    """正常答上的 RAG 结果不动它（评审不能过度触发）。"""
+    engine = _engine(_FakeRetriever(DOCS))
+    out = engine.ask("EMC 是什么意思")
+
+    assert out["type"] == "rag"
+    assert "review" not in out or out["review"].get("verdict") != "no_answer"

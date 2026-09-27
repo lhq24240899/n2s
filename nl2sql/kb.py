@@ -17,6 +17,7 @@ from __future__ import annotations
 from .embedding import Embedder
 from .fusion import rrf_fuse  # noqa: F401  对外仍可从 kb 导入，实现放在 fusion.py
 from .llm import LLMClient
+from .review import NO_ANSWER_MARK  # 兜底话术：提示词与评审共用同一来源
 from .vectorstore import DocHit, PgVectorStore
 
 # 中文停用字符：含这些字的 n-gram 不作为查询词（避免"的是""多少"这类噪声词）
@@ -147,7 +148,9 @@ RAG_SYSTEM_PROMPT = (
     "你是计量检测行业的知识助手。只能依据提供的资料回答，"
     "禁止编造资料里没有的数据、数字或结论。"
     "回答要简洁，并在引用到的句子后用 [编号] 标注来源，例如 [1][3]。"
-    "若资料不足以回答，就直接说明「资料中未涉及」。"
+    # 这句兜底话术与评审层共用同一个常量（见 nl2sql/review.py）：
+    # 提示词要求模型说它，评审层据此判定"这条 RAG 答案其实没答上"并降级为引导。
+    f"若资料不足以回答，就直接说明「{NO_ANSWER_MARK}」。"
 )
 
 
