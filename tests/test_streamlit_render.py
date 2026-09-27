@@ -253,3 +253,39 @@ def test_es_mode_shows_only_dsl_query(monkeypatch):
     assert len(code_blocks) == 1, f"DSL 档只应展示 1 个查询语句块: {code_blocks}"
     assert '"mode": "dsl"' in code_blocks[0], f"DSL JSON 应唯一展示: {code_blocks}"
     assert not code_blocks[0].startswith("source="), "DSL 档不应出现 PPL 语句"
+
+
+def test_es_answer_uses_collapsible_query_and_mapping_expanders(monkeypatch):
+    """ES/PPL 档的「查询语句」与「语义映射（溯源性）」各为独立下拉框，
+    对齐 SQL 档「🔍 生成的 SQL」「🧭 语义映射（可解释）」的结构，不再平铺 caption。"""
+    from examples.es_engine import EsQueryEngine
+    from nl2sql import es_backend
+
+    def fake_ask(self, question, *a, **kw):
+        return {
+            "type": "result",
+            "engine": "es",
+            "columns": ["region_dsl"],
+            "rows": [("华东_dsl",)],
+            "es_dsl": {"query": {"bool": {"filter": {"term": {"mode": "dsl"}}}}},
+            "ppl": {"query": "source=device_events | where level='ERROR'",
+                    "status": "executed", "columns": [], "rows": [], "adaptations": []},
+            "entities": {"index": "device_events", "filters": [("level", "term", "ERROR")]},
+            "reasons": ["IR->ES DSL 编译", "多轮上下文继承: level"],
+            "row_count": 1,
+            "empty": False,
+        }
+
+    monkeypatch.setattr(es_backend, "build_es_backend", lambda settings, mode: object())
+    monkeypatch.setattr(EsQueryEngine, "ask", fake_ask)
+
+    at = AppTest.from_file(str(ENTRY), default_timeout=120)
+    at.run()
+    at.radio(key="engine_label_v4").set_value(PPL_LABEL).run()
+    at.button(key="sample_ppl_0").click().run()
+
+    assert not at.exception, [e.value for e in at.exception]
+    labels = [ex.label for ex in at.expander]
+    assert "🔍 生成的查询语句" in labels, f"应有查询语句下拉框: {labels}"
+    assert "🧭 语义映射（可解释）" in labels, f"应有语义映射(溯源性)下拉框: {labels}"
+

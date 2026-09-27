@@ -403,8 +403,10 @@ def render_es_answer(out: dict, mode: str, elapsed_ms: float) -> None:
     else:
         st.info("查询执行完成，但无数据返回。")
 
-    # 语句区：只展示当前引擎档下发的那一种查询（DSL 档给 DSL，PPL 档给 PPL），不做对照展示
-    with st.expander("🔍 实际下发的查询语句", expanded=True):
+    # 生成的查询语句：默认折叠（与 SQL 档「🔍 生成的 SQL」对齐）；
+    # PPL 仅编译时自动展开，确保“为什么没真执行”的提示可见
+    ppl_compiled_only = (mode == "ppl" and ppl.get("status") != "executed")
+    with st.expander("🔍 生成的查询语句", expanded=ppl_compiled_only):
         if mode == "es":
             if out.get("es_dsl"):
                 st.markdown("**Elasticsearch DSL**（本次真执行）")
@@ -427,12 +429,13 @@ def render_es_answer(out: dict, mode: str, elapsed_ms: float) -> None:
                 if ppl.get("status_detail"):
                     st.caption(f"PPL 端点返回：{ppl['status_detail']}")
 
-    if out.get("entities"):
-        ent = out["entities"]
-        st.caption(f"IR 解析：索引 `{ent.get('index')}`，过滤条件 {ent.get('filters')}")
-    # 编译/多轮说明（上下文继承、维度替换、PPL 方言适配等）
-    for r in out.get("reasons") or []:
-        st.caption(f"· {r}")
+    # 溯源性信息（语义映射）：默认折叠下拉框，与 SQL 档「🧭 语义映射（可解释）」对齐
+    with st.expander("🧭 语义映射（可解释）"):
+        if out.get("entities"):
+            ent = out["entities"]
+            st.write(f"- IR 解析：索引 `{ent.get('index')}`，过滤条件 {ent.get('filters')}")
+        for r in out.get("reasons") or []:
+            st.write(f"- {r}")
 
 
 # ---------------------------------------------------------------------------
@@ -519,7 +522,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-single-dialect"
+APP_BUILD = "2026-09-27-es-collapsible"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
