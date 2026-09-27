@@ -100,15 +100,23 @@ class PsycopgRunner(DBRunner):
                 pass
 
     def _query(self, sql: str) -> tuple[list[str], list[tuple]]:
-        conn = self._connect()
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql)
-                cols = [d[0] for d in cur.description] if cur.description else []
-                return cols, cur.fetchall()
-        except Exception:  # noqa: BLE001
-            self._discard()
-            raise
+        last_exc: Exception | None = None
+        # 最多尝试两次：若撞上「刚被服务端回收的空闲连接」(SSL 已关但 closed 仍为 False，
+        # psycopg 在真正 execute 之前无从知晓)，第一次会抛
+        # `SSL connection has been closed unexpectedly`；丢弃后重建连接重跑一次即可无感恢复，
+        # 用户不必手动重试。仅对只读幂等查询重试，安全。
+        for _ in range(2):
+            try:
+                conn = self._connect()
+                with conn.cursor() as cur:
+                    cur.execute(sql)
+                    cols = [d[0] for d in cur.description] if cur.description else []
+                    return cols, cur.fetchall()
+            except Exception as e:  # noqa: BLE001
+                last_exc = e
+                self._discard()  # 任何异常都丢弃坏连接，下一次自动重建
+        assert last_exc is not None  # 循环至少执行一次，下面必然非空
+        raise last_exc
 
     def explain(self, sql: str) -> tuple[bool, Optional[str]]:
         try:
