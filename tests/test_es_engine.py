@@ -336,3 +336,34 @@ def test_scope_filters_survive_multi_turn_and_are_not_replaced():
     assert ("region", "term", "华南") in pairs      # 用户本轮显式说的维度也在
     # 两个 term 同时存在于 DSL -> 交集为空，是预期的 fail-closed 行为
     assert out["es_dsl"]["query"]["bool"]["filter"].count({"term": {"region": "华东"}}) == 1
+
+
+# ---------------- 域自检：业务问题别在日志引擎里静默降级 ----------------
+# 真机踩过：在 DSL/PPL 档问「已开票合同金额最高的客户是哪个」。
+# _parse 只被"最高"触发，但没有分组 -> _assemble 丢掉 order_by -> IR 变成
+# 「无过滤 + 无分组 + 全量 count」-> 返回整个索引的文档总数，看着像答案实则答非所问。
+
+
+def test_business_question_is_clarified_instead_of_silently_counted():
+    """业务问题落到日志引擎：必须澄清，不能返回"全量计数"这种假答案。"""
+    eng, calls = _engine()
+
+    out = eng.ask("已开票合同金额最高的客户是哪个")
+
+    assert out["type"] == "clarification", f"应澄清，实际 {out}"
+    assert "SQL" in out["message"], "应引导用户去 SQL 档提问"
+    assert not calls, "不应真的发起 ES 查询（澄清就该在这一步止住）"
+
+
+def test_log_question_without_domain_word_is_still_answered():
+    """没写"日志/告警"但有可解析条件的问句，仍属本域，不能被误拦。"""
+    eng, _ = _engine()
+    out = eng.ask("最近7天ERROR有多少条")
+    assert out["type"] == "result"
+
+
+def test_domain_word_alone_is_not_blocked_even_without_signals():
+    """写了"日志"但没有任何信号：保持原行为（全量计数），不因新规则被拦。"""
+    eng, _ = _engine()
+    out = eng.ask("日志总量")
+    assert out["type"] == "result", f"含域词「日志」不应被域自检拦下: {out}"

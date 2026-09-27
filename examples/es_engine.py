@@ -155,6 +155,34 @@ class EsQueryEngine:
         err = ir.validate()
         if err:
             return {"type": "clarification", "message": f"未能理解该日志类问题：{err}", "engine": "es"}
+
+        # 域自检（引擎级兜底，与 HybridRouter.is_es_domain 呼应）：
+        # 问题不属于事件流水域、且**解析不出任何过滤/分组/排序信号**时，它多半压根不是
+        # 日志问题 —— 此时必须澄清，绝不能不吭声地去执行。
+        #
+        # 真机踩过：在 DSL/PPL 档问「已开票合同金额最高的客户是哪个」。
+        # `_parse` 只被"最高"两个字触发（第 7 步设了 order_by），但因为没有分组，
+        # `_assemble` 会把 order_by 丢掉，最终 IR 是「无过滤 + 无分组 + 全量 count」，
+        # 于是编译出 `source=device_events | stats count() as cnt | head 1`，
+        # 返回**整个索引的文档总数**（1,222）——看着像个正经答案，其实答非所问。
+        # 静默的错误答案比报错更糟，所以这里宁可说"我听不懂"。
+        #
+        # 只在"零信号"时才拦：像「最近7天ERROR有多少条」没写"日志"二字，但时间条件解析得出，
+        # 属于本域，不拦；「日志总量」写全了域词但没信号，也不拦（交给下面的全量计数）。
+        if (
+            not self.is_es_domain(question)
+            and not ir.filters
+            and not ir.group_by
+            and not ir.order_by
+        ):
+            return {
+                "type": "clarification",
+                "message": (
+                    "这看起来不是「事件流水」类问题（本档只处理告警 / 异常 / 日志 / 事件）。"
+                    "若你想问业务指标、客户或合同这类数据，请在「🔢 SQL · PostgreSQL」档提问。"
+                ),
+                "engine": "es",
+            }
         try:
             dsl = ir.to_es_dsl()
             cols, rows = self.backend.query(self.index, dsl, ir)

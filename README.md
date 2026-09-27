@@ -839,6 +839,15 @@ ES 报错时**自动回落 SQL**并在 `reasons` 里标注。行级权限由 `sc
 `DataPolicy` 映射成 ES `terms` 过滤——`labs.region → region`、`business_lines.code → business_line`，
 **换引擎不换安全等级**。
 
+`EsQueryEngine` 自己还有一道**域自检**兜底：问题不属于事件流水域、且解析不出任何过滤/分组/排序
+信号时，直接返回澄清，而不是硬执行。加这道是因为真机踩过——在 DSL/PPL 档问
+「已开票合同金额最高的客户是哪个」：`_parse` 只被"最高"二字触发（设了 `order_by`），但没有分组，
+`_assemble` 便把 `order_by` 丢掉，最终 IR 是「无过滤 + 无分组 + 全量 count」，
+编译出 `source=device_events | stats count() as cnt | head 1`，**返回整个索引的文档总数**——
+看着像个正经答案，实则答非所问。**静默的错误答案比报错更糟**，所以宁可说"我听不懂"。
+（`tests/test_es_engine.py` 里三条测试分别守住：业务问题被澄清、没写域词但有条件的问句不被误拦、
+只写域词无信号的问句保持原行为。）
+
 ### 14.4 PPL 真执行：Aiven OpenSearch 接入（同一份 IR，第二个后端）
 
 `ElasticsearchBackend.execute_ppl()` 走 OpenSearch 的 `_plugins/_ppl` 端点；每次 `ask()` 都会
