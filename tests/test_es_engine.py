@@ -367,3 +367,91 @@ def test_domain_word_alone_is_not_blocked_even_without_signals():
     eng, _ = _engine()
     out = eng.ask("日志总量")
     assert out["type"] == "result", f"含域词「日志」不应被域自检拦下: {out}"
+
+
+# ---------------- PPL 端点能力：别再对着 Elasticsearch 发注定失败的 PPL ----------------
+# 真机现象：DSL 档每次提问都往 ES 集群打一次 `POST /_plugins/_ppl`，得到
+# `400 no handler found for uri [/_plugins/_ppl]`（PPL 是 OpenSearch 的能力，
+# Elasticsearch 上根本没有这条路由）。它不影响 DSL 结果，但白跑一次网络往返，
+# 还会在日志里留下一条看着像"DSL 坏了"的 400。
+
+def _ppl_probe_transport(stats_status: int):
+    """MockTransport：记录所有请求；`/_plugins/_ppl/stats`（端点探测）返回指定状态码。"""
+    calls: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.raw_path.decode()
+        calls.append({"method": request.method, "path": path})
+        if path == "/_plugins/_ppl/stats":
+            if stats_status == 400:
+                return httpx.Response(400, json={
+                    "error": "no handler found for uri [/_plugins/_ppl/stats] and method [GET]"})
+            return httpx.Response(stats_status, json={})
+        if path == "/_plugins/_ppl":
+            return httpx.Response(200, json={
+                "schema": [{"name": "cnt", "type": "long"}], "datarows": [[9]]})
+        return httpx.Response(200, json={"hits": {"total": {"value": 97}}})
+
+    return handler, calls
+
+
+def _ppl_engine(handler, **kw):
+    backend = ElasticsearchBackend(
+        host="https://es.example:9200", user="elastic", password="x",
+        transport=httpx.MockTransport(handler),
+    )
+    return EsQueryEngine(backend, index="device_events", **kw)
+
+
+def test_dsl_engine_never_sends_ppl_requests():
+    """DSL 档只执行 `_search`：连端点探测都不该发（那一档的 PPL 请求注定 400）。"""
+    handler, calls = _ppl_probe_transport(400)
+    out = _ppl_engine(handler, ppl_enabled=False).ask("最近7天告警")
+
+    assert out["type"] == "result", f"DSL 主结果不受影响: {out}"
+    assert not [c for c in calls if "_ppl" in c["path"]], f"DSL 档不该发 PPL 请求: {calls}"
+    assert out["ppl"]["status"] == "compiled-only"
+    assert "PPL · OpenSearch" in out["ppl"]["status_detail"]
+
+
+def test_ppl_endpoint_without_ppl_is_explained_not_hammered():
+    """端点没有 `_plugins/_ppl`（连到了 Elasticsearch）：如实说明原因，且不再撞 POST。"""
+    handler, calls = _ppl_probe_transport(400)
+    out = _ppl_engine(handler).ask("最近7天告警")   # 默认 ppl_enabled=True，即 PPL 档的行为
+
+    assert not [c for c in calls if c["method"] == "POST" and c["path"] == "/_plugins/_ppl"]
+    assert out["ppl"]["status"] == "compiled-only"
+    assert "ES__PPL_HOST" in out["ppl"]["status_detail"], "要给出可操作的修法，而不是一坨 JSON"
+
+
+def test_ppl_probe_result_is_cached():
+    """探测结果缓存：连问两次只探一次端点，不给集群添无谓请求。"""
+    handler, calls = _ppl_probe_transport(400)
+    eng = _ppl_engine(handler)
+    eng.ask("最近7天告警")
+    eng.ask("最近7天告警")
+
+    assert len([c for c in calls if c["path"] == "/_plugins/_ppl/stats"]) == 1
+
+
+def test_ppl_probe_denied_does_not_disable_ppl():
+    """探测被拒（403）不等于 PPL 不能用：保持原行为，照旧真执行（不能因探测权限误降级）。"""
+    handler, calls = _ppl_probe_transport(403)
+    out = _ppl_engine(handler).ask("最近7天告警")
+
+    assert out["ppl"]["status"] == "executed"
+    assert any(c["method"] == "POST" and c["path"] == "/_plugins/_ppl" for c in calls)
+
+
+def test_execute_ppl_on_non_opensearch_raises_actionable_error():
+    """后端直连时撞上"没有这条路由"，要给可操作报错（指出该配什么），而不是原样抛 JSON。"""
+    handler, _ = _ppl_probe_transport(400)
+    backend = ElasticsearchBackend(
+        host="https://es.example:9200", user="elastic", password="x",
+        transport=httpx.MockTransport(handler),
+    )
+    with pytest.raises(EsError) as ei:
+        backend.execute_ppl("source=device_events | stats count() as cnt")
+
+    msg = str(ei.value)
+    assert "OpenSearch" in msg and "ES__PPL_HOST" in msg

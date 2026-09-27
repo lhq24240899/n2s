@@ -17,6 +17,19 @@ class EsError(Exception):
     """ES 查询失败（网络/鉴权/语法）。接口层映射为 503。"""
 
 
+# PPL 打在"不是 OpenSearch"的端点上时的统一说明。
+# 真机踩坑：DSL 档每次提问都会顺带发一次 `POST /_plugins/_ppl`，而 DSL 档连的是
+# Elasticsearch（阿里云），该路由根本不存在 -> 400 `no handler found for uri [/_plugins/_ppl]`。
+# 这行 400 会一直躺在日志里，看着像"DSL 坏了"。它不是查询写错，也不是鉴权问题，
+# 而是**端点不对**：PPL 是 OpenSearch 的语言。
+PPL_ENDPOINT_HINT = (
+    "该端点不提供 PPL：Elasticsearch 上没有 `/_plugins/_ppl` 路由（PPL 是 OpenSearch 的能力），"
+    "集群会回 `400 no handler found for uri [/_plugins/_ppl]`（不是语法/鉴权错误）。"
+    "若要用 PPL，请把 OpenSearch 端点配到 `ES__PPL_HOST`（或 `ES__PPL_ENABLED=true`），"
+    "并在网页的「🧭 PPL · OpenSearch」档提问。"
+)
+
+
 class ElasticsearchBackend:
     def __init__(
         self,
@@ -30,6 +43,8 @@ class ElasticsearchBackend:
             raise ValueError("ES__HOST 未配置")
         self.host = host.rstrip("/")
         self.timeout = timeout
+        # `_plugins/_ppl` 端点是否可用：None = 尚未探测（见 ppl_supported）
+        self._ppl_ok: Optional[bool] = None
         self._client = httpx.Client(
             base_url=self.host,
             auth=(user, password) if user else None,
@@ -81,12 +96,30 @@ class ElasticsearchBackend:
         return parse_es_response(resp, ir)
 
     def ppl_supported(self) -> bool:
-        """探测 /_plugins/_ppl 端点：OpenSearch 为 True，普通 Elasticsearch 为 False。"""
+        """探测 `/_plugins/_ppl` 端点：OpenSearch 为 True，普通 Elasticsearch 为 False。
+
+        结果**缓存**，每个实例只真探一次——否则每问一句都要多打一次注定失败的请求
+        （真机现象：日志里成排的 `POST /_plugins/_ppl 400`）。
+
+        判定分寸（宁可放行，不可误禁）：
+        - 200        -> 支持；
+        - 400 / 404  -> 不支持（ES 上不存在该路由，回 `no handler found`）；
+        - 其它（401/403/5xx/网络错误）-> 视为支持：探测本身失败不代表 PPL 不能用，
+          此时保持原行为（照旧尝试真执行），避免因为探测权限不足把 PPL 档误降级。
+        """
+        if self._ppl_ok is not None:
+            return self._ppl_ok
         try:
             r = self._client.get("/_plugins/_ppl/stats", headers=self._headers())
-            return r.status_code == 200
+            if r.status_code == 200:
+                self._ppl_ok = True
+            elif r.status_code in (400, 404):
+                self._ppl_ok = False
+            else:
+                self._ppl_ok = True
         except Exception:  # noqa: BLE001
-            return False
+            self._ppl_ok = True
+        return self._ppl_ok
 
     def execute_ppl(self, ppl_query: str, ir=None) -> tuple[list[str], list[tuple]]:
         """真执行 PPL（OpenSearch _plugins/_ppl）。失败抛 EsError，上层降级。
@@ -98,11 +131,18 @@ class ElasticsearchBackend:
         `parse_es_response` 的 `[分组, 指标...]` 约定相反。传 ir 进来即可按列名重排对齐契约，
         否则上层按 [key, value] 取值会整体错位（表现为"区域名和数字互换"）。
         """
+        if not self.ppl_supported():
+            raise EsError(PPL_ENDPOINT_HINT)
         try:
             r = self._client.post(
                 "/_plugins/_ppl", json={"query": ppl_query}, headers=self._headers())
             if r.status_code != 200:
                 detail = r.text[:300]
+                # 端点根本没有 PPL 路由（连到了 Elasticsearch）—— 与"查询写错"完全不同，
+                # 要明确说清，并把探测结果置为不支持，后续不再重复撞。
+                if "no handler found" in detail:
+                    self._ppl_ok = False
+                    raise EsError(PPL_ENDPOINT_HINT)
                 # 已知引擎限制：Calcite 用 ISO-8859-1 编码字面量，非 ASCII（中文）直接 500。
                 # 这不是查询写错了，换语法（U&'..'/like/match/双引号）都绕不过去，要如实告知。
                 if "ISO-8859-1" in detail or "CalciteException" in detail:

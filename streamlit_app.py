@@ -340,7 +340,12 @@ def get_es_engine(mode: str):
     if backend is None:
         st.session_state[key] = None
         return None
-    engine = EsQueryEngine(backend, index=resolve_index(settings, mode))
+    # ppl_enabled：DSL 档连的是 Elasticsearch 的 `_search` 端点，对它发 PPL 必然 400
+    # （PPL 是 OpenSearch 的能力），所以那一档不再尝试——省掉一次注定失败的网络往返，
+    # 也免得日志里那条 400 被误读成"DSL 坏了"。PPL 档才真执行。
+    engine = EsQueryEngine(
+        backend, index=resolve_index(settings, mode), ppl_enabled=(mode == "ppl")
+    )
     st.session_state[key] = engine
     return engine
 
@@ -425,10 +430,16 @@ def render_es_answer(out: dict, mode: str, elapsed_ms: float) -> None:
                 if status != "executed":
                     st.info(
                         "当前 PPL 未真执行，已降级为「仅编译」。常见原因：\n"
-                        "1. 该集群是普通 Elasticsearch，没有 `_plugins/_ppl` 端点（PPL 是 OpenSearch 的语言）；\n"
-                        "2. 未配置 `ES__PPL_HOST`（PPL 专用的 OpenSearch 端点）；\n"
+                        "1. 未配置 `ES__PPL_HOST`（PPL 专用的 OpenSearch 端点），于是回退到了 ES 集群——\n"
+                        "   普通 Elasticsearch 没有 `_plugins/_ppl` 端点（PPL 是 OpenSearch 的语言）；\n"
+                        "2. `ES__PPL_HOST` 指向的集群不是 OpenSearch；\n"
                         "3. 端点或鉴权问题，详见下方返回。"
                     )
+                    # 把"实际打到了哪台端点"摆出来：这是这类问题最快的一条线索
+                    # （真机踩过：PPL 请求打到了 ES 集群，日志里只有一条莫名其妙的 400）。
+                    from nl2sql.config import get_settings
+
+                    st.caption(f"当前 PPL 实际端点：{es_backend_info(get_settings(), mode)}")
                 if ppl.get("status_detail"):
                     st.caption(f"PPL 端点返回：{ppl['status_detail']}")
 
@@ -533,7 +544,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-unrecognized-slot"
+APP_BUILD = "2026-09-27-ppl-endpoint-probe"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -602,6 +613,25 @@ def config_diag() -> str:
         )
     except Exception as e:  # noqa: BLE001
         lines.append(f"解析失败: {type(e).__name__}: {e}")
+    # ES / OpenSearch 两个端点（只显示主机与启用位，不显示凭据）——
+    # 只有 ES__HOST、没有 ES__PPL_HOST 时，PPL 档会回退到 ES 集群，
+    # 于是 `_plugins/_ppl` 必然 400。这一行能让这类问题一眼看出来。
+    try:
+        from nl2sql.config import get_settings
+
+        es = get_settings().es
+
+        def _host_only(h: str) -> str:
+            return h.split("://")[-1].split("@")[-1] if h else "(空)"
+
+        lines.append(
+            f"ES 解析结果: ES__ENABLED={es.enabled}, ES__PPL_ENABLED={es.ppl_enabled}, "
+            f"ES__HOST={_host_only(es.host)}（索引 {es.index}）, "
+            f"ES__PPL_HOST={_host_only(es.ppl_host)}"
+            + ("" if es.ppl_host else "  ← 为空：PPL 档会回退到 ES__HOST，PPL 无法真执行")
+        )
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"ES 配置解析失败: {type(e).__name__}")
     return "\n".join(lines)
 
 

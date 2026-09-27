@@ -162,3 +162,8 @@ python examples/eval_run.py --min-accuracy 0.9 # 低于阈值退出码 1，可�
   那是第 9 步要演示的能力，别当成 bug。
 - 演示前确认库里有数据（`labs 5 / reports 60 / equipment 7`）。库被重建过的话数字会变，
   重算方法见 `TESTCASES.md` 文末。
+- **第 8 步若显示「PPL（仅编译，未执行）」**：说明当前环境的 `ES__PPL_HOST` 没读到
+  （PPL 档会回退到 ES 集群，而普通 ES 没有 `_plugins/_ppl`）。展开侧边栏「🩺 部署诊断」
+  看 `ES__PPL_HOST` 那行即可确认；本地 `.env` 与平台 `.streamlit/secrets.toml` 是两份配置，
+  改了一份不代表另一份生效。顺带一句实话：**"这份 IR 编译到了 PPL"是可验证的**，
+  "PPL 跑没跑"只取决于你有没有那个 OpenSearch 端点——演示时说清这个区别反而加分。

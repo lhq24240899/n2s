@@ -146,6 +146,12 @@ python examples/es_eval.py                       # 双份成绩单：ES DSL x/y 
   并展开侧边栏「🩺 部署诊断」看 env 是否注入。
 - **问什么都「无匹配数据」**：连到了空库 / 索引里没灌数。用「🔌 数据源自检」核对——SQL 档看表行数，DSL/PPL 档看索引文档数与 level/region 分布。DSL/PPL 档若显示「PPL 真执行 ❌」，说明当前 PPL 端点回退到了普通 ES（仅编译不真跑）。
 - **切到 DSL/PPL 档后自检报「未启用」**：Secrets 里缺 `ES__*` / `ES__PPL_*`，按第 1 章补上。
+- **日志里出现 `POST /_plugins/_ppl 400`**：PPL 请求打到了 Elasticsearch 上——PPL 是
+  OpenSearch 的能力，普通 ES 没有 `/_plugins/_ppl` 路由，回的是
+  `400 no handler found`（**不是语法或鉴权问题**）。看侧边栏「🩺 部署诊断」里的
+  `ES__PPL_HOST`：为空即说明该环境只配了 `ES__HOST`，PPL 档会回退过去（页面显示
+  「PPL（仅编译，未执行）」）。补上 `ES__PPL_ENABLED=true` + `ES__PPL_HOST` 后 Reboot 即可。
+  （DSL 档本身不发 PPL 请求，所以这条 400 只会来自 PPL 档或评估脚本。）
 - **应用休眠**：Community Cloud 免费版长时间无人访问会休眠，下次访问自动唤醒（首次较慢）。
 - **要换显示名**（现在是 `智能问数`）：改 `streamlit_app.py` 顶部 `DISPLAY_NAME`。
 

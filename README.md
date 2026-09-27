@@ -898,9 +898,26 @@ ES 报错时**自动回落 SQL**并在 `reasons` 里标注。行级权限由 `sc
 
 ### 14.4 PPL 真执行：Aiven OpenSearch 接入（同一份 IR，第二个后端）
 
-`ElasticsearchBackend.execute_ppl()` 走 OpenSearch 的 `_plugins/_ppl` 端点；每次 `ask()` 都会
+`ElasticsearchBackend.execute_ppl()` 走 OpenSearch 的 `_plugins/_ppl` 端点；提问时会
 双路执行——ES DSL 与 PPL 各跑一遍，`ppl.status` 标注 `executed` / `compiled-only`：
 后端探测不到 PPL 端点（普通 ES，如阿里云）就自动降级，主结果不受影响。
+
+**踩坑：PPL 请求打到 Elasticsearch 上 = 每次提问一条 400。** PPL 是 OpenSearch 的能力，
+Elasticsearch 上没有 `/_plugins/_ppl` 这条路由，会回
+`400 no handler found for uri [/_plugins/_ppl]`（**不是语法错，也不是鉴权错**）。
+真机日志里成排的这条 400，很容易被误读成"DSL 档坏了"。两处收口：
+
+- **DSL 档根本不发 PPL 请求**（`EsQueryEngine(..., ppl_enabled=False)`）：那一档连的就是
+  ES 的 `_search` 端点，发 PPL 是必然失败的一次网络往返；
+- **PPL 档先探测端点**（`ppl_supported()`，结果缓存，每实例只探一次）：探测到没有
+  `_plugins/_ppl` 就**不发请求**，直接把原因说清（"该端点不提供 PPL，请配 `ES__PPL_HOST`"）。
+  判定分寸是"宁可放行不可误禁"：只有 400/404 才算不支持，401/403/5xx/网络错误都视为
+  "探测失败但不代表不能用"，保持原行为。
+
+> 注意 `ES__PPL_HOST` 为空时 PPL 档会**回退到 `ES__HOST`**（阿里云 ES）→ 页面显示
+> 「PPL（仅编译，未执行）」。所以线上若突然出现这种情况，先查这个变量是否真的注入到了
+> 该环境（本地 `.env` / 平台 `.streamlit/secrets.toml` 是两份），侧边栏「🩺 部署诊断」
+> 会直接打印 ES 两个端点的解析结果。
 
 方言差异消化在**编译器**里（这正是 IR 方案的价值）：PPL 的 `where` 不认 ES 的 date math（`now-7d`），
 `to_ppl()` 把相对窗口换算成执行时刻的绝对时间（`_abs_since()`，可注入 now 做离线单测）。

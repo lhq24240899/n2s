@@ -14,6 +14,7 @@ import re
 from typing import Any, Optional
 
 from nl2sql.dsl import IRFilter, IRMetric, QueryIR
+from nl2sql.es_backend import PPL_ENDPOINT_HINT
 
 # 进入 ES 域的关键词（事件流水类问题）
 ES_DOMAIN_PATTERNS = ("告警", "异常", "日志", "事件")
@@ -126,9 +127,14 @@ class EsContext:
 class EsQueryEngine:
     """事件流水问数引擎（ES 后端）。ask() 返回与 SQL 引擎同构的 payload。"""
 
-    def __init__(self, backend, index: str = "device_events"):
+    def __init__(self, backend, index: str = "device_events", ppl_enabled: bool = True):
         self.backend = backend
         self.index = index
+        # 是否尝试真执行 PPL。DSL 档传 False：那一档连的就是 Elasticsearch 的 `_search` 端点，
+        # 对它发 PPL 是一次**必然失败**的请求（400 no handler found），除了在日志里留下
+        # 一条像"DSL 坏了"的 400、并白跑一个网络往返之外没有任何收益。
+        # 默认 True 保持旧行为：PPL 档 / 评估脚本照旧尝试（能不能跑由端点探测决定）。
+        self.ppl_enabled = ppl_enabled
         # 多轮上下文：与 SQL 路径的 QueryContext 同构（见 EsContext 的说明）
         self._ctx = EsContext()
 
@@ -195,11 +201,21 @@ class EsQueryEngine:
         # 透出去是为了让用户看懂"为什么 PPL 语句里的字段名和问题里的不一样"。
         adaptations = ir.ppl_adaptations()
         ppl_payload: dict = {"query": ppl, "status": "compiled-only", "adaptations": adaptations}
-        try:
-            ppl_cols, ppl_rows = self.backend.execute_ppl(ppl, ir=ir)
-            ppl_payload.update(status="executed", columns=ppl_cols, rows=ppl_rows)
-        except Exception as e:  # noqa: BLE001 - PPL 不可用不影响主结果
-            ppl_payload["status_detail"] = str(e)[:200]
+        if not self.ppl_enabled:
+            # 本档（DSL）只执行 `_search`；PPL 由 PPL 档执行。这里连探测都不发，
+            # 免得往 ES 集群再打一个没有意义的请求（见 __init__ 的说明）。
+            ppl_payload["status_detail"] = (
+                "本档只执行 ES `_search`。PPL 请在「🧭 PPL · OpenSearch」档执行。"
+            )
+        elif not getattr(self.backend, "ppl_supported", lambda: True)():
+            # 该端点不是 OpenSearch（没有 `_plugins/_ppl`）：不发请求，直接如实说明原因。
+            ppl_payload["status_detail"] = PPL_ENDPOINT_HINT
+        else:
+            try:
+                ppl_cols, ppl_rows = self.backend.execute_ppl(ppl, ir=ir)
+                ppl_payload.update(status="executed", columns=ppl_cols, rows=ppl_rows)
+            except Exception as e:  # noqa: BLE001 - PPL 不可用不影响主结果
+                ppl_payload["status_detail"] = str(e)[:200]
 
         return {
             "type": "result",
