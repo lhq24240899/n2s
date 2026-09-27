@@ -289,3 +289,51 @@ def test_es_answer_uses_collapsible_query_and_mapping_expanders(monkeypatch):
     assert "🔍 生成的查询语句" in labels, f"应有查询语句下拉框: {labels}"
     assert "🧭 语义映射（可解释）" in labels, f"应有语义映射(溯源性)下拉框: {labels}"
 
+
+
+def test_sql_answer_shows_elapsed_time_and_doc_snippets(monkeypatch):
+    """SQL 档必须展示耗时（与 ES 档一致），且参考知识库要给出溯源片段（文档正文），
+    否则使用者只知道"参考了哪篇标题 + 检索分"，却看不出具体参考了哪段资料。"""
+    from examples.grg_engine import GRGQueryEngine
+    from types import SimpleNamespace
+
+    def fake_ask(self, question, *a, **kw):
+        return {
+            "type": "result",
+            "mapped": SimpleNamespace(metric=None, reasons=["（测试替身）"],
+                                     entities={"region": "华东"}, normalized=question),
+            "result": GenerationResult(sql="SELECT 42 AS answer", raw="SELECT 42 AS answer",
+                                       source=ResultSource.LLM),
+            "cols": ["answer"],
+            "rows": [(42,)],
+            "row_count": 1,
+            "empty": False,
+            # 故意带一篇有正文 content 的资料，验证溯源片段会被渲染
+            "docs": [
+                SimpleNamespace(id="m1", title="检测准时率口径说明",
+                                content="准时率 = 按期出具报告数 / 应出具报告总数；"
+                                        "按期指出具日不晚于承诺出具日。",
+                                source="指标口径库", reasons=["RRF 融合得分 0.05", "LLM 精排 9/10"]),
+            ],
+        }
+
+    monkeypatch.setattr(GRGQueryEngine, "ask", fake_ask)
+
+    at = AppTest.from_file(str(ENTRY), default_timeout=120)
+    at.run()
+    at.button(key="sample_sql_0").click().run()
+
+    assert not at.exception, [e.value for e in at.exception]
+
+    # 1) 顶部状态行必须含"耗时"（与 ES 档对齐）
+    status = [c.value for c in at.caption if "耗时" in c.value]
+    assert status, "SQL 档应展示耗时"
+    assert "SQL" in status[0], f"耗时 caption 应标明 SQL 引擎: {status}"
+
+    # 2) 参考知识库下拉框里必须出现文档正文（溯源片段），而不只是标题
+    md = [m.value for m in at.markdown]
+    assert any("准时率 = 按期出具报告数" in m for m in md), \
+        f"参考知识库应展示溯源片段(文档正文): {md}"
+
+    # 3) 参考知识库标题也应保留（st.write 的 **加粗** 文本在 AppTest 里归到 markdown）
+    assert any("检测准时率口径说明" in m for m in md), "应出现资料标题"

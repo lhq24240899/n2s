@@ -465,7 +465,7 @@ def run_es_query(question: str, mode: str) -> tuple[dict, float]:
 
 def render_by_engine(payload: dict, mode: str, elapsed_ms: float = 0.0) -> None:
     if mode == "sql":
-        render_answer(payload)
+        render_answer(payload, elapsed_ms)
     else:
         render_es_answer(payload, mode, elapsed_ms)
 
@@ -522,7 +522,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-d03-fix"
+APP_BUILD = "2026-09-27-ui-elapsed-snippet"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -708,6 +708,16 @@ def _fmt(v) -> str:
     return str(v)
 
 
+def _render_doc_snippet(d) -> None:
+    """把被引用的文档正文作为溯源片段展示（让使用者知道"到底参考了哪段资料"）。"""
+    content = getattr(d, "content", "") or ""
+    if not content:
+        return
+    # 长文档截断，避免把整篇资料顶到对话区；溯源看关键片段即可
+    snippet = content if len(content) <= 600 else content[:600] + " …（已截断，完整内容见知识库）"
+    st.markdown("> " + snippet.replace("\n", "\n> "))
+
+
 def render_rag(out: dict) -> None:
     """文档问答（混合 RAG）：只依据知识库资料作答，并列出引用来源。"""
     st.caption("📚 知识库问答 · 结构化问数不适用时走文档检索（三路召回 + RRF 融合）")
@@ -718,6 +728,7 @@ def render_rag(out: dict) -> None:
             for i, d in enumerate(docs, start=1):
                 src = f" — {d.source}" if getattr(d, "source", "") else ""
                 st.write(f"**[{i}] {d.title}**{src}")
+                _render_doc_snippet(d)
                 if getattr(d, "reasons", None):
                     # 展示全部 reasons：召回分（RRF 融合）与精排分（LLM）都在，
                     # 否则只显示 RRF 分会让"顺序按精排分排"看起来像排反了
@@ -731,6 +742,7 @@ def render_doc_sources(docs: list) -> None:
     with st.expander(f"📚 参考知识库（{len(docs)} 篇，已作为口径补充注入生成）"):
         for i, d in enumerate(docs, start=1):
             st.write(f"**[{i}] {d.title}**")
+            _render_doc_snippet(d)
             if getattr(d, "reasons", None):
                 # 展示全部 reasons：召回分（RRF 融合）与精排分（LLM）都在，
                 # 否则只显示 RRF 分会让"顺序按精排分排"看起来像排反了
@@ -749,7 +761,7 @@ def entities_text(entities: dict) -> str:
     return "、".join(parts) or "（无）"
 
 
-def render_answer(out: dict) -> None:
+def render_answer(out: dict, elapsed_ms: float = 0.0) -> None:
     # 安全护栏拒绝：明确告知，不进入任何生成 / 检索
     if out.get("type") == "refused":
         st.warning(f"🚫 {out.get('answer', '该问题不在我的回答范围内。')}")
@@ -759,6 +771,9 @@ def render_answer(out: dict) -> None:
     if out.get("type") == "clarification":
         st.warning(f"❓ 需要澄清：{out['message']}")
         return
+
+    # 顶部状态行：引擎 + 耗时（与 ES 档一致，便于横向对比三档性能）
+    st.caption(f"🔢 {ENGINE_BADGE['sql']} · 耗时 {elapsed_ms:.0f} ms")
 
     # 文档问答（RAG 分支）
     if out.get("type") == "rag":
@@ -961,7 +976,9 @@ if question:
         with st.spinner(_spin):
             try:
                 if ENGINE_MODE == "sql":
+                    t0 = time.time()
                     out = get_engine().ask(question)
+                    elapsed_ms = (time.time() - t0) * 1000
                 else:
                     out, elapsed_ms = run_es_query(question, ENGINE_MODE)
             except Exception as e:  # noqa: BLE001
