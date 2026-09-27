@@ -210,13 +210,24 @@ class GRGQueryEngine:
         # 路由：解析不出结构化意图（无指标、无计数/排名意图、也没要求分组）-> 走文档问答（RAG）
         # （"多少台设备"这类总量问句没有注册指标，必须靠 count 意图保住结构化路由——
         #   评估集实测：缺这条规则时「总量」类 8 条全部被错误路由进 RAG）
+        #
+        # 两个方向相反的例外，别看错：
+        #   · count / topn  -> 没有指标也要走 SQL（"多少台设备"确实要数行）
+        #   · knowledge     -> **有指标也要走 RAG**（"EMC 是什么意思"根本不是查数据）
+        # 判据必须是「本轮解析出」的 knowledge 标记，而不能是 merged 里继承来的指标：
+        # 真机踩过——先问「华南区…准时率」，再问「EMC 是什么意思」，上一轮的指标被继承进
+        # merged，路由据 merged.metric 判成结构化问句，于是拿"准时率 WHERE 业务线=emc AND
+        # 区域=华南"去查库，返回「无匹配数据」。定义类问题与上一轮无关，不该被劫持。
+        knowledge = "knowledge" in merged.entities
         structured = (
             merged.metric is not None
             or "group_by" in merged.entities
             or "count" in merged.entities
             or "topn" in merged.entities
         )
-        if not structured and docs:
+        # docs 为空（知识库未配 / 未命中）时不硬走 RAG，仍退回结构化查询，
+        # 保持原有的降级行为，而不是变成"什么都不答"。
+        if (knowledge or not structured) and docs:
             answer = answer_with_docs(
                 self.pipeline.llm, mapped.normalized, docs, self.doc_max_chars
             )

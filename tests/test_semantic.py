@@ -95,3 +95,26 @@ def test_group_by_glossary_instruction_and_same_dim_filter_skipped():
     assert "business_lines.code = 'reliability'" not in text
     # 其他维度照常下发过滤
     assert "labs.region = '华东'" in text
+
+
+def test_knowledge_question_is_flagged_for_rag():
+    """定义/解释/对照类问句标记 knowledge，供引擎优先路由到文档问答。"""
+    m = SemanticMapper(_layer())
+    assert m.map("EMC 是什么意思").entities.get("knowledge") is True
+    assert m.map("ISO/IEC 17025 和 GB/T 27025 有什么区别").entities.get("knowledge") is True
+    assert m.map("什么是检测准时率").entities.get("knowledge") is True
+
+
+def test_data_question_is_not_flagged_as_knowledge():
+    """「是多少」是数据问句，与「是什么」一字之差，不能被误判。"""
+    m = SemanticMapper(_layer())
+    assert "knowledge" not in m.map("华东区上个月的准时率是多少").entities
+    assert "knowledge" not in m.map("各业务线的检测准时率是多少").entities
+
+
+def test_knowledge_flag_coexists_with_metric():
+    """知识型问句即使解析出指标也要带标记 —— 引擎据此覆盖"有指标就走 SQL"的判断。"""
+    m = SemanticMapper(_layer())
+    mapped = m.map("检测准时率是什么意思")
+    assert mapped.metric is not None          # 指标照样解析出来（用于展示/权限）
+    assert mapped.entities.get("knowledge") is True

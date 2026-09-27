@@ -311,6 +311,19 @@ class SemanticMapper:
     # 忘了返回"是哪个"的名称列（评估集实测）。
     TOPN_PATTERNS = ("最高", "最多", "最低", "最少", "排名", "前三个", "前三名", "top")
 
+    # 知识型问句（定义 / 解释 / 对照）：要查**知识库**，不是查数据。
+    # 与 count/topn 方向相反：那两个是"没有指标也要走结构化"，
+    # 这个是"**有指标也要走文档问答**"。
+    #
+    # 真机踩过：先问「华南区上个月…准时率」，再问「EMC 是什么意思」——
+    # 上一轮的指标被 inherit() 回填进 merged，路由据 merged.metric 判成结构化问句，
+    # 于是拿"准时率 WHERE 业务线=emc AND 区域=华南"去查库，返回「无匹配数据」。
+    # 例问「ISO/IEC 17025 和 GB/T 27025 有什么区别」同样中招。
+    KNOWLEDGE_PATTERNS = (
+        "是什么", "什么是", "什么意思", "含义", "定义", "解释", "介绍",
+        "有什么区别", "区别",
+    )
+
     def __init__(self, layer: SemanticLayer):
         self.layer = layer
 
@@ -379,6 +392,14 @@ class SemanticMapper:
         if any(p in question for p in self.TOPN_PATTERNS) or "top" in ql:
             entities["topn"] = True
             reasons.append("排名问句: 返回最值所在行（ORDER BY + LIMIT），需含名称列")
+
+        # 2.7) 知识型问句（定义/解释/对照）：显式标记，由引擎优先路由到文档问答。
+        #      注意这里**不判 metric**——正是"即使解析出指标也要走 RAG"。
+        #      该标记不会被 inherit() 回填（它只回填 metric/region/business_line/time），
+        #      所以不会跨轮污染。
+        if any(p in question for p in self.KNOWLEDGE_PATTERNS):
+            entities["knowledge"] = True
+            reasons.append("知识型问句: 走文档问答（定义/解释/对照）")
 
         # 3) 区域实体抽取
         for r in self.REGIONS:
