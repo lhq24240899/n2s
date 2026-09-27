@@ -406,7 +406,7 @@ def render_es_answer(out: dict, mode: str, elapsed_ms: float) -> None:
     else:
         st.info("查询执行完成，但无数据返回。")
 
-    # 生成的查询语句：默认折叠（与 SQL 档「🔍 生成的 SQL」对齐）；
+    # 生成的查询语句：默认折叠（与 SQL 档「🔍 生成的查询语句」对齐）；
     # PPL 仅编译时自动展开，确保“为什么没真执行”的提示可见
     ppl_compiled_only = (mode == "ppl" and ppl.get("status") != "executed")
     with st.expander("🔍 生成的查询语句", expanded=ppl_compiled_only):
@@ -533,7 +533,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-caliber-expander"
+APP_BUILD = "2026-09-27-query-statement-label"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -836,8 +836,8 @@ def render_answer(out: dict, elapsed_ms: float = 0.0) -> None:
         st.error(f"告警：{res.error}")
 
     if is_empty and res.sql:
-        # 没数据时自动展开 SQL + 诊断信息（本轮过滤实体 / 库内行数），便于直接排查
-        st.caption("⬇️ 未返回数据，已自动展开生成的 SQL 与诊断信息：")
+        # 没数据时自动展开查询语句 + 诊断信息（本轮过滤实体 / 库内行数），便于直接排查
+        st.caption("⬇️ 未返回数据，已自动展开生成的查询语句与诊断信息：")
         st.code(res.sql, language="sql")
         st.caption(f"本轮识别实体：`{mapped.entities}`")
         try:
@@ -848,7 +848,7 @@ def render_answer(out: dict, elapsed_ms: float = 0.0) -> None:
         except Exception:  # noqa: BLE001
             pass
     else:
-        with st.expander("🔍 生成的 SQL"):
+        with st.expander("🔍 生成的查询语句"):
             st.code(res.sql or "（无）", language="sql")
 
     with st.expander("🧭 语义映射（可解释）"):

@@ -257,7 +257,7 @@ def test_es_mode_shows_only_dsl_query(monkeypatch):
 
 def test_es_answer_uses_collapsible_query_and_mapping_expanders(monkeypatch):
     """ES/PPL 档的「查询语句」与「语义映射（溯源性）」各为独立下拉框，
-    对齐 SQL 档「🔍 生成的 SQL」「🧭 语义映射（可解释）」的结构，不再平铺 caption。"""
+    对齐 SQL 档「🔍 生成的查询语句」「🧭 语义映射（可解释）」的结构，不再平铺 caption。"""
     from examples.es_engine import EsQueryEngine
     from nl2sql import es_backend
 
@@ -388,3 +388,18 @@ def test_sql_metric_caliber_is_collapsible_right_below_semantic_mapping(monkeypa
     assert "检测准时率" in md, "应保留指标名"
     assert "应出具报告总数" in md, "应保留口径定义"
     assert "reports" in md, "应保留来源表"
+
+
+def test_sql_query_expander_is_labelled_query_statement(fake_sql_engine):
+    """SQL 档的查询语句下拉框统一叫「🔍 生成的查询语句」（与 DSL/PPL 档同名）。
+
+    三档同一位置用同一个叫法，用户切档不用换脑子；旧名「生成的 SQL」不应再出现。
+    """
+    at = AppTest.from_file(str(ENTRY), default_timeout=120)
+    at.run()
+    at.button(key="sample_sql_0").click().run()
+
+    assert not at.exception, [e.value for e in at.exception]
+    labels = [ex.label for ex in at.expander]
+    assert "🔍 生成的查询语句" in labels, f"应有查询语句下拉框: {labels}"
+    assert "🔍 生成的 SQL" not in labels, f"旧标签「生成的 SQL」应已改名: {labels}"
