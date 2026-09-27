@@ -226,3 +226,45 @@ def test_c05_retrieval_not_polluted_by_customer_example():
     assert "ex_contract_amount_top_customer" not in top_ids, (
         f"C05 检索被客户排名示例污染: {top_ids}"
     )
+
+
+# ---------------- 未识别槽位：不能静默沿用上一轮 ----------------
+# 真机：先问「华南呢」-> 0.8667；再问「那华西 准确率呢」-> 还是 0.8667、SQL 里仍是华南。
+# 根因：inherit() 只补"缺失"的槽位，把"用户提了但没懂"也当成"缺失"来补。
+
+def test_unrecognized_region_clarifies_instead_of_reusing_context():
+    e = _engine()
+    first = e.ask("华南区上个月可靠性试验的准时完成率是多少")
+    assert first["type"] == "result", "前置条件：第一轮应正常出结果并写进上下文"
+
+    out = e.ask("那华西 准确率呢")
+
+    assert out["type"] == "clarification", f"应澄清，实际 {out.get('type')}"
+    assert "华西" in out["message"]
+    assert "rows" not in out and "result" not in out, "澄清不该产生任何查询结果"
+
+
+def test_clarification_converges_instead_of_looping():
+    """澄清后给出有效值必须能出结果，不能反复澄清。"""
+    e = _engine()
+    e.ask("华南区上个月可靠性试验的准时完成率是多少")
+    assert e.ask("那华西 准确率呢")["type"] == "clarification"
+
+    out = e.ask("华南区的准时率是多少")
+
+    assert out["type"] == "result", f"澄清后应能答上来，实际 {out.get('type')}"
+
+
+def test_short_reply_narrows_only_the_remaining_slot():
+    """回复"华南"只补上区域 -> 仍缺指标 -> 只就指标再问一次（渐进式，不是死循环）。"""
+    e = _engine()
+    e.ask("华南区上个月可靠性试验的准时完成率是多少")
+    e.ask("那华西 准确率呢")
+
+    again = e.ask("华南")
+    assert again["type"] == "clarification"
+    assert "准确率" in again["message"]
+    assert "华西" not in again["message"], "区域已由回复解决，不该再问它"
+
+    out = e.ask("准时率")
+    assert out["type"] == "result", f"两个槽位补齐后应答上来，实际 {out.get('type')}"

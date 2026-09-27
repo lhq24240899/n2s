@@ -324,6 +324,17 @@ class SemanticMapper:
         "有什么区别", "区别",
     )
 
+    # 「疑似区域」：华X / X华，允许带"区"后缀（华西、华西区、华东区…）。
+    # 只覆盖"华"字系写法——不能放宽成 [东南西北]{2}，否则「这个东西」「东西南北」
+    # 会被误判成区域。
+    _REGION_CANDIDATE_RE = re.compile(r"(?:华[东南西北中]|[东南西北中]华)区?")
+
+    # 「疑似指标」：以"率"结尾的词（本项目所有比率型指标都以"率"结尾）。
+    _RATE_WORD_RE = re.compile(r"[\u4e00-\u9fa5]{2,4}率")
+
+    # 正则可能把虚词前缀一起吃进来（「那准确率」）——提示语里要还原成「准确率」
+    _PREFIX_STOPWORDS_RE = re.compile(r"^[那的这那个和与及也还]+")
+
     def __init__(self, layer: SemanticLayer):
         self.layer = layer
 
@@ -441,12 +452,63 @@ class SemanticMapper:
                 ambiguous_synonyms=ambiguous,
             )
 
+        # 6) 未识别槽位自检：本轮提到了"疑似区域/指标"的词却没识别出来 -> 澄清
+        clar = self._unrecognized_slot_clarification(question, entities, metric)
+        if clar:
+            reasons.append("未识别槽位: 改为澄清（不静默沿用上一轮的值）")
+
         return MappedQuery(
             original=question,
             normalized=normalized,
             metric=metric,
             entities=entities,
             resolved_synonyms=resolved,
-            clarification=None,
+            clarification=clar,
             reasons=reasons,
         )
+
+    def _unrecognized_slot_clarification(
+        self, question: str, entities: dict, metric: Optional[Metric]
+    ) -> Optional[str]:
+        """问句里出现了「疑似区域 / 疑似指标」的词，但我们没能识别出来 -> 澄清。
+
+        为什么需要这一步？
+        `QueryContext.inherit()` 只补「**缺失**」的槽位，而在它眼里
+        「用户没提」和「用户提了但我们没懂」**是同一种情况** —— 于是解析失败就等于"缺失"，
+        会被上一轮的值静默填上。
+
+        真机踩过：先问「华南呢」（返回 0.8667），再问「那华西 准确率呢」——
+        「华西」不在区域词表、「准确率」不是任何指标的别名，两个槽位都空了，
+        于是双双沿用上一轮（区域仍是华南、指标仍是准时率）。用户拿到一个
+        "看起来很正常、但问的根本不是他要的"数字。**拿错范围的数据，比说"我没懂"危险得多。**
+
+        原则：**只继承用户没提到的；用户提到了、我们没懂，就问。**
+        """
+        hints: list[str] = []
+
+        # ① 疑似区域但不在词表（"华西"）。
+        #    仅在**本轮没解析出有效区域**时提示：否则澄清后用户回一句「华南的准时率」，
+        #    重跑时问句里仍带着"华西"，会反复触发、陷入死循环。
+        if "region" not in entities:
+            cands = [
+                c[:-1] if c.endswith("区") else c
+                for c in self._REGION_CANDIDATE_RE.findall(question)
+            ]
+            bad = [c for c in cands if c not in self.REGIONS]
+            if bad:
+                hints.append(
+                    f"「{bad[0]}」不是有效区域。可选：{'、'.join(self.REGIONS)}"
+                )
+
+        # ② 有"X率"这样的指标词，但没命中任何已注册指标（"准确率"）。
+        #    同样只在 metric 为空时提示（回一句"准时率"就能收敛）。
+        if metric is None:
+            m = self._RATE_WORD_RE.search(question)
+            if m:
+                word = self._PREFIX_STOPWORDS_RE.sub("", m.group(0)) or m.group(0)
+                names = [x.name for x in self.layer.metrics.values()]
+                hints.append(
+                    f"没找到叫「{word}」的指标。现在能问的指标有：{'、'.join(names)}"
+                )
+
+        return "\n\n".join(hints) or None
