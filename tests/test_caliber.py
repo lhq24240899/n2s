@@ -186,3 +186,23 @@ def test_engine_has_no_caliber_key_when_clean():
     ).ask("某汽车客户的合同金额是多少")
 
     assert "caliber" not in out
+
+
+def test_group_display_column_accepts_domain_specific_column():
+    """误报回归（用评估集的真实 SQL）：G01「最近一个季度各业务板块的营收是多少」取自
+    `business_segment_revenue`，那个域里"业务板块"是 `business_segment` 列，
+    不是 `business_lines.name` —— 只认一个列名会对这条**完全正确**的 SQL 误报。
+
+    （这条误报是在 69 条真实 SQL 的误报复核里抓出来的；同一次复核还暴露了
+     `partition(".")` 对不带表前缀的列名返回空串的 bug。）
+    """
+    p = check_caliber(
+        "SELECT business_segment, revenue FROM business_segment_revenue "
+        "WHERE report_date = (SELECT MAX(report_date) FROM business_segment_revenue) "
+        "ORDER BY revenue DESC",
+        entities={"group_by": "business_line"}, group_by="business_line",
+        group_columns=GROUP_COLUMNS, group_column_accept=LAYER.GROUP_COLUMN_ACCEPT,
+        question="最近一个季度各业务板块的营收是多少",
+    )
+
+    assert p == []

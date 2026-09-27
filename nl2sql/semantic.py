@@ -178,6 +178,14 @@ class SemanticLayer:
         "customer": "customers.name",
     }
 
+    # 分组展示列的**可接受写法**：同一维度在不同主题域可能落到不同物理列。
+    # 实测（出口展示列校验的误报复核）：G01「最近一个季度各业务板块的营收是多少」
+    # 取自 `business_segment_revenue`，那个域里"业务板块"是 `business_segment` 列，
+    # 不是 `business_lines.name`——只认一个列名就会对这条**完全正确**的 SQL 误报。
+    GROUP_COLUMN_ACCEPT = {
+        "business_line": ("business_segment",),
+    }
+
     # 时间口径：口语 -> 规范 SQL 窗口。不固定死它，LLM 会时而写滚动窗口时而写自然月，
     # 同一个"上个月"返回不同数字（评估集实测抓到过）。
     TIME_WINDOWS = {

@@ -33,6 +33,14 @@ def _tables(parsed) -> set[str]:
     return {t.name.lower() for t in parsed.find_all(exp.Table) if t.name}
 
 
+def _colname(ref: str) -> str:
+    """`customers.name` / `name` 两种写法都取出 `name`。
+
+    （不要用 `partition(".")[2]`：不带表前缀时它会得到空串，于是永远匹配不上 —— 实测踩过。）
+    """
+    return str(ref).split(".")[-1].lower()
+
+
 def _columns(parsed) -> set[str]:
     return {c.name.lower() for c in parsed.find_all(exp.Column) if c.name}
 
@@ -66,6 +74,7 @@ def check_caliber(
     guard: Any = None,
     entity_columns: Optional[dict] = None,
     group_columns: Optional[dict] = None,
+    group_column_accept: Optional[dict] = None,
     question: str = "",
     dialect: str = "postgres",
 ) -> list[str]:
@@ -100,10 +109,14 @@ def check_caliber(
 
     # 2) 分组维度必须输出展示列：问「各客户」不能只给 id。
     #    （真机踩过：`SELECT c.customer_id ... GROUP BY c.customer_id` -> 用户看不懂是哪家客户）
+    #    允许多个可接受写法：同一维度在不同主题域可能落到不同物理列
+    #    （`business_line` 在营收域是 `business_segment`，见 SemanticLayer.GROUP_COLUMN_ACCEPT）。
     target = (group_columns or {}).get(group_by) if group_by else None
     if target:
-        _, _, column = str(target).partition(".")
-        if column and column.lower() not in _columns(parsed):
+        extras = (group_column_accept or {}).get(group_by) or ()
+        candidates = [target, *extras]
+        cols = _columns(parsed)
+        if not any(_colname(t) in cols for t in candidates):
             problems.append(
                 f"口径：本轮按「{group_by}」分组，SQL 应输出展示列 {target}，但 SELECT 里没有它"
             )
@@ -147,6 +160,7 @@ def check_mapped(sql: str, mapped, layer, dialect: str = "postgres") -> list[str
         guard=(getattr(layer, "metric_guards", None) or {}).get(getattr(metric, "id", None)),
         entity_columns=getattr(layer, "entity_columns", None),
         group_columns=getattr(layer, "GROUP_COLUMNS", None),
+        group_column_accept=getattr(layer, "GROUP_COLUMN_ACCEPT", None),
         question=getattr(mapped, "original", "") or getattr(mapped, "normalized", ""),
         dialect=dialect,
     )
