@@ -911,7 +911,6 @@ _PLACEHOLDER = {
 # 位置必须在 chat_input 之前 —— 按钮的返回值只有在创建它时才知道，放到后面就会变成
 # "点了没反应，要再点一次/再操作一次才提问"。问完后的隐藏由处理段末尾的 st.rerun() 负责。
 if not _engine_turns(ENGINE_MODE):
-    st.caption("💡 示例问题（点一下直接提问；开始对话后自动隐藏）")
     _sample_cols = st.columns(len(SAMPLES_BY_ENGINE[ENGINE_MODE]))
     for _i, _q in enumerate(SAMPLES_BY_ENGINE[ENGINE_MODE]):
         with _sample_cols[_i]:
