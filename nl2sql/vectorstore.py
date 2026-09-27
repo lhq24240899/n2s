@@ -11,13 +11,16 @@
 3. `vector_search` ：pgvector 余弦相似度 —— 语义改写（"准时率" ↔ "按期交付比例"）
 
 连接层沿用 BUG-05 的教训：**autocommit + 异常即弃连接**，避免一条坏语句
-把整条连接毒化成 `current transaction is aborted`。
+把整条连接毒化成 `current transaction is aborted`；并复用 `pgconn.py` 的重连逻辑
+（云库空闲挂起会关掉连接，而 `conn.closed` 仍为 False —— 首次 execute 才暴露）。
 """
 from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
 from typing import Optional
+
+from .pgconn import KEEPALIVE, run_with_reconnect
 
 
 @dataclass
@@ -49,7 +52,10 @@ class _PgConnMixin:
             import psycopg
 
             self._conn = psycopg.connect(
-                self.dsn, connect_timeout=int(self.timeout), autocommit=True
+                self.dsn,
+                connect_timeout=int(self.timeout),
+                autocommit=True,
+                **KEEPALIVE,   # 见 pgconn.py：往内核要 TCP 保活，减少僵尸连接
             )
         return self._conn
 
@@ -63,16 +69,17 @@ class _PgConnMixin:
                 pass
 
     def _exec(self, sql: str, params: tuple = (), fetch: bool = False):
-        conn = self._connect()
-        try:
+        def _run(conn):
             with conn.cursor() as cur:
                 cur.execute(sql, params)
                 if fetch:
                     return cur.fetchall()
                 return None
-        except Exception:  # noqa: BLE001
-            self._discard()
-            raise
+
+        # 与 SQL 执行层共用同一份「丢弃坏连接 -> 重连 -> 重跑一次」：
+        # 这两条连接（知识库文档召回、示例向量召回）是一次提问里**最先**用到的，
+        # 云库空闲挂起后的第一问最容易撞上，必须能自动恢复。
+        return run_with_reconnect(self._connect, self._discard, _run)
 
     def close(self) -> None:
         self._discard()

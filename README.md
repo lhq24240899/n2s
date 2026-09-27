@@ -68,6 +68,7 @@ nl2sql/
 │   ├── llm.py                  # LLMClient ABC + OpenAI 兼容真实客户端（缺 key 报错）
 │   ├── validation.py           # SQLValidator（sqlglot AST 校验）
 │   ├── db.py                   # DBRunner ABC + Psycopg(EXPLAIN)（缺 DSN 报错）
+│   ├── pgconn.py               # PG 连接韧性：僵尸连接自动重连 + TCP 保活（三条连接共用）
 │   ├── embedding.py            # ★向量化：OpenAI 兼容 + 本地 HashingEmbedder（离线可测）
 │   ├── vectorstore.py          # ★pgvector + pg_trgm 存储（文档库 + 示例库向量索引）
 │   ├── fusion.py               # ★RRF 倒数排名融合（与存储/模型无关，可复用）
@@ -177,6 +178,7 @@ PIPELINE__MAX_RETRY=1
 | SQL 正确但匹配 0 行 / 全 NULL | **空结果自愈**：`query()` 检测到空结果，带「过滤条件可能不匹配」反馈重生成一次（`retry_on_empty`，可关）；UI 自动展开 SQL |
 | 问「各业务线/各实验室」却只返回一个总数 | 语义层识别**分组维度**（`各/按/每个 + 维度词`）→ Glossary 下发 `GROUP BY` 指令（每行一个取值），且**不再把同维度继承成过滤条件** |
 | 会话中途答错一次后，后面全查不到数据 | 连接用 **autocommit**（每语句独立事务）避免坏语句毒化整条连接，并**异常即弃连接重连**——否则 PostgreSQL 的 `current transaction is aborted` 会让整条连接持续失败 |
+| 空闲几分钟后的第一问报 `SSL connection has been closed unexpectedly` | 云库（Neon 等）空闲挂起时**从服务端关掉连接**，而 `conn.closed` 仍为 `False` → 客户端要等到首次 `execute` 才发现，报 `consuming input failed: SSL connection has been closed unexpectedly`。三条长连接统一走「丢弃坏连接 → 重连 → 重跑一次」（`nl2sql/pgconn.py`），并全部开启 TCP 保活。真机踩过：重试只加在 SQL 执行那条上，知识库两条照旧炸——而它们才是每次提问**最先**用到的 |
 | 文档类问题（"EMC 是什么""为什么华南区查不到数据"） | 走**企业知识库混合 RAG**：关键词 + pg_trgm + pgvector 三路召回 → RRF 融合 → **只依据资料作答并标注引用**，避免 RAG 变成新的幻觉源 |
 | 谁能查、能查哪些数据 | **四道门**（第 12 节）：JWT 认证 → scope 授权 → 数据权限（无权表不进 prompt、指标级拒绝、行级过滤注入 SQL）→ 库级只读 |
 | 同一条问题不同角色看到的口径不一样 | 令牌携带 `regions / business_lines` → 合成 `DataPolicy` → **过滤条件注入 SQL 的 WHERE**（不是查完再截断，聚合值本身就是对的） |
@@ -193,7 +195,9 @@ PIPELINE__MAX_RETRY=1
 1. **`llm.py`**：配 `LLM__API_KEY` 即自动切换真实 OpenAI 兼容模型；温度恒为 0。
 2. **`db.py`**：配 `DB__DSN` 即走 `PsycopgRunner.explain`（`EXPLAIN`，只读不执行）；
    连接为 **autocommit**（只读场景，避免一条坏语句让整条连接持续报
-   `current transaction is aborted`），且任何异常都会丢弃连接、下次自动重连。
+   `current transaction is aborted`），且任何异常都会丢弃连接、**当场重连并重跑一次**
+   （用户不必手动重问）。知识库那两条连接（文档召回 / 示例向量召回）与其共用同一份
+   实现（`nl2sql/pgconn.py`），且三条连接都带 TCP 保活参数。
 3. **`validation.py`**：已用 `sqlglot` 做 AST 解析与方言（`dialect` 可配 postgres/mysql/...），
    比正则可靠得多；可按需扩展为「语义校验 + 权限校验」。
 4. **`retrieval.py`**：若标签覆盖不足，可叠加 BM25（`rank_bm25`）或向量检索，
