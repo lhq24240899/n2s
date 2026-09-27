@@ -160,10 +160,11 @@ def test_context_fallback_is_disclosed_in_the_ui(monkeypatch):
 
 
 PPL_LABEL = "🧭 PPL · OpenSearch"
+ES_LABEL = "🔎 DSL · Elasticsearch"
 
 
-def test_ppl_mode_shows_ppl_result_and_query_first(monkeypatch):
-    """PPL 档必须展示 PPL 的执行结果与查询语句，不能把 DSL 放在主位。"""
+def test_ppl_mode_shows_only_ppl_query(monkeypatch):
+    """方案 B：PPL 档只展示 PPL 的查询语句，不显示 DSL（DSL 作为对照）。"""
     from examples.es_engine import EsQueryEngine
     from nl2sql import es_backend
 
@@ -203,8 +204,52 @@ def test_ppl_mode_shows_ppl_result_and_query_first(monkeypatch):
     status_captions = [c.value for c in at.caption if "PPL" in c.value and "1 行" in c.value]
     assert status_captions, "应出现 PPL 执行状态 caption"
 
-    # 展开“实际下发的查询语句”后，code 块顺序应为 PPL 在前、DSL 在后
-    code_blocks = [c.value for c in at.code]
+    # 只应出现 PPL 的查询语句，不应出现 DSL JSON
+    # 过滤掉侧边栏“部署诊断”里的 config_diag() 代码块（配置未就绪时默认展开）
+    code_blocks = [c.value for c in at.code if "APP_BUILD=" not in c.value]
     assert code_blocks, "应有查询语句 code 块"
-    assert code_blocks[0].startswith("source="), f"PPL 语句应在前: {code_blocks}"
-    assert '"mode": "dsl"' in code_blocks[1], f"DSL JSON 应在后: {code_blocks}"
+    assert len(code_blocks) == 1, f"PPL 档只应展示 1 个查询语句块: {code_blocks}"
+    assert code_blocks[0].startswith("source="), f"PPL 语句应唯一展示: {code_blocks}"
+    assert '"mode": "dsl"' not in "\n".join(code_blocks), "PPL 档不应出现 DSL 语句"
+
+
+def test_es_mode_shows_only_dsl_query(monkeypatch):
+    """方案 B 对称验证：DSL 档只展示 DSL 的查询语句，不显示 PPL。"""
+    from examples.es_engine import EsQueryEngine
+    from nl2sql import es_backend
+
+    def fake_ask(self, question, *a, **kw):
+        return {
+            "type": "result",
+            "engine": "es",
+            "columns": ["region_dsl"],
+            "rows": [("华东_dsl",)],
+            "es_dsl": {"query": {"bool": {"filter": {"term": {"mode": "dsl"}}}}},
+            "ppl": {
+                "query": "source=device_events | where level='ERROR'",
+                "status": "executed",
+                "columns": ["region_ppl"],
+                "rows": [("华北_ppl",)],
+                "adaptations": [],
+            },
+            "entities": {"index": "device_events", "filters": []},
+            "reasons": ["IR->ES DSL 编译"],
+            "row_count": 1,
+            "empty": False,
+        }
+
+    monkeypatch.setattr(es_backend, "build_es_backend", lambda settings, mode: object())
+    monkeypatch.setattr(EsQueryEngine, "ask", fake_ask)
+
+    at = AppTest.from_file(str(ENTRY), default_timeout=120)
+    at.run()
+    at.radio(key="engine_label_v4").set_value(ES_LABEL).run()
+    at.button(key="sample_es_0").click().run()
+
+    assert not at.exception, [e.value for e in at.exception]
+
+    code_blocks = [c.value for c in at.code if "APP_BUILD=" not in c.value]
+    assert code_blocks, "应有查询语句 code 块"
+    assert len(code_blocks) == 1, f"DSL 档只应展示 1 个查询语句块: {code_blocks}"
+    assert '"mode": "dsl"' in code_blocks[0], f"DSL JSON 应唯一展示: {code_blocks}"
+    assert not code_blocks[0].startswith("source="), "DSL 档不应出现 PPL 语句"

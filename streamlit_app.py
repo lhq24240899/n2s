@@ -403,46 +403,29 @@ def render_es_answer(out: dict, mode: str, elapsed_ms: float) -> None:
     else:
         st.info("查询执行完成，但无数据返回。")
 
-    # 语句区：优先展示当前引擎真执行的方言，再把同一份 IR 的另一种方言作为对照
-    with st.expander("🔍 实际下发的查询语句（当前引擎方言优先）", expanded=True):
-        def _render_dsl(*, primary: bool) -> None:
-            if not out.get("es_dsl"):
-                return
-            label = "（本次真执行）" if primary else "（同 IR 编译产物，未作为本次主查询执行）"
-            st.markdown(f"**Elasticsearch DSL** {label}")
-            st.code(json.dumps(out["es_dsl"], ensure_ascii=False, indent=2), language="json")
-
-        def _render_ppl(*, primary: bool) -> None:
-            if not ppl.get("query"):
-                return
-            status = ppl.get("status")
-            if primary:
-                label = "（本次真执行）"
-            else:
-                label = {
-                    "executed": "（同 IR 对照，PPL 也真执行过）",
-                    "compiled-only": "（同 IR 编译产物对照，未执行）",
-                }.get(status, "（同 IR 编译产物）")
-            st.markdown(f"**PPL** {label}")
-            st.code(ppl["query"], language="sql")
-            for a in ppl.get("adaptations") or []:
-                st.caption(f"⚙️ 编译层适配：{a}")
-            if primary and status != "executed":
-                st.info(
-                    "当前 PPL 未真执行，已降级为「仅编译」。常见原因：\n"
-                    "1. 该集群是普通 Elasticsearch，没有 `_plugins/_ppl` 端点（PPL 是 OpenSearch 的语言）；\n"
-                    "2. 未配置 `ES__PPL_HOST`（PPL 专用的 OpenSearch 端点）；\n"
-                    "3. 端点或鉴权问题，详见下方返回。"
-                )
-            if ppl.get("status_detail"):
-                st.caption(f"PPL 端点返回：{ppl['status_detail']}")
-
+    # 语句区：只展示当前引擎档下发的那一种查询（DSL 档给 DSL，PPL 档给 PPL），不做对照展示
+    with st.expander("🔍 实际下发的查询语句", expanded=True):
         if mode == "es":
-            _render_dsl(primary=True)
-            _render_ppl(primary=False)
+            if out.get("es_dsl"):
+                st.markdown("**Elasticsearch DSL**（本次真执行）")
+                st.code(json.dumps(out["es_dsl"], ensure_ascii=False, indent=2), language="json")
         else:
-            _render_ppl(primary=True)
-            _render_dsl(primary=False)
+            if ppl.get("query"):
+                status = ppl.get("status")
+                st.markdown("**PPL**（本次真执行）" if status == "executed"
+                           else "**PPL**（仅编译，未执行）")
+                st.code(ppl["query"], language="sql")
+                for a in ppl.get("adaptations") or []:
+                    st.caption(f"⚙️ 编译层适配：{a}")
+                if status != "executed":
+                    st.info(
+                        "当前 PPL 未真执行，已降级为「仅编译」。常见原因：\n"
+                        "1. 该集群是普通 Elasticsearch，没有 `_plugins/_ppl` 端点（PPL 是 OpenSearch 的语言）；\n"
+                        "2. 未配置 `ES__PPL_HOST`（PPL 专用的 OpenSearch 端点）；\n"
+                        "3. 端点或鉴权问题，详见下方返回。"
+                    )
+                if ppl.get("status_detail"):
+                    st.caption(f"PPL 端点返回：{ppl['status_detail']}")
 
     if out.get("entities"):
         ent = out["entities"]
@@ -536,7 +519,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-ppl-render"
+APP_BUILD = "2026-09-27-single-dialect"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
