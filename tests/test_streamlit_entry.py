@@ -396,3 +396,47 @@ def test_es_and_ppl_share_the_same_sample_set(monkeypatch):
     """DSL / PPL 同属日志域，示例问题应一致（避免同一份数据两套问法）。"""
     _, _, g = _run_entry(monkeypatch, _engine_labels()[0])
     assert g["SAMPLES_BY_ENGINE"]["es"] == g["SAMPLES_BY_ENGINE"]["ppl"]
+
+
+# ---------------- 两路检索共用同一个 embedder 实例 ----------------
+# 背景：一次 SQL 提问里，示例检索（RetrievalService）与文档检索（HybridDocRetriever）
+# 都要 embed **同一句问题**。若各建一个 Embedder 实例，跨实例缓存不互通，
+# 同一句话就要走两次网络（白付一整次 embedding 往返，真机实测如此）。
+# 所以 `get_engine` 只建一次，并把同一实例透传给两个构建函数。
+
+
+def test_retriever_builders_reuse_the_passed_embedder(monkeypatch):
+    """显式传入 embedder 时必须原样复用，不得再自建一个。"""
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[0])
+
+    def _boom(settings):
+        raise AssertionError("不该重建 embedder：应复用上层传入的同一实例")
+
+    # 模块级函数：改全局名即可影响函数内部的查找
+    g["_build_embedder"] = _boom
+
+    sentinel = object()
+    seen: dict = {}
+    monkeypatch.setattr(
+        "nl2sql.retrieval.build_retriever",
+        lambda settings, store, embedder=None: seen.setdefault("example", embedder),
+    )
+    monkeypatch.setattr(
+        "nl2sql.kb.build_doc_retriever",
+        lambda settings, embedder, llm=None: seen.setdefault("doc", embedder),
+    )
+
+    settings = types.SimpleNamespace(kb=types.SimpleNamespace(enabled=True))
+    g["_build_retriever"](settings, None, None, embedder=sentinel)
+    g["_build_doc_retriever"](settings, None, embedder=sentinel)
+
+    assert seen["example"] is sentinel, "示例检索没有复用传入的 embedder"
+    assert seen["doc"] is sentinel, "文档检索没有复用传入的 embedder"
+
+
+def test_doc_retriever_is_skipped_when_kb_disabled(monkeypatch):
+    """知识库关闭时不构建文档检索器（也不该为此去建 embedder）。"""
+    _, _, g = _run_entry(monkeypatch, _engine_labels()[0])
+    settings = types.SimpleNamespace(kb=types.SimpleNamespace(enabled=False))
+
+    assert g["_build_doc_retriever"](settings, None, embedder=None) is None

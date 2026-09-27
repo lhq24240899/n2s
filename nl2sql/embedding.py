@@ -10,14 +10,51 @@
    同一句话不重复调用；文档侧只在建库时 embed 一次。
 2. `HashingEmbedder` 是确定性的本地实现（hashing trick），不联网、不花钱，
    用于离线单测与"无网演示"——让检索/融合逻辑可以在没有 API key 时被验证。
+
+缓存为什么放在**模块级**而不是实例级？
+
+- 一次 SQL 提问里，**同一句问题会被 embed 两次**：SQL 示例检索（`RetrievalService`）
+  与知识库文档检索（`HybridDocRetriever`）各持一个 Embedder 实例。
+- 实例级缓存互不相通，第二次照样要走网络——白付一整次往返。
+  提到模块级后，key 用 `(base_url, model, text)`，跨实例直接命中。
 """
 from __future__ import annotations
 
+import threading
 from abc import ABC, abstractmethod
 from hashlib import blake2b
-from typing import Iterable
+from typing import Iterable, Optional
 
 from .config import EmbeddingSettings
+
+# ---------------------------------------------------------------------------
+# 进程级共享的向量缓存
+# ---------------------------------------------------------------------------
+# key = (base_url, model, text)：带上网关与模型名，避免换了模型/网关却命中旧向量。
+_EMBED_CACHE: dict[tuple[str, str, str], list[float]] = {}
+_EMBED_CACHE_MAX = 512
+_EMBED_CACHE_LOCK = threading.Lock()
+
+
+def _cache_get(key: tuple[str, str, str]) -> Optional[list[float]]:
+    """取缓存（返回副本：调用方改动不会污染缓存）。"""
+    with _EMBED_CACHE_LOCK:
+        hit = _EMBED_CACHE.get(key)
+        return list(hit) if hit is not None else None
+
+
+def _cache_put(key: tuple[str, str, str], vec: list[float]) -> None:
+    """写缓存；超出上限按 FIFO 淘汰最早写入的一条（dict 保序）。"""
+    with _EMBED_CACHE_LOCK:
+        if len(_EMBED_CACHE) >= _EMBED_CACHE_MAX:
+            _EMBED_CACHE.pop(next(iter(_EMBED_CACHE), None), None)
+        _EMBED_CACHE[key] = list(vec)
+
+
+def clear_embed_cache() -> None:
+    """清空进程级向量缓存（换模型后或测试里重置用）。"""
+    with _EMBED_CACHE_LOCK:
+        _EMBED_CACHE.clear()
 
 
 class Embedder(ABC):
@@ -37,7 +74,7 @@ class Embedder(ABC):
 
 
 class OpenAIEmbedder(Embedder):
-    """OpenAI 兼容 /embeddings 客户端（带同文本缓存）。"""
+    """OpenAI 兼容 /embeddings 客户端（同文本缓存，**跨实例共享**）。"""
 
     def __init__(
         self,
@@ -68,7 +105,8 @@ class OpenAIEmbedder(Embedder):
         )
         self._model = settings.model
         self._dim = settings.dim
-        self._cache: dict[str, list[float]] = {}
+        # 缓存 key 前缀：带上 base_url 与模型名，保证跨实例共享也不串味
+        self._key_prefix = (base_url, settings.model)
 
     @property
     def dim(self) -> int:
@@ -76,21 +114,22 @@ class OpenAIEmbedder(Embedder):
 
     def embed(self, texts: list[str]) -> list[list[float]]:
         results: list[list[float] | None] = [None] * len(texts)
-        todo: list[tuple[int, str]] = []
+        todo: list[tuple[int, str, tuple[str, str, str]]] = []
         for i, t in enumerate(texts):
-            cached = self._cache.get(t)
+            key = self._key_prefix + (t,)
+            cached = _cache_get(key)
             if cached is not None:
                 results[i] = cached
             else:
-                todo.append((i, t))
+                todo.append((i, t, key))
 
         if todo:
             resp = self._client.embeddings.create(
-                model=self._model, input=[t for _, t in todo]
+                model=self._model, input=[t for _, t, _ in todo]
             )
-            for (i, t), item in zip(todo, resp.data):
+            for (i, _t, key), item in zip(todo, resp.data):
                 vec = [float(x) for x in item.embedding]
-                self._cache[t] = vec
+                _cache_put(key, vec)
                 results[i] = vec
 
         return [r if r is not None else [] for r in results]

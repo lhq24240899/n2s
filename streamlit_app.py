@@ -293,6 +293,9 @@ def get_engine():
     layer = build_semantic_layer()
     llm = build_llm(settings.llm)  # 缺 LLM__API_KEY 会直接抛错
     store = build_store()
+    # 向量化器**只建一次**，示例检索与文档检索共用：两路都要 embed 同一句问题，
+    # 各建一个实例会各自缓存、各走一次网络（一次提问白付一整次 embedding 往返）。
+    embedder = _build_embedder(settings) if settings.kb.enabled else None
 
     st.session_state.engine = GRGQueryEngine(
         Text2SQLPipeline(
@@ -300,14 +303,14 @@ def get_engine():
             store=store,
             llm=llm,
             db=build_db(settings.db, registry),  # 缺 DB__DSN 会直接抛错
-            retriever=_build_retriever(settings, store, llm),
+            retriever=_build_retriever(settings, store, llm, embedder=embedder),
             graph=layer.graph,  # 业务知识图谱 -> Schema Linking（中文业务词 -> 物理表）
             top_k=settings.retrieval.top_k,
             min_score=settings.retrieval.min_score,
             max_retry=settings.pipeline.max_retry,
         ),
         layer,
-        doc_retriever=_build_doc_retriever(settings, llm),
+        doc_retriever=_build_doc_retriever(settings, llm, embedder=embedder),
         doc_max_chars=settings.kb.doc_max_chars,
         # 输入安全护栏：拦截密钥提取 / 提示词注入 / PII / 越界。
         # 不接这一句，部署出去的 Streamlit 会被"问 apikey 是多少"类攻击绕过（直奔 RAG）。
@@ -480,25 +483,33 @@ def _build_embedder(settings):
         return None
 
 
-def _build_retriever(settings, store, llm):
-    """SQL 示例检索：标签分 ⊕ 示例向量召回（RRF 融合）。未装向量库时自动退化为纯标签。"""
+def _build_retriever(settings, store, llm, embedder=None):
+    """SQL 示例检索：标签分 ⊕ 示例向量召回（RRF 融合）。未装向量库时自动退化为纯标签。
+
+    `embedder` 由上层复用同一个实例（见 `get_engine`）：两路检索都 embed 同一句问题，
+    各建一个实例会白付一次网络往返；详见 `nl2sql/embedding.py` 的模块级共享缓存。
+    """
     from nl2sql.retrieval import build_retriever
 
-    embedder = _build_embedder(settings) if settings.kb.enabled else None
+    if embedder is None and settings.kb.enabled:
+        embedder = _build_embedder(settings)
     return build_retriever(settings, store, embedder)
 
 
-def _build_doc_retriever(settings, llm):
+def _build_doc_retriever(settings, llm, embedder=None):
     """企业知识库混合检索器（pgvector + pg_trgm + 关键词 → RRF → LLM 精排）。
 
     构建失败不影响主流程：自动降级为纯 SQL 问数。
+    `embedder` 同上：与示例检索共用同一实例。
     """
     if not settings.kb.enabled:
         return None
     try:
         from nl2sql.kb import build_doc_retriever
 
-        return build_doc_retriever(settings, _build_embedder(settings), llm)
+        if embedder is None:
+            embedder = _build_embedder(settings)
+        return build_doc_retriever(settings, embedder, llm)
     except Exception:  # noqa: BLE001
         return None
 
@@ -522,7 +533,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-ui-elapsed-snippet"
+APP_BUILD = "2026-09-27-shared-embedder"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
