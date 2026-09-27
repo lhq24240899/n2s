@@ -522,7 +522,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-db-reconnect"
+APP_BUILD = "2026-09-27-doc-reasons"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -719,7 +719,9 @@ def render_rag(out: dict) -> None:
                 src = f" — {d.source}" if getattr(d, "source", "") else ""
                 st.write(f"**[{i}] {d.title}**{src}")
                 if getattr(d, "reasons", None):
-                    st.caption("　检索依据：" + d.reasons[0])
+                    # 展示全部 reasons：召回分（RRF 融合）与精排分（LLM）都在，
+                    # 否则只显示 RRF 分会让"顺序按精排分排"看起来像排反了
+                    st.caption("　检索依据：" + "　".join(d.reasons))
 
 
 def render_doc_sources(docs: list) -> None:
@@ -730,7 +732,9 @@ def render_doc_sources(docs: list) -> None:
         for i, d in enumerate(docs, start=1):
             st.write(f"**[{i}] {d.title}**")
             if getattr(d, "reasons", None):
-                st.caption("　检索依据：" + d.reasons[0])
+                # 展示全部 reasons：召回分（RRF 融合）与精排分（LLM）都在，
+                # 否则只显示 RRF 分会让"顺序按精排分排"看起来像排反了
+                st.caption("　检索依据：" + "　".join(d.reasons))
 
 
 # 维度中文名：用于把"继承了哪些上一轮条件"讲清楚
