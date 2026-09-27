@@ -195,3 +195,34 @@ def test_explicit_filters_are_never_dropped_by_the_fallback():
     assert out["mapped"].entities.get("region") == "华东"
     assert out.get("context_fallback") is None
     assert out["rows"] == [(None,)]                  # 保持"无匹配数据"，不假装有结果
+
+
+def test_d03_customer_ranking_example_is_top_retrieval():
+    """D03『已开票合同金额最高的客户是哪个』必须把客户排名示例排到第一，
+    才能提供正确的 contracts→customers 连接示范与回退模板。"""
+    from nl2sql.retrieval import build_retriever
+
+    settings = Settings()
+    store = build_store()
+    retriever = build_retriever(settings, store)  # 无 embedder/dsn -> 纯标签检索
+    hits = retriever.retrieve("已开票合同金额最高的客户是哪个", top_k=3)
+    assert hits, "应检索到示例"
+    assert hits[0].example.id == "ex_contract_amount_top_customer", (
+        f"D03 应把客户排名示例排第一，实际: {[h.example.id for h in hits]}"
+    )
+
+
+def test_c05_retrieval_not_polluted_by_customer_example():
+    """回归护栏：加 D03 客户排名示例后，C05『每个客户的合同总金额』的检索 top
+    不能被它抢占（否则分组问句会误学 LIMIT 1 而退化）。示例标签刻意只挂
+    『排名/最高/哪个』，不挂 合同金额/客户，正是为此。"""
+    from nl2sql.retrieval import build_retriever
+
+    settings = Settings()
+    store = build_store()
+    retriever = build_retriever(settings, store)
+    hits = retriever.retrieve("每个客户的合同总金额是多少", top_k=3)
+    top_ids = [h.example.id for h in hits]
+    assert "ex_contract_amount_top_customer" not in top_ids, (
+        f"C05 检索被客户排名示例污染: {top_ids}"
+    )

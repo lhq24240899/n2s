@@ -222,7 +222,9 @@ def build_metrics() -> list[Metric]:
                 "与『检测服务收入』不同：后者只统计已开票且报告已出具的合同，两者数值不相等，"
                 "问『合同总金额』走本口径，不要用收入口径顶替。"
                 "⚠️ 只从 contracts 表汇总；**不要再 JOIN trust_orders / reports** —— "
-                "合同与委托单/报告是一对多，关联后同一份合同的金额会被按报告份数重复累加"
+                "合同与委托单/报告是一对多，关联后同一份合同的金额会被按报告份数重复累加。"
+                "若问到『客户』（如客户名、哪个客户），需通过 contracts.customer_id = customers.id "
+                "关联取 **customers.name**（contracts 本身没有 name 列，不要写 contracts.name）"
             ),
             # sql_hint 刻意**不带** settled_status 过滤：带了会被 LLM 照抄到
             # "每个客户的合同总金额"（不该过滤）上——评估集实测抓到过（C05）。
@@ -561,6 +563,26 @@ def build_examples() -> list[SQLExample]:
             metrics=["检测服务收入"],
             dimensions=["区域", "业务线", "时间"],
             keywords=["华东", "上个月", "收入", "可靠性试验"],
+        ),
+        # 注意：标签刻意只挂「排名 / 最高 / 哪个」，不挂 metric=合同金额 也不挂 客户/合同金额 关键词，
+        # 否则会按"问题子串"把 C05（每个客户的合同金额→分组）、E04（已开票合同总金额→标量）等
+        # 所有合同金额类问题的检索 top 抢走，导致它们误学 LIMIT 1 / cu.name 而退化。
+        # 本示例只为 D03「…最高的…哪个」这类排名问句提供 contracts→customers 连接示范与正确回退模板。
+        SQLExample(
+            id="ex_contract_amount_top_customer",
+            question="已开票合同金额最高的客户是哪个",
+            sql=(
+                "SELECT cu.name FROM contracts ct "
+                "JOIN customers cu ON ct.customer_id = cu.id "
+                "WHERE ct.settled_status = '已开票' "
+                "GROUP BY cu.name ORDER BY SUM(ct.amount) DESC LIMIT 1"
+            ),
+            domain=["排名"],
+            intent=["排名"],
+            tables=["contracts", "customers"],
+            metrics=[],
+            dimensions=[],
+            keywords=["最高", "哪个"],
         ),
         SQLExample(
             id="ex_equip_util",
