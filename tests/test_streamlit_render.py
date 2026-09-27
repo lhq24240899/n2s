@@ -157,3 +157,54 @@ def test_context_fallback_is_disclosed_in_the_ui(monkeypatch):
     warnings = " ".join(w.value for w in at.warning)
     assert "已忽略这些继承维度重新查询" in warnings
     assert "区域" in warnings and "时间" in warnings      # 维度用中文讲清楚，不暴露内部键名
+
+
+PPL_LABEL = "🧭 PPL · OpenSearch"
+
+
+def test_ppl_mode_shows_ppl_result_and_query_first(monkeypatch):
+    """PPL 档必须展示 PPL 的执行结果与查询语句，不能把 DSL 放在主位。"""
+    from examples.es_engine import EsQueryEngine
+    from nl2sql import es_backend
+
+    def fake_ask(self, question, *a, **kw):
+        return {
+            "type": "result",
+            "engine": "es",
+            # DSL 执行结果：故意和 PPL 不同，用于断言前端真的按 mode 选了 PPL 结果
+            "columns": ["region_dsl"],
+            "rows": [("华东_dsl",)],
+            "es_dsl": {"query": {"bool": {"filter": {"term": {"mode": "dsl"}}}}},
+            "ppl": {
+                "query": "source=device_events | where level='ERROR' | stats count() as cnt by region",
+                "status": "executed",
+                "columns": ["region_ppl"],
+                "rows": [("华北_ppl",)],
+                "adaptations": ["相对时间 -> 绝对时间"],
+            },
+            "entities": {"index": "device_events", "filters": [("level", "term", "ERROR")]},
+            "reasons": ["IR->ES DSL 编译", "PPL: executed"],
+            "row_count": 1,
+            "empty": False,
+        }
+
+    # 避免测试环境缺 ES__PPL_HOST 导致 get_es_engine 返回 None
+    monkeypatch.setattr(es_backend, "build_es_backend", lambda settings, mode: object())
+    monkeypatch.setattr(EsQueryEngine, "ask", fake_ask)
+
+    at = AppTest.from_file(str(ENTRY), default_timeout=120)
+    at.run()
+    at.radio(key="engine_label_v4").set_value(PPL_LABEL).run()
+    at.button(key="sample_ppl_0").click().run()
+
+    assert not at.exception, [e.value for e in at.exception]
+
+    # 结果区应展示 PPL 行（而不是 DSL 行）：执行状态 caption 里应包含 PPL 与行数
+    status_captions = [c.value for c in at.caption if "PPL" in c.value and "1 行" in c.value]
+    assert status_captions, "应出现 PPL 执行状态 caption"
+
+    # 展开“实际下发的查询语句”后，code 块顺序应为 PPL 在前、DSL 在后
+    code_blocks = [c.value for c in at.code]
+    assert code_blocks, "应有查询语句 code 块"
+    assert code_blocks[0].startswith("source="), f"PPL 语句应在前: {code_blocks}"
+    assert '"mode": "dsl"' in code_blocks[1], f"DSL JSON 应在后: {code_blocks}"

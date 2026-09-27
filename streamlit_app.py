@@ -378,10 +378,22 @@ def render_es_answer(out: dict, mode: str, elapsed_ms: float) -> None:
         st.error(f"查询失败：{out.get('message')}")
         return
 
-    cols, rows = out.get("columns") or [], out.get("rows") or []
     ppl = out.get("ppl") or {}
-    st.caption(f"🔧 {ENGINE_BADGE[mode]} · 耗时 {elapsed_ms:.0f} ms · "
-               f"{out.get('row_count', len(rows))} 行")
+
+    # 按当前引擎档位取结果：PPL 档优先用 PPL 执行结果，否则回退到 DSL 结果并提示
+    if mode == "ppl" and ppl.get("status") == "executed":
+        cols, rows = ppl.get("columns") or [], ppl.get("rows") or []
+        ppl_primary = True
+    else:
+        cols, rows = out.get("columns") or [], out.get("rows") or []
+        ppl_primary = False
+
+    st.caption(f"🔧 {ENGINE_BADGE[mode]} · 耗时 {elapsed_ms:.0f} ms · {len(rows)} 行")
+
+    if mode == "ppl" and not ppl_primary:
+        st.info(
+            "当前 PPL 未真执行，已显示同一份 IR 编译出的 DSL 执行结果作为对照。"
+        )
 
     # 结果区：单值给大数字，多行给表格
     if rows and len(rows) == 1 and len(rows[0]) == 1:
@@ -391,19 +403,31 @@ def render_es_answer(out: dict, mode: str, elapsed_ms: float) -> None:
     else:
         st.info("查询执行完成，但无数据返回。")
 
-    # 语句区：DSL 与 PPL 都展示 —— 同一份 IR 的两种编译产物，便于对照
-    with st.expander("🔍 实际下发的查询语句（可对照 DSL / PPL 两种方言）", expanded=True):
-        if out.get("es_dsl"):
-            st.markdown("**Elasticsearch DSL**" + ("（本次真执行）" if mode == "es" else ""))
+    # 语句区：优先展示当前引擎真执行的方言，再把同一份 IR 的另一种方言作为对照
+    with st.expander("🔍 实际下发的查询语句（当前引擎方言优先）", expanded=True):
+        def _render_dsl(*, primary: bool) -> None:
+            if not out.get("es_dsl"):
+                return
+            label = "（本次真执行）" if primary else "（同 IR 编译产物，未作为本次主查询执行）"
+            st.markdown(f"**Elasticsearch DSL** {label}")
             st.code(json.dumps(out["es_dsl"], ensure_ascii=False, indent=2), language="json")
-        if ppl.get("query"):
+
+        def _render_ppl(*, primary: bool) -> None:
+            if not ppl.get("query"):
+                return
             status = ppl.get("status")
-            label = {"executed": "（本次真执行）", "compiled-only": "（仅编译，未执行）"}.get(status, "")
+            if primary:
+                label = "（本次真执行）"
+            else:
+                label = {
+                    "executed": "（同 IR 对照，PPL 也真执行过）",
+                    "compiled-only": "（同 IR 编译产物对照，未执行）",
+                }.get(status, "（同 IR 编译产物）")
             st.markdown(f"**PPL** {label}")
             st.code(ppl["query"], language="sql")
             for a in ppl.get("adaptations") or []:
                 st.caption(f"⚙️ 编译层适配：{a}")
-            if mode == "ppl" and status != "executed":
+            if primary and status != "executed":
                 st.info(
                     "当前 PPL 未真执行，已降级为「仅编译」。常见原因：\n"
                     "1. 该集群是普通 Elasticsearch，没有 `_plugins/_ppl` 端点（PPL 是 OpenSearch 的语言）；\n"
@@ -412,6 +436,13 @@ def render_es_answer(out: dict, mode: str, elapsed_ms: float) -> None:
                 )
             if ppl.get("status_detail"):
                 st.caption(f"PPL 端点返回：{ppl['status_detail']}")
+
+        if mode == "es":
+            _render_dsl(primary=True)
+            _render_ppl(primary=False)
+        else:
+            _render_ppl(primary=True)
+            _render_dsl(primary=False)
 
     if out.get("entities"):
         ent = out["entities"]
@@ -505,7 +536,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-audit"
+APP_BUILD = "2026-09-27-ppl-render"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
