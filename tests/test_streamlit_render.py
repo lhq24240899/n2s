@@ -337,3 +337,54 @@ def test_sql_answer_shows_elapsed_time_and_doc_snippets(monkeypatch):
 
     # 3) 参考知识库标题也应保留（st.write 的 **加粗** 文本在 AppTest 里归到 markdown）
     assert any("检测准时率口径说明" in m for m in md), "应出现资料标题"
+
+
+def test_sql_metric_caliber_is_collapsible_right_below_semantic_mapping(monkeypatch):
+    """口径说明要收进**下拉框**，并排在「🧭 语义映射（可解释）」**下面**。
+
+    原因：它原先是一段平铺在结果区上方的引用块，既挤占结果区，又离"这句话被怎么理解"
+    很远——用户得上下翻才能对着看。改为折叠框并紧随语义映射，两件事挨着读。
+    """
+    from examples.grg_engine import GRGQueryEngine
+    from types import SimpleNamespace
+
+    def fake_ask(self, question, *a, **kw):
+        return {
+            "type": "result",
+            "mapped": SimpleNamespace(
+                metric=SimpleNamespace(
+                    name="检测准时率",
+                    definition="按期出具报告数 / 应出具报告总数",
+                    source_tables=["reports", "labs"],
+                ),
+                reasons=["命中指标:准时率"],
+                entities={"region": "华东"},
+                normalized=question,
+            ),
+            "result": GenerationResult(sql="SELECT 0.92 AS on_time_rate", raw="s",
+                                       source=ResultSource.LLM),
+            "cols": ["on_time_rate"],
+            "rows": [(0.92,)],
+            "row_count": 1,
+            "empty": False,
+        }
+
+    monkeypatch.setattr(GRGQueryEngine, "ask", fake_ask)
+
+    at = AppTest.from_file(str(ENTRY), default_timeout=120)
+    at.run()
+    at.button(key="sample_sql_0").click().run()
+
+    assert not at.exception, [e.value for e in at.exception]
+
+    labels = [ex.label for ex in at.expander]
+    assert "📐 口径说明" in labels, f"口径说明应为下拉框: {labels}"
+    assert "🧭 语义映射（可解释）" in labels, f"应有语义映射下拉框: {labels}"
+    assert labels.index("📐 口径说明") > labels.index("🧭 语义映射（可解释）"), \
+        f"口径说明应排在语义映射下面: {labels}"
+
+    # 内容（指标名 / 定义 / 来源表）不能丢，只是收进了下拉框
+    md = " ".join(m.value for m in at.markdown)
+    assert "检测准时率" in md, "应保留指标名"
+    assert "应出具报告总数" in md, "应保留口径定义"
+    assert "reports" in md, "应保留来源表"

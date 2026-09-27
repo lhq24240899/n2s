@@ -533,7 +533,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-shared-embedder"
+APP_BUILD = "2026-09-27-caliber-expander"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -835,14 +835,6 @@ def render_answer(out: dict, elapsed_ms: float = 0.0) -> None:
     if res.error:
         st.error(f"告警：{res.error}")
 
-    # 口径说明（可审计）
-    if mapped.metric:
-        m = mapped.metric
-        st.markdown(
-            f"> **口径说明**：{m.name} = {m.definition}  \n"
-            f"> 数据来源：`{'`、`'.join(m.source_tables)}`"
-        )
-
     if is_empty and res.sql:
         # 没数据时自动展开 SQL + 诊断信息（本轮过滤实体 / 库内行数），便于直接排查
         st.caption("⬇️ 未返回数据，已自动展开生成的 SQL 与诊断信息：")
@@ -864,6 +856,16 @@ def render_answer(out: dict, elapsed_ms: float = 0.0) -> None:
             st.write(f"- {r}")
         st.write(f"- 归一化问题：`{mapped.normalized}`")
         st.write(f"- 解析实体：`{mapped.entities}`")
+
+    # 口径说明（可审计）：与「语义映射」同为折叠下拉框，并紧随其后，
+    # 让"这句话被怎么理解"和"这个指标怎么定义"挨着看，不必翻回结果区上方。
+    if mapped.metric:
+        m = mapped.metric
+        with st.expander("📐 口径说明"):
+            st.markdown(
+                f"> **{m.name}** = {m.definition}  \n"
+                f"> 数据来源：`{'`、`'.join(m.source_tables)}`"
+            )
 
     render_doc_sources(out.get("docs") or [])
 
