@@ -201,8 +201,23 @@ CASES: list[dict] = [
                   "WHERE l.region = '华东' AND r.issued_at >= CURRENT_DATE - INTERVAL '30 days' "
                   "GROUP BY b.name")),
 
+    # 指代型追问（覆盖 nl2sql/condense.py）：锚点在**上一轮的结果行**里，槽位继承给不出来。
+    # 回归用例：追问会把范围悄悄放大成"全公司"，且答案不稳定（同一句话出现过
+    # 300000 与 5450000 两个错值）；正确是那家客户的 2,540,000。
+    _c("多轮", "F10", "已开票合同金额最高的客户是哪个", compare="value", session="m5",
+       truth_sql=("SELECT cu.name FROM contracts ct JOIN customers cu ON ct.customer_id = cu.id "
+                  "WHERE ct.settled_status = '已开票' "
+                  "GROUP BY cu.name ORDER BY SUM(ct.amount) DESC LIMIT 1")),
+    _c("多轮", "F11", "金额是多少", compare="value", session="m5",
+       # 标准答案独立算：合同金额最高的那家客户（已开票口径）的合计
+       truth_sql=("SELECT SUM(amount) FROM contracts WHERE customer_id = ("
+                  "SELECT customer_id FROM contracts WHERE settled_status = '已开票' "
+                  "GROUP BY customer_id ORDER BY SUM(amount) DESC LIMIT 1)")),
+
     # ============ K. 澄清（ID 用 K 前缀：G 已被「经营」占用，避免重复 ID） ============
     _c("澄清", "K01", "那个做环境的实验室利用率怎么样", None, expect={"kind": "clarification"}),
+    # 写了「X客户的」但 X 没登记 -> 澄清（否则会静默按全公司算，范围被悄悄放大）
+    _c("澄清", "K02", "某航空客户的合同金额是多少", None, expect={"kind": "clarification"}),
 
     # ============ H. 文档问答（混合 RAG，带引用） ============
     _c("文档RAG", "H01", "EMC 是什么意思", None, expect={"kind": "rag"}),
@@ -243,6 +258,12 @@ CASES: list[dict] = [
        truth_sql="SELECT name, equipment_count FROM labs ORDER BY name"),
     _c("经营", "G08", "所有实验室的设备总数是多少",
        truth_sql="SELECT SUM(equipment_count) FROM labs"),
+    # 客户维度：值必须**登记在语义层**才能被抽成过滤条件（SemanticLayer.entity_values）。
+    # 回归用例：未登记时客户名会被整个丢掉 -> SELECT SUM(amount) FROM contracts（全库）
+    # = 5,450,000，而正确答案是这家客户的 2,540,000。
+    _c("经营", "G09", "某汽车客户的合同金额是多少", compare="value",
+       truth_sql=("SELECT SUM(amount) FROM contracts c JOIN customers cu ON c.customer_id = cu.id "
+                  "WHERE cu.name = '某汽车客户'")),
 
     # ============ J. 边界与健壮（不出异常即可） ============
     _c("边界", "J01", "你好", None, expect={"kind": "any"}),

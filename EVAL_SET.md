@@ -14,7 +14,7 @@
 
 | 引擎 | 数据集 | 条数 | 标准答案来源 | 比对方式 |
 |---|---|---|---|---|
-| 🔢 SQL（PostgreSQL） | `evals/cases.py` | 65 | ground-truth SQL 真跑 | 按值 / 行集比对 |
+| 🔢 SQL（PostgreSQL） | `evals/cases.py` | 69 | ground-truth SQL 真跑 | 按值 / 行集比对 |
 | 🔎 DSL（Elasticsearch） | `examples/es_eval.py::ES_CASES` | 9 | 按构造常量 | 按值 / 分布比对 |
 | 🧭 PPL（OpenSearch） | 同一批 ES_CASES | 9 | 按构造常量 | 同上（走 `_plugins/_ppl`） |
 
@@ -25,7 +25,7 @@
 
 ---
 
-## 一、SQL 评估集：65 条
+## 一、SQL 评估集：69 条
 
 跑法 `python examples/eval_run.py`；浮点按 4 位小数归一，多行按排序后的集合比对。
 
@@ -202,7 +202,7 @@ SQL 走的是另一条链路（LLM 生成 + sqlglot 校验），下面看 ES DSL
 ## 四、复现命令
 
 ```bash
-# SQL：65 条真实 LLM + 真实库（结果写 evals/last_report.json）
+# SQL：69 条真实 LLM + 真实库（结果写 evals/last_report.json）
 python examples/eval_run.py                       # 全量
 python examples/eval_run.py --id G06 --id C06     # 指定用例
 python examples/eval_run.py --min-accuracy 0.9    # 接 CI，低于阈值退出码 1

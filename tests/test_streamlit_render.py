@@ -444,3 +444,65 @@ def test_rag_no_answer_is_presented_as_guidance_not_as_a_normal_answer(monkeypat
     labels = [ex.label for ex in at.expander]
     assert any("都答不上这个问题" in x for x in labels), f"参考资料措辞要诚实: {labels}"
     assert not any("知识库命中" in x for x in labels), "没答上时不该说'命中'"
+
+
+def test_caliber_violation_is_surfaced_as_warning(monkeypatch):
+    """口径校验未通过时必须**在界面上说出来**（只提示、不改写）。
+
+    这一层的意义就是"别把一个没按口径生成的数静静给出去"——如果只在 payload 里带个字段、
+    界面不显示，等于白做。正常结果则不该出现这条黄条（防噪声）。
+    """
+    from examples.grg_engine import GRGQueryEngine
+    from types import SimpleNamespace
+
+    def fake_ask(self, question, *a, **kw):
+        return {
+            "type": "result",
+            "mapped": SimpleNamespace(metric=None, reasons=["（测试替身）"],
+                                     entities={"customer": "某汽车客户"}, normalized=question),
+            "result": GenerationResult(sql="SELECT SUM(amount) FROM contracts",
+                                       raw="SELECT SUM(amount) FROM contracts",
+                                       source=ResultSource.LLM),
+            "cols": ["contract_amount"],
+            "rows": [(5450000,)],
+            "empty": False,
+            "caliber": {"ok": False, "reasons": [
+                "口径：识别出 customer=某汽车客户，但 SQL 里没有出现这个取值（过滤没落地）"]},
+        }
+
+    monkeypatch.setattr(GRGQueryEngine, "ask", fake_ask)
+
+    at = AppTest.from_file(str(ENTRY), default_timeout=120)
+    at.run()
+    at.button(key="sample_sql_0").click().run()
+
+    assert not at.exception, [e.value for e in at.exception]
+
+    warnings = " ".join(w.value for w in at.warning)
+    assert "口径校验未通过" in warnings, f"应出黄条提示: {warnings}"
+    assert "过滤没落地" in warnings, "要说清是哪条违规，而不是笼统报错"
+    assert "口径说明" in warnings, "要指向用户该去哪儿核对"
+
+
+def test_clean_result_has_no_caliber_warning(monkeypatch):
+    """没有 caliber 字段（= 校验通过）时不能出黄条——否则每一条都提示，等于噪声。"""
+    from examples.grg_engine import GRGQueryEngine
+    from types import SimpleNamespace
+
+    def fake_ask(self, question, *a, **kw):
+        return {
+            "type": "result",
+            "mapped": SimpleNamespace(metric=None, reasons=["（测试替身）"],
+                                     entities={}, normalized=question),
+            "result": GenerationResult(sql="SELECT 1", raw="SELECT 1", source=ResultSource.LLM),
+            "cols": ["answer"], "rows": [(1,)], "empty": False,
+        }
+
+    monkeypatch.setattr(GRGQueryEngine, "ask", fake_ask)
+
+    at = AppTest.from_file(str(ENTRY), default_timeout=120)
+    at.run()
+    at.button(key="sample_sql_0").click().run()
+
+    assert not at.exception, [e.value for e in at.exception]
+    assert "口径校验未通过" not in " ".join(w.value for w in at.warning)

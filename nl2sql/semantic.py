@@ -122,6 +122,24 @@ class KnowledgeGraph:
 
 
 @dataclass
+class MetricGuard:
+    """指标的**口径硬约束**（数据，不是代码里的 if）—— 给出口的「口径一致性校验」用。
+
+    为什么写成数据：口径会变、指标会加，把断言和指标定义放一起，改口径时一眼能看到
+    要同步改什么。判定逻辑在 `nl2sql/caliber.py`（纯函数、可离线测）。
+
+    - trigger：问题里出现这些词才启用 **must_filter** 断言（如 `("已开票",)`）。空 = 每次都判。
+      （`forbid_tables` 不受它门控——"该口径不得 JOIN 某表"是定义的一部分，与问法无关。）
+    - must_filter：必须出现的等值过滤，`{"contracts.settled_status": ("已开票",)}`。
+    - forbid_tables：该口径下明令不得 JOIN 的表（一对多连接会把金额按行重复累加）。
+    """
+
+    trigger: tuple[str, ...] = ()
+    must_filter: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    forbid_tables: tuple[str, ...] = ()
+
+
+@dataclass
 class MappedQuery:
     """语义映射的产出：归一化问题 + 解析出的指标/实体 + 可解释 reasons + 澄清。"""
 
@@ -178,6 +196,7 @@ class SemanticLayer:
         base_entries: list[GlossaryEntry] | None = None,
         entity_columns: dict[str, str] | None = None,
         entity_values: dict[str, tuple[str, ...]] | None = None,
+        metric_guards: dict[str, MetricGuard] | None = None,
     ):
         self.metrics = {m.id: m for m in metrics}
         self.synonyms = SynonymMap(synonyms)
@@ -190,6 +209,9 @@ class SemanticLayer:
         # sample_values 取）。不登记的话，问句里写清了客户名也抽不出来，
         # 会被当成"全公司"来算（真机踩过：「某汽车客户的合同金额是多少」返回全库 5,450,000）。
         self.entity_values = entity_values or {}
+        # 指标口径的硬约束（给出口的口径一致性校验用，见 nl2sql/caliber.py）。
+        # 空 = 不做指标级断言；单条最多漏一个，判错也只标注不改写。
+        self.metric_guards = metric_guards or {}
 
     def get_metric(self, mid: str) -> Optional[Metric]:
         return self.metrics.get(mid)

@@ -30,6 +30,7 @@ from __future__ import annotations
 from typing import Optional
 
 from nl2sql.context import QueryContext
+from nl2sql.caliber import check_mapped
 from nl2sql.condense import condense_followup, is_weak_followup
 from nl2sql.kb import answer_with_docs, build_sql_doc_block
 from nl2sql.pipeline import Text2SQLPipeline
@@ -404,7 +405,15 @@ class GRGQueryEngine:
         # 更新上下文，供下一轮继承
         self.context.update_from(merged)
 
-        return {
+        # 口径一致性校验（零成本规则，见 nl2sql/caliber.py）：只**标注**、不改写、不重生成。
+        # 放在引擎出口的理由与答案评审一致——这里同时拿得到 SQL、指标和识别出的实体；
+        # 而静态校验（只读/白名单/EXPLAIN）管的是"安全"，管不了"答的是不是那个口径"。
+        caliber_problems = check_mapped(
+            res.sql, merged, self.layer,
+            dialect=getattr(getattr(self.pipeline, "registry", None), "dialect", "postgres"),
+        )
+
+        payload = {
             "type": "result",
             "mapped": merged,
             "result": res,
@@ -414,6 +423,9 @@ class GRGQueryEngine:
             "docs": docs,
             "context_fallback": context_fallback,
         }
+        if caliber_problems:
+            payload["caliber"] = {"ok": False, "reasons": caliber_problems}
+        return payload
 
     @staticmethod
     def _is_empty_result(rows) -> bool:

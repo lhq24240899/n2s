@@ -648,6 +648,29 @@ def build_entity_values() -> dict:
     return out
 
 
+def build_metric_guards() -> dict:
+    """指标口径的**硬约束**（出口口径一致性校验用，见 nl2sql/caliber.py）。
+
+    口径目前只能"提示"给模型（写进提示词），而模型可以不遵守：真机实测过
+    「某汽车客户的合同金额是多少」把客户名整个丢掉、返回全库 5,450,000。
+    把口径里**可判定的**那部分写成数据，出口就能事后核一遍并如实标注。
+
+    只登记"判错会误报"风险低的项：值只有一种规范写法的（已开票）、
+    以及口径明文禁止的连接。宁可少判，不可噪声。
+    """
+    from nl2sql.semantic import MetricGuard
+
+    return {
+        # 合同金额 = 合同口径：只从 contracts 汇总，明令不要 JOIN 委托单/报告
+        # （一对多会把同一份合同的金额按报告份数重复累加，实测放大 2~10 倍）。
+        "contract_amount": MetricGuard(
+            trigger=("已开票",),
+            must_filter={"contracts.settled_status": ("已开票",)},
+            forbid_tables=("trust_orders", "reports"),
+        ),
+    }
+
+
 def build_semantic_layer() -> SemanticLayer:
     base_entries = [
         GlossaryEntry("报告已出具", "reports.status = '已出具'"),
@@ -660,6 +683,7 @@ def build_semantic_layer() -> SemanticLayer:
         graph=build_knowledge_graph(),
         base_entries=base_entries,
         entity_values=build_entity_values(),
+        metric_guards=build_metric_guards(),
     )
 
 

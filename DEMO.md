@@ -154,7 +154,7 @@ reports 60 的旧快照**——换一份库，同一个问题给的数值就不�
 **命令行**（或提前录屏）：
 
 ```bash
-python examples/eval_run.py                    # 65/65
+python examples/eval_run.py                    # 69/69
 python examples/eval_run.py --min-accuracy 0.9 # 低于阈值退出码 1，可接 CI
 ```
 

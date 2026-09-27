@@ -546,7 +546,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-customer-condense"
+APP_BUILD = "2026-09-27-caliber-check"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():
@@ -855,6 +855,16 @@ def render_answer(out: dict, elapsed_ms: float = 0.0) -> None:
         st.warning(
             f"⚠️ 按上一轮继承的「{_dims}」查不到数据，**已忽略这些继承维度重新查询**"
             f"（你本轮明确说出的条件仍然生效）。下方是放宽后的结果。"
+        )
+
+    # 口径一致性校验未通过：如实标注，让用户核对（只提示、不改写、不重生成）。
+    # 与上面「空结果回退」同一风格：出问题就说清楚，别把一个"看着像答案的数"静静给出去。
+    _cal = out.get("caliber")
+    if _cal and not _cal.get("ok", True):
+        _why = "；".join(_cal.get("reasons") or [])
+        st.warning(
+            f"⚠️ **口径校验未通过**：{_why}。"
+            f"该结果可能没按语义层的口径生成，**请对照「📐 口径说明」核对**。"
         )
 
     # 空结果判定：无行 或 全部为 NULL
