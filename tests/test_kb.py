@@ -131,10 +131,51 @@ def test_engine_without_retriever_degrades_to_pure_sql():
     assert out["docs"] == []
 
 
-def test_no_docs_means_no_rag_fallback_to_sql():
-    """检索为空时不强行走 RAG，退回原有 SQL 路径（不改变老行为）。"""
+def test_no_docs_means_clarify_instead_of_guessing():
+    """检索为空时**如实澄清**，不再落到 SQL 去猜。
+
+    期望值由 `type=="result"` 改为 `clarification`：原先那条"落到 SQL"的降级路径，
+    在零相关资料时只会生成一张无意义的表（真机踩过：问「全部数据」被倒出
+    equipment 整张表，界面还显示「✅ LLM 生成 · 通过静态校验 + 执行预检」，
+    比报错更误导）。原来的意图——"别因为知识库不可用就把应用搞崩"——依然成立。
+    """
     out = _engine(_FakeRetriever([])).ask("EMC 是什么意思")
-    assert out["type"] == "result"
+    assert out["type"] == "clarification"
+    assert "知识库" in out["message"]
+
+
+# ---------------- 零意图问句：不许瞎猜 ----------------
+# 真机踩过：问「全部数据」-> 倒出 equipment 整张表。链路是——
+# 语义映射零信号 -> 路由进 SQL -> Schema Linking 推不出候选表、退化成全部 9 张表
+# -> 示例检索 0 命中（无 few-shot）-> LLM 收到"一句废话 + 9 张表结构"只能瞎猜。
+
+def test_zero_intent_question_asks_for_clarification():
+    retriever = _FakeRetriever([])
+    out = _engine(retriever).ask("全部数据")
+    assert out["type"] == "clarification", f"应澄清，实际 {out.get('type')}"
+    assert "指标" in out["message"]
+    # 澄清发生在生成之前：不能有任何查询产物
+    assert "rows" not in out and "result" not in out, "澄清不该产生查询结果"
+
+
+def test_zero_intent_with_docs_goes_to_rag():
+    """零意图但知识库有命中 -> 交给文档问答，而不是澄清。"""
+    out = _engine(_FakeRetriever(DOCS)).ask("全部数据")
+    assert out["type"] == "rag"
+
+
+def test_follow_up_without_local_intent_still_goes_to_sql():
+    """多轮追问本身没有意图（"那华南区呢？"），必须靠**继承的指标**保住结构化路由。
+
+    这是新规则最容易误伤的地方：判据要用继承后的 merged，不能用本轮 parsed，
+    否则 F02/F03/F05 这类多轮用例会被误拦成澄清。
+    """
+    engine = _engine(_FakeRetriever([]))
+    first = engine.ask("华东区上个月可靠性试验的准时完成率是多少")
+    assert first["type"] == "result", "前置条件：第一轮应把指标存进上下文"
+
+    out = engine.ask("那华南区呢？")
+    assert out["type"] == "result", f"合法追问被误拦成 {out.get('type')}"
 
 
 def test_definition_question_after_metric_question_still_routes_to_rag():

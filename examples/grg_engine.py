@@ -225,17 +225,51 @@ class GRGQueryEngine:
             or "count" in merged.entities
             or "topn" in merged.entities
         )
-        # docs 为空（知识库未配 / 未命中）时不硬走 RAG，仍退回结构化查询，
-        # 保持原有的降级行为，而不是变成"什么都不答"。
-        if (knowledge or not structured) and docs:
-            answer = answer_with_docs(
-                self.pipeline.llm, mapped.normalized, docs, self.doc_max_chars
-            )
+
+        def _rag_answer() -> dict:
+            """依据知识库资料作答（带引用）。下面两处都用它，避免重复拼装。"""
             return {
                 "type": "rag",
                 "mapped": merged,
-                "answer": answer,
+                "answer": answer_with_docs(
+                    self.pipeline.llm, mapped.normalized, docs, self.doc_max_chars
+                ),
                 "docs": docs,
+            }
+
+        # ① 知识型问句：**优先于结构化**——有资料就依据资料作答，即使同时解析出指标也不查数。
+        if knowledge:
+            if docs:
+                return _rag_answer()
+            # 知识库给不出资料时**如实说不懂**，不再落到 SQL（否则会生成一张无意义的表，原因见 ②）。
+            return {
+                "type": "clarification",
+                "message": (
+                    "这看起来是个概念 / 定义类问题，但知识库里没有检索到相关资料，我无法回答。"
+                    "可以换个说法，或改问具体指标（例如「华东区上个月的检测准时率是多少」）。"
+                ),
+                "mapped": merged,
+            }
+
+        # ② 什么都没听懂（无指标、无分组、无计数、无排名，也不是知识型问句）：
+        #    先给知识库一次机会，拿不出来就**如实澄清**。
+        #
+        #    这段以前是"直接落到 SQL"，后果比报错更糟：零意图时提示词里只剩
+        #    「全部 9 张表的表结构」—— 没有指标口径、没有 few-shot（示例检索 0 命中）、
+        #    Schema Linking 也退化成全部表，LLM 只能瞎猜。
+        #    真机踩过：问「全部数据」被倒出 equipment 整张表，界面还显示
+        #    「✅ LLM 生成 · 通过静态校验 + 执行预检」——**答非所问却看起来像答案**，
+        #    而且整个语义层（口径/指标/Glossary 约束）全被绕过。
+        if not structured:
+            if docs:
+                return _rag_answer()
+            return {
+                "type": "clarification",
+                "message": (
+                    "没听出你想查什么。请补充指标（如检测准时率 / 设备利用率 / 报告数量）、"
+                    "维度（区域 / 业务线 / 实验室）或时间范围后再问。"
+                ),
+                "mapped": merged,
             }
 
         # 结构化问数：把知识库摘录作为**业务口径补充**注入生成 prompt
