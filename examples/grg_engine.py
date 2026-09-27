@@ -30,6 +30,7 @@ from __future__ import annotations
 from typing import Optional
 
 from nl2sql.context import QueryContext
+from nl2sql.condense import condense_followup, is_weak_followup
 from nl2sql.kb import answer_with_docs, build_sql_doc_block
 from nl2sql.pipeline import Text2SQLPipeline
 from nl2sql.models import ResultSource
@@ -58,6 +59,8 @@ class GRGQueryEngine:
         guard=None,
         runner=None,
         safety=None,
+        condense_enabled: bool = True,
+        condense_max_chars: int = 60,
     ):
         self.pipeline = pipeline
         self.layer = layer
@@ -76,6 +79,10 @@ class GRGQueryEngine:
         # （仅用于内部测试 / 已被外层 QueryService 拦截的场景）。生产入口务必传入，
         # 否则密钥提取 / 提示词注入 / PII / 越界问题会绕过护栏直接进 RAG 或 LLM。
         self.safety = safety
+        # 追问改写：本轮信号太弱（"金额是多少"）时，让 LLM 结合上一轮把指代补全，
+        # 再交回确定性 mapper。详见 nl2sql/condense.py。
+        self.condense_enabled = condense_enabled
+        self.condense_max_chars = condense_max_chars
 
     # ---------------- 对外 API ----------------
 
@@ -109,7 +116,56 @@ class GRGQueryEngine:
         # 降级为引导。放在**引擎出口**而不是编排层，一处即覆盖三个入口
         # （Streamlit / FastAPI / MCP）与两条编排（pipeline / graph）。
         # 详见 nl2sql/review.py。
-        return review_answer(self._answer(self.mapper.map(question)))
+        mapped = self.mapper.map(question)
+        mapped = self._maybe_condense(question, mapped)
+        out = self._answer(mapped)
+        self._note_result(out)
+        return review_answer(out)
+
+    # ---------------- 追问改写（指代补全） ----------------
+
+    def _maybe_condense(self, question: str, mapped: MappedQuery) -> MappedQuery:
+        """信号太弱的追问：让 LLM 补上指代，再交回确定性 mapper 重新映射。
+
+        只在「本轮弱信号 + 有上一轮问题」时触发；改写没带来新信号就丢弃、保持原行为
+        （宁可如实澄清，也不凭空猜一个范围）。除 question 外不改任何既有路径。
+        """
+        if not self.condense_enabled or mapped.clarification:
+            return mapped
+        if not is_weak_followup(mapped):
+            return mapped
+        prev = self.context.last_question
+        if not prev:
+            return mapped
+
+        rewritten = condense_followup(
+            self.pipeline.llm, prev, question, self.context.last_result,
+            max_chars=self.condense_max_chars,
+        )
+        if not rewritten or rewritten == question:
+            return mapped
+
+        remapped = self.mapper.map(rewritten)
+        if is_weak_followup(remapped) and not remapped.clarification:
+            return mapped          # 改写没带来信号 -> 用原来的（不改变既有行为）
+        remapped.reasons.insert(
+            0, f"追问改写: {question} -> {rewritten}（依据上一轮「{prev}」）"
+        )
+        return remapped
+
+    def _note_result(self, out: dict) -> None:
+        """把上一轮结果摘要记进上下文 —— 供下一轮追问改写定位指代对象。
+
+        只记**小结果**（≤3 行）：大表格记进来既没用又是噪声。
+        """
+        if out.get("type") != "result":
+            return
+        rows = out.get("rows") or []
+        if not rows or len(rows) > 3:
+            return
+        cells = [str(v) for r in rows for v in r if v is not None]
+        if cells:
+            self.context.note_result("、".join(dict.fromkeys(cells)))
 
     @staticmethod
     def _refuse(ref) -> dict:

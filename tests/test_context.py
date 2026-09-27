@@ -95,3 +95,55 @@ def test_inherit_filters_false_still_keeps_group_by_of_this_turn():
 
     assert "region" not in relaxed.entities
     assert relaxed.entities["group_by"] == "business_line"
+
+
+# ---------------- 客户维度 + 上一轮问题/结果 ----------------
+
+def test_inherit_fills_customer():
+    ctx = QueryContext(customer="某汽车客户")
+    merged = ctx.inherit(_mapped("那合同金额呢"))
+
+    assert merged.entities["customer"] == "某汽车客户"
+    assert "某汽车客户" in merged.normalized, "继承的客户名要进归一化问句，否则进不了生成提示词"
+    assert merged.inherited_dimensions == ["customer"]
+
+
+def test_grouping_by_customer_is_not_inherited_as_filter():
+    """本轮要按客户分组时，不能再把上一轮的客户继承成过滤条件（否则只剩一行）。"""
+    ctx = QueryContext(customer="某汽车客户")
+    merged = ctx.inherit(_mapped("各客户的合同金额是多少", entities={"group_by": "customer"}))
+
+    assert "customer" not in merged.entities
+    assert any("分组优先" in r for r in merged.reasons)
+
+
+def test_update_from_records_customer_and_last_question():
+    ctx = QueryContext()
+    ctx.update_from(_mapped(
+        "某汽车客户的合同金额是多少",
+        entities={"customer": "某汽车客户", "metric": "contract_amount"},
+    ))
+
+    assert ctx.customer == "某汽车客户"
+    # 追问改写要用**原始问题**（含用户原话），不能用被继承补齐后的 normalized
+    assert ctx.last_question == "某汽车客户的合同金额是多少"
+
+
+def test_reset_clears_last_question_and_result():
+    ctx = QueryContext()
+    ctx.update_from(_mapped("某汽车客户的合同金额是多少", entities={"customer": "某汽车客户"}))
+    ctx.note_result("2,540,000")
+
+    ctx.reset()
+
+    assert ctx.customer is None
+    assert ctx.last_question == "" and ctx.last_result == ""
+
+
+def test_empty_result_fallback_drops_customer_too():
+    """空结果回退（inherit_filters=False）必须把客户也一起放开，否则回退形同虚设。"""
+    ctx = QueryContext(customer="某汽车客户", region="华东")
+    relaxed = ctx.inherit(_mapped("合同金额是多少"), inherit_filters=False)
+
+    assert "customer" not in relaxed.entities
+    assert "region" not in relaxed.entities

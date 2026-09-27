@@ -147,6 +147,9 @@ class SemanticLayer:
     DEFAULT_ENTITY_COLUMNS = {
         "region": "labs.region",
         "business_line": "business_lines.code",
+        # 客户：值来自 customers.name。登记在这里，Glossary 才会把
+        # 「必须使用 customers.name = '某汽车客户'」当**硬过滤**下发。
+        "customer": "customers.name",
     }
 
     # 分组维度 -> 用于 GROUP BY 的展示列（问「各业务线」要每行一个业务线）
@@ -174,12 +177,19 @@ class SemanticLayer:
         graph: KnowledgeGraph,
         base_entries: list[GlossaryEntry] | None = None,
         entity_columns: dict[str, str] | None = None,
+        entity_values: dict[str, tuple[str, ...]] | None = None,
     ):
         self.metrics = {m.id: m for m in metrics}
         self.synonyms = SynonymMap(synonyms)
         self.graph = graph
         self.base_entries = base_entries or []
         self.entity_columns = entity_columns or dict(self.DEFAULT_ENTITY_COLUMNS)
+        # 实体**取值**登记表：键 -> 库里真实存在的取值（如 customer -> 客户名列表）。
+        # 为什么必须登记：区域是固定枚举（SemanticMapper.REGIONS 可硬编码），
+        # 但客户名属于**业务数据**，只能在装配时由调用方注入（示例 schema 从表结构的
+        # sample_values 取）。不登记的话，问句里写清了客户名也抽不出来，
+        # 会被当成"全公司"来算（真机踩过：「某汽车客户的合同金额是多少」返回全库 5,450,000）。
+        self.entity_values = entity_values or {}
 
     def get_metric(self, mid: str) -> Optional[Metric]:
         return self.metrics.get(mid)
@@ -213,6 +223,7 @@ class SemanticLayer:
         notes = {
             "region": "用户口语可能带'区'字（如'华南区'），但库内规范值不带，务必用此值",
             "business_line": "这是业务线 code，不要用中文名",
+            "customer": "这是客户名；contracts 表没有 name 列，必须 JOIN customers 才能过滤/展示",
         }
         out: list[GlossaryEntry] = []
 
@@ -267,12 +278,14 @@ class SemanticLayer:
             value = entities.get(key)
             if not value:
                 continue
+            # 「禁止写成 'X区'」这半句只对**区域**成立（库内取值不带"区"）。
+            # 其它维度保持原样拼装，避免改动既有区域/业务线的下发文本。
+            suffix = "" if key == "customer" else f"；禁止写成 '{value}区' 或用户原话"
             out.append(
                 GlossaryEntry(
                     f"本次过滤-{key}",
                     f"必须使用 {column} = '{value}'"
-                    f"（{notes.get(key, '务必使用该规范值')}；"
-                    f"禁止写成 '{value}区' 或用户原话）",
+                    f"（{notes.get(key, '务必使用该规范值')}{suffix}）",
                 )
             )
         return out
@@ -294,6 +307,13 @@ class SemanticMapper:
     }
     # "所有"**不是**分组触发词：它是全称限定，语义是"合起来一共多少"
     # （评估集实测：「所有实验室的设备总数是多少」被误判成按实验室分组，返回 5 行而非总数）。
+    # 「X客户的」= 客户限定语（过滤意图），用于识别"写了客户名但我们没登记"的情况。
+    # 刻意只认「…客户的」这个形态：排名句（"最高的客户是哪个"）不含它，不会被误伤。
+    _CUSTOMER_FILTER_RE = re.compile(r"([\u4e00-\u9fa5]{1,8}客户)的")
+    # 客户限定语上要剥掉的泛指前缀（分组/全称/指代）：剥完只剩"客户"即为泛指，不是具体客户名。
+    _CUSTOMER_PREFIX_RE = re.compile(
+        r"^(?:各|每个|各个|每|所有|全部|全量|不同|哪些|哪个|哪家|多少|几家|这些|那些|该|本)+"
+    )
     # 机构/基地全称模式：命中即视为长实体，优先于词级同义词（见 map() 第 0 步）
     _FULL_NAME_RE = re.compile(r"[\u4e00-\u9fa5A-Za-z（）()]{2,}有限公司")
 
@@ -422,6 +442,19 @@ class SemanticMapper:
                     normalized = normalized.replace(f"{r}区", r)
                     reasons.append(f"区域归一化:{r}区->{r}")
 
+        # 3.1) 业务取值抽取（客户名等）：值必须**登记在语义层**（layer.entity_values）。
+        #      区域能硬编码成枚举，客户名是业务数据，只能由装配方注入。
+        #      真机踩过：不登记时「某汽车客户的合同金额是多少」会把客户名整个丢掉，
+        #      SQL 退化成 SELECT SUM(amount) FROM contracts（全库）→ 5,450,000（正确 2,540,000）。
+        for key, values in (self.layer.entity_values or {}).items():
+            if key in entities:
+                continue
+            for v in sorted(values, key=len, reverse=True):   # 长值优先，避免前缀误配
+                if v and v in question:
+                    entities[key] = v
+                    reasons.append(f"{key}实体:{v}")
+                    break
+
         # 3.5) 分组维度：「各业务线 / 各实验室 / 各区域」-> 要求按该维度 GROUP BY
         group_by = self._detect_group_by(question)
         if group_by:
@@ -510,5 +543,34 @@ class SemanticMapper:
                 hints.append(
                     f"没找到叫「{word}」的指标。现在能问的指标有：{'、'.join(names)}"
                 )
+
+        # ③ 「X客户的」这种限定写法，但 X客户 没登记在语义层（"某航空客户"）。
+        #    只在写成了**限定语**（"...客户的"）时判：这是明确的过滤意图，
+        #    静默忽略就等于把范围悄悄放大成全公司 —— 与本文件 ⑥ 步同一族问题。
+        #    刻意不泛化（如"最高的客户是哪个"不含"客户的"），以免误伤排名类问句。
+        #
+        #    ⚠️ 要先剥掉"各/所有/每个/全部"这类前缀：「各客户的合同金额是多少」里
+        #    正则抓到的是"各客户"，那是**泛指**（本轮按客户分组），不是具体客户名
+        #    （第一版漏了这层剥离，把合法的分组问句判成了未登记客户）。
+        if "customer" not in entities:
+            known = tuple(self.layer.entity_values.get("customer", ()))
+            for cand in self._CUSTOMER_FILTER_RE.findall(question):
+                word = cand
+                while True:
+                    stripped = self._CUSTOMER_PREFIX_RE.sub(
+                        "", self._PREFIX_STOPWORDS_RE.sub("", word)
+                    )
+                    if stripped == word:
+                        break
+                    word = stripped
+                if word in ("客户", "") or word in known:
+                    continue
+                if known:
+                    hints.append(
+                        f"「{word}」不是已登记的客户。可选：{'、'.join(known)}"
+                    )
+                else:
+                    hints.append(f"「{word}」不是已登记的客户，无法按客户过滤。")
+                break
 
         return "\n\n".join(hints) or None

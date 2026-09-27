@@ -312,6 +312,8 @@ def get_engine():
         layer,
         doc_retriever=_build_doc_retriever(settings, llm, embedder=embedder),
         doc_max_chars=settings.kb.doc_max_chars,
+        condense_enabled=settings.pipeline.condense_followup,
+        condense_max_chars=settings.pipeline.condense_max_chars,
         # 输入安全护栏：拦截密钥提取 / 提示词注入 / PII / 越界。
         # 不接这一句，部署出去的 Streamlit 会被"问 apikey 是多少"类攻击绕过（直奔 RAG）。
         safety=SafetyGuard(),
@@ -544,7 +546,7 @@ def config_status() -> tuple[bool, str]:
 
 
 # 部署自检标记：每次重新部署后改这个值，用户刷新即可判断平台是否拉到了新代码。
-APP_BUILD = "2026-09-27-ppl-endpoint-probe"
+APP_BUILD = "2026-09-27-customer-condense"
 
 # secrets.toml 候选路径（与 _load_local_secrets 保持一致，用于诊断显示）
 def _secrets_candidates():

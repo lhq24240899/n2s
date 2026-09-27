@@ -26,15 +26,22 @@ class QueryContext:
     metric: Optional[Metric] = None
     business_line: Optional[str] = None  # 业务线 code，如 "reliability"
     region: Optional[str] = None
+    customer: Optional[str] = None       # 客户名（语义层登记的取值），如 "某汽车客户"
     time: Optional[str] = None
     dimensions: list[str] = field(default_factory=list)
+    # 上一轮的**原始问题**与**结果摘要**。它们不参与槽位继承，只喂给「追问改写」
+    # （nl2sql/condense.py）：指代型追问（"金额是多少"）的锚点在结果行里，
+    # 槽位继承给不出来 —— 有这两项，改写器才能把锚点补回问句。
+    last_question: str = ""
+    last_result: str = ""
 
     def inherit(self, mapped: MappedQuery, *, inherit_filters: bool = True) -> MappedQuery:
         """把上一轮上下文回填到本轮缺失的实体，返回补全后的 MappedQuery。
 
-        inherit_filters=False：**只继承指标**，不继承 region/business_line/time 这些过滤维度。
-        这是给「空结果回退」用的（见 GRGQueryEngine._answer）：若继承来的过滤条件把结果筛空了，
-        可以忽略它们重查一次——指标这类"问题类型"信息仍然沿用，语义不会跑偏。
+        inherit_filters=False：**只继承指标**，不继承 region/business_line/customer/time
+        这些过滤维度。这是给「空结果回退」用的（见 GRGQueryEngine._answer）：若继承来的
+        过滤条件把结果筛空了，可以忽略它们重查一次——指标这类"问题类型"信息仍然沿用，
+        语义不会跑偏。
         """
         ents = dict(mapped.entities)
         metric = mapped.metric or self.metric
@@ -56,6 +63,9 @@ class QueryContext:
             if self.region is not None and "region" not in ents and "region" not in skip:
                 ents["region"] = self.region
                 inherited_keys.append("region")
+            if self.customer is not None and "customer" not in ents and "customer" not in skip:
+                ents["customer"] = self.customer
+                inherited_keys.append("customer")
             if self.time is not None and "time" not in ents and "time" not in skip:
                 ents["time"] = self.time
                 inherited_keys.append("time")
@@ -66,13 +76,15 @@ class QueryContext:
             extra.append(ents["region"])
         if "business_line" in ents and ents["business_line"] not in mapped.normalized:
             extra.append(ents["business_line"])
+        if "customer" in ents and ents["customer"] not in mapped.normalized:
+            extra.append(ents["customer"])
         normalized = mapped.normalized
         if extra:
             normalized = f"{normalized} {' '.join(extra)}"
 
         reasons = list(mapped.reasons)
         if not inherit_filters:
-            reasons.append("空结果回退: 不使用上一轮继承的过滤维度（区域/业务线/时间）")
+            reasons.append("空结果回退: 不使用上一轮继承的过滤维度（区域/业务线/客户/时间）")
         elif inherited_keys:
             reasons.append(f"上下文继承: 补齐缺失维度 {inherited_keys}")
         if group_by:
@@ -99,12 +111,25 @@ class QueryContext:
             self.business_line = e["business_line"]
         if "region" in e:
             self.region = e["region"]
+        if "customer" in e:
+            self.customer = e["customer"]
         if "time" in e:
             self.time = e["time"]
+        # 记住原始问题（不含继承补的维度），供下一轮的「追问改写」用。
+        # 存 original 而不是 normalized：改写器要看到**用户真正说的那句**，
+        # 否则上一轮补齐的维度会被当成用户说的，指代对象反而更难判断。
+        self.last_question = mapped.original or self.last_question
+
+    def note_result(self, summary: str) -> None:
+        """记住上一轮结果的摘要（如 "某汽车客户" / "0.9167"），供追问改写定位指代对象。"""
+        self.last_result = (summary or "")[:200]
 
     def reset(self) -> None:
         self.metric = None
         self.business_line = None
         self.region = None
+        self.customer = None
         self.time = None
         self.dimensions = []
+        self.last_question = ""
+        self.last_result = ""

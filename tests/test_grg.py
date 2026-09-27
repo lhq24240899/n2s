@@ -268,3 +268,99 @@ def test_short_reply_narrows_only_the_remaining_slot():
 
     out = e.ask("准时率")
     assert out["type"] == "result", f"两个槽位补齐后应答上来，实际 {out.get('type')}"
+
+
+# ---------------- 追问改写：指代型追问不再丢锚点 ----------------
+# 真机一幕：「已开票合同金额最高的客户是哪个」-> 答「某汽车客户」；
+# 追问「金额是多少」-> 锚点在**上一轮结果行**里，槽位继承给不出来，
+# 问题被悄悄放大成"全公司合同金额"（实测那次给出 5,450,000，正确 2,540,000）。
+# 修法：信号太弱的追问先让 LLM 补成自包含问句，再交回确定性 mapper。
+
+class _CondenseMockLLM(GRGMockLLM):
+    """接住「追问改写」的提示词，返回预设的改写结果；其余照旧走 GRGMockLLM。"""
+
+    def __init__(self, rewrite: str = "某汽车客户的合同金额是多少"):
+        super().__init__()
+        self.rewrite = rewrite
+        self.condense_prompts: list[str] = []
+
+    def generate(self, prompt: str, system: str | None = None) -> str:
+        if "多轮问句改写器" in (system or ""):
+            self.condense_prompts.append(prompt)
+            return self.rewrite
+        return super().generate(prompt, system)
+
+
+def _engine_with_llm(llm, **kw):
+    settings = Settings()
+    registry = build_registry(settings.db.dialect)
+    layer = build_semantic_layer()
+    pipeline = Text2SQLPipeline(
+        registry=registry, store=build_store(), llm=llm,
+        db=GRGSampleDB(registry, dialect=settings.db.dialect),
+        graph=layer.graph,
+        top_k=settings.retrieval.top_k, min_score=settings.retrieval.min_score,
+        max_retry=settings.pipeline.max_retry,
+    )
+    return GRGQueryEngine(pipeline, layer, **kw)
+
+
+def test_followup_condense_recovers_the_anchor():
+    llm = _CondenseMockLLM("某汽车客户的合同金额是多少")
+    e = _engine_with_llm(llm)
+    e.ask("已开票合同金额最高的客户是哪个")
+
+    out = e.ask("金额是多少")
+
+    assert out["type"] == "result"
+    assert out["mapped"].entities.get("customer") == "某汽车客户", "指代锚点必须被补回来"
+    assert any("追问改写" in r for r in out["mapped"].reasons), "改写要可解释（进「语义映射」面板）"
+    # 改写提示词里必须带上上一轮的原问题，模型才知道"金额"指谁
+    assert llm.condense_prompts and "已开票合同金额最高的客户是哪个" in llm.condense_prompts[0]
+    # 客户过滤要真的进 Glossary（硬约束）才算接通，不能只停在 entities
+    assert "本次过滤-customer" in out["glossary"].entries
+
+
+def test_condense_disabled_keeps_old_behaviour():
+    """关掉开关 = 回到加这个特性之前的行为（弱信号追问直接走原链路）。"""
+    llm = _CondenseMockLLM()
+    e = _engine_with_llm(llm, condense_enabled=False)
+    e.ask("已开票合同金额最高的客户是哪个")
+
+    out = e.ask("金额是多少")
+
+    assert not llm.condense_prompts, "开关关掉后不该再叫模型"
+    assert "customer" not in out["mapped"].entities
+
+
+def test_condense_not_triggered_when_signal_is_strong():
+    """说清了区域/指标就不改写 —— 改写只补指代，不越界。"""
+    llm = _CondenseMockLLM()
+    e = _engine_with_llm(llm)
+    e.ask("华东区上个月可靠性试验的准时完成率是多少")
+
+    e.ask("那华南区呢？")
+    e.ask("各业务线的检测准时率是多少")
+
+    assert not llm.condense_prompts, "有强信号的追问不该触发改写"
+
+
+def test_condense_ignores_rewrite_without_new_signal():
+    """改写没带来新信号 -> 丢弃，保持原行为（宁可澄清也不凭空猜范围）。"""
+    llm = _CondenseMockLLM("还是没说清")
+    e = _engine_with_llm(llm)
+    e.ask("已开票合同金额最高的客户是哪个")
+
+    out = e.ask("金额是多少")
+
+    assert not any("追问改写" in r for r in out["mapped"].reasons)
+
+
+def test_customer_filter_reaches_glossary_in_single_turn():
+    """单轮也受益：客户名被抽出 -> Glossary 下发硬过滤（不用等改写）。"""
+    out = _engine().ask("某汽车客户的合同金额是多少")
+
+    assert out["mapped"].entities.get("customer") == "某汽车客户"
+    # Glossary.entries 是 {term: GlossaryEntry} —— 客户过滤必须作为**硬约束**下发
+    meaning = out["glossary"].entries["本次过滤-customer"].meaning
+    assert "customers.name = '某汽车客户'" in meaning

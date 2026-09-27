@@ -110,6 +110,10 @@ class KBSettings(BaseModel):
 class PipelineSettings(BaseModel):
     max_retry: int = 1           # 生成失败后的重试次数（每次携带错误反馈）
     critique_llm: bool = False   # 图编排下是否开启 LLM 结果复核（默认关，省成本）
+    # 追问改写：本轮信号太弱（"金额是多少"）时，让 LLM 结合上一轮把指代补全，
+    # 再交回确定性 mapper。只在这种窄条件下触发，成本可控。
+    condense_followup: bool = True
+    condense_max_chars: int = 60  # 改写结果超过此长度视为不可用（防模型跑偏写长句/SQL）
 
 
 class MetadataSettings(BaseModel):

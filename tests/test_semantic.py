@@ -34,7 +34,14 @@ def _layer() -> SemanticLayer:
             clarification="您说的'那个做环境的'是指环境可靠性实验室吗？",
         ),
     ]
-    return SemanticLayer(metrics=metrics, synonyms=synonyms, graph=None)
+    return SemanticLayer(
+        metrics=metrics,
+        synonyms=synonyms,
+        graph=None,
+        # 业务取值登记表（生产侧由 build_entity_values() 从表的样本值注入，见 examples/grg_schema.py）。
+        # 客户名无法像区域那样硬编码成枚举，必须由装配方登记，mapper 才能抽出来当过滤条件。
+        entity_values={"customer": ("某汽车客户", "某通信客户")},
+    )
 
 
 def test_synonym_expand():
@@ -168,3 +175,40 @@ def test_ambiguous_synonym_clarification_takes_priority():
 
     assert cl and "环境可靠性实验室" in cl
     assert "不是有效区域" not in cl
+
+
+# ---------------- 客户维度：可抽取、可分组、可过滤 ----------------
+# 真机踩过：不登记客户取值时，「某汽车客户的合同金额是多少」会把客户名整个丢掉，
+# SQL 退化成 SELECT SUM(amount) FROM contracts（全库）→ 5,450,000（正确 2,540,000）。
+# 根因不是"多轮没记住"，而是**可过滤维度只登记了 region/business_line/time 三类**。
+
+
+def test_customer_value_is_extracted_as_filter():
+    mp = SemanticMapper(_layer()).map("某汽车客户的检测准时率是多少")
+
+    assert mp.entities.get("customer") == "某汽车客户"
+
+
+def test_customer_can_be_a_grouping_dimension():
+    mp = SemanticMapper(_layer()).map("各客户的检测准时率是多少")
+
+    assert mp.entities.get("group_by") == "customer"
+    assert "customer" not in mp.entities, "正在分组的维度不能再当过滤条件"
+    assert mp.clarification is None, "合法的分组问句不该被误判成'未登记客户'"
+
+
+def test_unregistered_customer_asks_for_clarification():
+    """写了「X客户的」但 X 没登记 -> 澄清（否则会静默按全公司算，范围被悄悄放大）。"""
+    mp = SemanticMapper(_layer()).map("某航空客户的检测准时率是多少")
+
+    assert mp.clarification and "某航空客户" in mp.clarification
+    assert "某汽车客户" in mp.clarification, "要列出可选客户，而不是只说'没懂'"
+    assert "customer" not in mp.entities
+
+
+def test_ranking_question_about_customer_is_not_misjudged():
+    """排名句里没有「…客户的」限定语 —— 不能被客户自检误伤（评估集 D03）。"""
+    mp = SemanticMapper(_layer()).map("已开票合同金额最高的客户是哪个")
+
+    assert mp.clarification is None
+    assert mp.entities.get("topn") is True

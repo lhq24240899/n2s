@@ -129,6 +129,10 @@ def build_tables() -> list[TableSchema]:
                 "industry": "varchar",  # 战略性新兴产业分类
             },
             description="客户表",
+            # 客户名是**业务取值**，语义层无法硬编码（不像区域有固定枚举）→ 以"样本值"
+            # 的形式登记，由 build_entity_values() 注入 SemanticLayer.entity_values，
+            # mapper 才能把「某汽车客户的合同金额是多少」里的客户名抽出来当过滤条件。
+            sample_values={"name": ["某汽车客户", "某通信客户"]},
         ),
         TableSchema(
             name="equipment",
@@ -624,6 +628,26 @@ def build_examples() -> list[SQLExample]:
 # 6. 组装
 # ============================================================
 
+def build_entity_values() -> dict:
+    """把「库里真实存在的取值」登记给语义层 —— mapper 才能从问句里**抽出值**。
+
+    区域是固定枚举（`SemanticMapper.REGIONS` 硬编码即可），而客户名属于业务数据，
+    只能从表结构的样本值来。生产形态下这里应该换成从元数据中心/维表同步
+    （对应 `MetadataSettings.provider="api"`）。
+
+    不登记的后果（真机踩过）：问「某汽车客户的合同金额是多少」，客户名被整个丢掉，
+    SQL 退化成 `SELECT SUM(amount) FROM contracts` → 返回全库 5,450,000（正确 2,540,000）。
+    """
+    reg = build_registry()
+    out: dict[str, tuple[str, ...]] = {}
+    for key, table, column in (("customer", "customers", "name"),):
+        schema = reg.tables.get(table)
+        vals = tuple((schema.sample_values or {}).get(column) or ()) if schema else ()
+        if vals:
+            out[key] = vals
+    return out
+
+
 def build_semantic_layer() -> SemanticLayer:
     base_entries = [
         GlossaryEntry("报告已出具", "reports.status = '已出具'"),
@@ -635,6 +659,7 @@ def build_semantic_layer() -> SemanticLayer:
         synonyms=build_synonyms(),
         graph=build_knowledge_graph(),
         base_entries=base_entries,
+        entity_values=build_entity_values(),
     )
 
 

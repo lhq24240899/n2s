@@ -212,6 +212,10 @@ def _make_engine(ctx: AppContext, pipeline: Text2SQLPipeline, guard: PolicyGuard
         # 引擎这层知道"这是不是在回应上一轮的澄清"，能对澄清回复只做硬拦截，
         # 因此拦得更准；pipeline 那层则是最后一道（graph 编排时尤其需要）。
         safety=SafetyGuard(),
+        # 追问改写（指代补全）：见 nl2sql/condense.py。可用
+        # PIPELINE__CONDENSE_FOLLOWUP=false 关掉（关掉后行为与加这个特性之前一致）。
+        condense_enabled=settings.pipeline.condense_followup,
+        condense_max_chars=settings.pipeline.condense_max_chars,
     )
 
 
