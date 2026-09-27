@@ -121,7 +121,7 @@ python examples/demo.py         # 通用 3 场景
 # 5) 跑单元测试（使用 tests/doubles 里的离线替身，不花真钱、不碰真库）
 pytest -q
 
-# 5.5) 跑问数评估集（57 条，真 LLM + 真库，输出 execution accuracy）
+# 5.5) 跑问数评估集（65 条，真 LLM + 真库，输出 execution accuracy）
 python examples/eval_run.py                 # 全量，报告写入 evals/last_report.json
 python examples/eval_run.py --category 分组 # 只跑某类
 
@@ -299,10 +299,11 @@ python examples/grg_demo.py
 ### 8.5 测试与评估
 
 ```bash
-pytest -q                        # 172 个离线用例：检索/校验/linker/semantic/context/grg
+pytest -q                        # 293 个离线用例：检索/校验/linker/semantic/context/grg
                                  #   + kb(混合RAG)/rerank/graph(图编排)/auth/policy/api/mcp/metadata
                                  #   + dsl(IR->ES DSL/PPL)/es_engine(MockTransport 端到端)
-python examples/eval_run.py      # 57 条在线评估（真 LLM + 真库）→ execution accuracy
+                                 #   + streamlit 渲染(真实 AppTest)/db 重连韧性/资产体检/es 后端模式
+python examples/eval_run.py      # 65 条在线评估（真 LLM + 真库）→ execution accuracy
 python examples/es_eval.py       # 9 条在线评估（真 ES 集群）→ 第二执行引擎 execution accuracy
 ```
 
@@ -357,7 +358,9 @@ streamlit run streamlit_app.py
 | 🧭 PPL | OpenSearch `_plugins/_ppl` | 同一份 `QueryIR` 编译成 PPL → 真执行（OpenSearch 专有） |
 
 三档**共用同一套 IR/语义层与安全护栏**——换引擎不换安全等级（ES 路径同样先过 `SafetyGuard` 硬拦截）。
-页面会把**实际下发的 DSL 与 PPL 两条语句**都列出来对照，方便看清楚"同一份中间表示如何编译成两种方言"。
+页面**只展示当前档对应的查询语句**（SQL 档展示生成的 SQL、DSL 档展示 Elasticsearch DSL、PPL 档展示 PPL），
+不再把两种方言并列对照——这样切到 PPL 档就不会再看到 DSL，切到 DSL 档也不会看到 PPL；
+各档的语义映射（溯源性信息：IR 解析 + 编译/多轮说明）同样收进可收起的下拉框，保持界面干净。
 
 侧边栏「🔌 数据源自检」也**随档位切换**（`datasource_selfcheck(mode)`）：SQL 档给库/方言 + 核心表行数，
 DSL/PPL 档给集群版本 + 索引文档数 + level/region 分布；PPL 档再多一条「PPL 真执行」——
@@ -449,8 +452,8 @@ LLM 仍会照抄旧口径把区域过滤写回 SQL —— 重查照样为空，�
   环境变量（`LLM__BASE_URL` 等），`pydantic-settings` 便能像读 `.env` 一样读到——**核心引擎零改动**。
 - 每个浏览器会话**独立持有一个 `GRGQueryEngine`**（含独立 `QueryContext`），所以多轮上下文
   互不串台；侧边栏「清空对话」即 `reset_context()`。
-- 结果区展示：数值卡片/表格 + **口径说明**（指标=口径，数据来源=表）+ 可展开的**生成 SQL** 与
-  **语义映射 reasons**——把「可解释、可审计」直接暴露给使用者。
+- 结果区展示：数值卡片/表格 + **口径说明**（指标=口径，数据来源=表）+ 可展开/收起的下拉框
+  **生成 SQL（或查询语句）** 与 **语义映射 reasons**——把「可解释、可审计」直接暴露给使用者。
 
 ---
 
@@ -688,7 +691,7 @@ HTTP API 面向前端；MCP 面向**宿主模型**——把能力以「工具 + 
 这一节对应 JD 第 2 条里最容易被忽略的两句：「搭建智能问数**全流程**能力」（全流程必须**可衡量**）
 和「**对接**企业数据系统」（表结构不能永远手写在代码里）。
 
-### 13.1 评估集：57 条 + 自动跑分（execution accuracy）
+### 13.1 评估集：65 条 + 自动跑分（execution accuracy）
 
 ```bash
 python examples/eval_run.py                  # 全量，报告写 evals/last_report.json
@@ -702,7 +705,7 @@ python examples/eval_run.py --min-accuracy 0.9   # 低于阈值退出码 1，可
   这是 NL2SQL 领域标准的 evaluation 做法：种子数据变了评估集依然有效，还顺带验证标准 SQL 本身。
 - 浮点按 4 位小数归一；多行结果按**排序后的集合**比对（GROUP BY 行序不影响对错）；
   「最高的实验室是哪个」允许系统额外返回利用率列，只要标准值出现在任一列即算命中。
-- 57 条覆盖 8 类：指标值（准时率/收入/利用率/一次通过率/周期）、分组、排名 TopN、总量计数、
+- 65 条覆盖 9 类：指标值（准时率/收入/利用率/一次通过率/周期）、分组、排名 TopN、总量计数、
   **多轮继承**、澄清、文档 RAG（必须带引用）、**安全**（写请求/注入必须被拒）、边界健壮。
 - 比对逻辑是纯函数，`tests/test_eval.py` 离线单测（不起服务也能测 harness）。
 
@@ -714,14 +717,14 @@ python examples/eval_run.py --min-accuracy 0.9   # 低于阈值退出码 1，可
 | R2 | 91.2% | TopN 问句（"报告数量最多的业务线"）仍走 RAG → 补 `topn` 意图进路由；LLM 只返回聚合数值不返回"是哪个" → 排名约束要求第一列是名称列 |
 | R3 | **93.0%** | 剩余 4 条失败各有明确根因，不再盲修 |
 | R4 | **96.9%** | 灌入经营数据后扩到 65 条；新用例首测 6/8，抓出 3 个指标口径问题并治理（详见 §15.2） |
+| R5 | **98.5%** | 口径审计（§15.2.1）再抓出合同金额重复累加 / `on_time` 与口径不自洽 / 时间窗口形同虚设 / C05 标准答案本身错四类问题并治理；C05 等由"判错"转"通过"，仅 D03 残留 |
 
-**当前（65 条口径）剩余 2 个已知失败（诚实记录）**：
-- `每个客户的合同总金额`：LLM 用 **id 列**而不是名称列分组，且**自行添加了问句未提及的过滤条件**
-  （NL2SQL 的经典病；Glossary 已明确要求名称列，属模型服从性的边界 case）；
-- `设备利用率最低的三个实验室`：系统 SQL 多 JOIN 了一层业务表，导致聚合值被放大（0.75 vs 标准 0.76）——
-  与 C05 同类，都是"模型生成了多余的 JOIN/过滤"。
+**当前（65 条口径）通过 64 条（98.5%），仅 1 个已知失败（诚实记录）**：
+- `已开票合同金额最高的客户是哪个`（D03）：LLM 选用 `c.name` 而非 `customers.name`，被 `EXPLAIN`
+  预检拦下并自动回退到最相关示例 SQL，前端明确标注「🟡 回退」——答案口径仍可信，但非本轮
+  LLM 直出（属模型对多表 JOIN 列选择的服从性边界 case；Glossary 已明确要求客户名取自 customers 表）。
 
-> 面试价值：**"你的准确率多少？怎么测的？"** —— 65 条 9 类、通过 63 条（96.9%），标准答案是一段段标准 SQL、按执行结果比对，
+> 面试价值：**"你的准确率多少？怎么测的？"** —— 65 条 9 类、通过 64 条（98.5%），标准答案是一段段标准 SQL、按执行结果比对，
 > 且能说出"从 75% 到 93% 的每一分是修了什么"。这比任何"我做了 NL2SQL"都有说服力。
 
 ### 13.2 知识图谱接进 Schema Linking（把注释兑现）
