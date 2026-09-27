@@ -30,7 +30,13 @@
 | 基础量级 | labs 5 / reports 60 / trust_orders 64 / equipment 7 / test_records 20 | — |
 
 > 若数据库被重建过，这些值可能变化。核对方法见文末「附录：重算标准答案」。
-> 注意：`各业务线` 只有 5 条业务线有报告数据（生命科学 / EHS 未灌数），所以该问句返回 **5 行**。
+> ⚠️ **已实测到漂移**：上表对应的是 **labs 5 / reports 60** 那一份快照；换一份库（实测
+> labs 20 / reports 77）同一个问题会给不同数值——"华东·可靠性·近1月"从 0.9167 变成 0.875，
+> "各业务线"的 5 个数值也全部不同。**演示前务必按附录 SQL 重算，不要照表念数字。**
+> 注意：`各业务线` 这一问的分组维度是 **business_line**，返回的**行永远是业务线**（区域不会
+> 成为行）；库里 5 条业务线有报告数据（生命科学 / EHS 未灌数），所以那份快照下返回 **5 行**。
+> 但若**承接了上一轮的区域/时间**，它们会作为**过滤条件**继承进来（用例 A-09），行数随之减少
+> ——实测：同一句话，清空对话后 5 行，承接"华南区…上个月"后只剩 3 行。
 
 ---
 
@@ -261,7 +267,25 @@ WHERE b.code='ic';
 SELECT l.name, AVG(e.utilization) AS util
 FROM equipment e JOIN labs l ON e.lab_id=l.id
 GROUP BY l.name ORDER BY util DESC;
+
+-- 各业务线 · 准时率（"各业务线的检测准时率是多少"这一问；不限时间）
+SELECT b.name,
+       ROUND(COUNT(*) FILTER (WHERE r.on_time=1)::numeric / NULLIF(COUNT(*),0), 4) AS on_time_rate,
+       COUNT(*) AS cnt
+FROM reports r
+JOIN business_lines b ON r.business_line_id = b.id
+GROUP BY b.name ORDER BY b.name;
+
+-- 基础量级（对应基线表最后一行）
+SELECT (SELECT COUNT(*) FROM labs)          AS labs,
+       (SELECT COUNT(*) FROM reports)       AS reports,
+       (SELECT COUNT(*) FROM trust_orders)  AS trust_orders,
+       (SELECT COUNT(*) FROM equipment)     AS equipment,
+       (SELECT COUNT(*) FROM test_records)  AS test_records;
 ```
+
+> 跑完把数字抄到 `DEMO.md` 主路线上再开演——实测过三份快照（文档 / 本地库 / 线上 App）
+> 的数都不一致，念错数字比不念更扣分。
 
 ---
 
