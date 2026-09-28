@@ -58,10 +58,14 @@ class PsycopgRunner(DBRunner):
         timeout: float = 10.0,
         readonly: bool = True,
         statement_timeout_ms: int = 5000,
+        connect_timeout: float = 30.0,
     ):
         self.dsn = dsn
         self.dialect = dialect
         self.timeout = timeout
+        # 建连超时**独立于** timeout：云库空闲挂起后唤醒要 20 秒上下，
+        # 用 10s 会导致"空闲后第一问必失败"（详见 config.DBSettings 的注释）。
+        self.connect_timeout = connect_timeout
         self.readonly = readonly
         self.statement_timeout_ms = statement_timeout_ms
         self._conn = None
@@ -72,7 +76,7 @@ class PsycopgRunner(DBRunner):
 
             conn = psycopg.connect(
                 self.dsn,
-                connect_timeout=int(self.timeout),
+                connect_timeout=int(self.connect_timeout),
                 autocommit=True,  # 只读场景：避免一条坏语句毒化整个会话
                 **KEEPALIVE,      # 见 pgconn.py：往内核要 TCP 保活，减少僵尸连接
             )
@@ -144,4 +148,5 @@ def build_db(settings, registry=None) -> DBRunner:
         timeout=settings.timeout,
         readonly=getattr(settings, "readonly", True),
         statement_timeout_ms=getattr(settings, "statement_timeout_ms", 5000),
+        connect_timeout=getattr(settings, "connect_timeout", 30.0),
     )

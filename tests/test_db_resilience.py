@@ -225,3 +225,50 @@ def test_db_runner_enables_tcp_keepalive(monkeypatch):
 
     for key, want in KEEPALIVE_EXPECTED.items():
         assert captured.get(key) == want, f"PsycopgRunner 缺少保活参数 {key}"
+
+
+# ---------------- 建连超时：云库唤醒窗口 ----------------
+# 真机踩过（2026-09-28，面试前一天）：Neon 计算实例空闲挂起后**唤醒要 21.8 秒**，
+# 而 psycopg.connect 用的是 settings.timeout=10 —— 配上 run_with_reconnect 的
+# 2 次尝试（2×10s=20s），刚好差一点点。症状极具迷惑性：
+# "空闲之后第一问必报连接失败，手动再点一次就好了"。
+# 修法：把建连超时与语句 timeout 解耦，给到 30s。
+
+def test_connect_timeout_is_independent_from_statement_timeout(monkeypatch):
+    """建连超时不能跟着 timeout=10 走 —— 那点时间盖不住云库冷启动。"""
+    captured: dict = {}
+    monkeypatch.setattr(psycopg, "connect", _capturing_connect(captured))
+
+    PsycopgRunner(
+        dsn="postgresql://u:p@h/db", timeout=10.0,
+        readonly=False, statement_timeout_ms=0,
+    )._connect()
+
+    assert captured.get("connect_timeout", 0) >= 30, (
+        f"建连超时 {captured.get('connect_timeout')}s 太短：云库唤醒要 ~22s"
+    )
+
+
+@pytest.mark.parametrize("store_cls", [PgVectorStore, PgExampleVectorIndex])
+def test_kb_connect_timeout_covers_cloud_wakeup(monkeypatch, store_cls):
+    """知识库那两条连接同样要够长 —— 而它们是一次提问里**最先用到**的。"""
+    captured: dict = {}
+    monkeypatch.setattr(psycopg, "connect", _capturing_connect(captured))
+
+    store_cls(dsn="postgresql://u:p@h/db", timeout=10.0).count()
+
+    assert captured.get("connect_timeout", 0) >= 30, (
+        f"{store_cls.__name__} 建连超时 {captured.get('connect_timeout')}s 太短"
+    )
+
+
+def test_build_db_passes_settings_connect_timeout():
+    """配置项要真的接到 PsycopgRunner 上（不然改了 .env 也不生效）。"""
+    from nl2sql.config import DBSettings
+    from nl2sql.db import build_db
+
+    assert DBSettings(dsn="postgresql://u:p@h/db").connect_timeout == 30.0
+
+    runner = build_db(DBSettings(dsn="postgresql://u:p@h/db", connect_timeout=45.0))
+    assert runner.connect_timeout == 45.0
+    assert runner.timeout == 10.0, "语句超时不受影响，两者独立"

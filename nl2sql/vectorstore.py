@@ -45,6 +45,9 @@ class _PgConnMixin:
 
     dsn: str
     timeout: float
+    # 建连超时：云库空闲挂起后唤醒要 20 秒上下，不能用 timeout(10s) 当建连超时。
+    # 这里给类属性默认值，子类不传也能拿到正确行为（详见 config.DBSettings 的注释）。
+    connect_timeout: float = 30.0
     _conn = None
 
     def _connect(self):
@@ -53,7 +56,7 @@ class _PgConnMixin:
 
             self._conn = psycopg.connect(
                 self.dsn,
-                connect_timeout=int(self.timeout),
+                connect_timeout=int(self.connect_timeout),
                 autocommit=True,
                 **KEEPALIVE,   # 见 pgconn.py：往内核要 TCP 保活，减少僵尸连接
             )

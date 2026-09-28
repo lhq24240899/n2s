@@ -31,6 +31,12 @@ class DBSettings(BaseModel):
     dsn: str = ""                # 必填；缺省时 build_db 直接抛错
     dry_run: bool = True         # 是否用 EXPLAIN / LIMIT 1 做执行预检
     timeout: float = 10.0
+    # 建连超时，与 timeout 分开：云库（Neon 等）计算实例空闲挂起后**唤醒要 20 秒上下**
+    # （本机实测 21.8s）。原实现直接拿 timeout=10 当 connect_timeout，于是
+    # "空闲之后第一问必失败"——而且 run_with_reconnect 只重试 2 次（2×10s=20s），
+    # 刚好差一点点，重试也救不回来。症状：第一问报连接失败，手动再点一次就好。
+    # 给到 30s 覆盖唤醒窗口。只影响"建连"，不影响单条语句执行时长（那个由 statement_timeout_ms 管）。
+    connect_timeout: float = 30.0
     # 库级只读：连接后 SET default_transaction_read_only = on。
     # 与 SQLValidator 的 AST 白名单形成双保险——即使有 SQL 绕过静态校验，
     # 数据库也会直接拒绝写操作。生产务必保持 true。
